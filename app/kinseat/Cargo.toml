@@ -1,0 +1,22 @@
+[package]
+name = "kinseat"
+version = "0.3.16"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+eframe = { version = "=0.32.3", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
+egui = "=0.32.3"
+wgpu = { version = "=25.0.2", default-features = false, features = ["dx12", "vulkan", "gles", "metal", "wgsl"] }
+kinseat-ipc = { path = "../kinseat-ipc" }
+serde_json = "=1.0.145"
+serde = "=1.0.228"
+image = { version = "=0.25.9", default-features = false, features = ["png", "jpeg"] }
+
+[target.'cfg(windows)'.dependencies]
+rfd = "=0.15.4"
+windows-sys = { version = "=0.61.2", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry"] }
+
+[build-dependencies]
+embed-manifest = "=1.5.1"
+winresource = "0.1"

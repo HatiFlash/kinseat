@@ -1,0 +1,792 @@
+using System.Diagnostics;
+using MultiSeat.Service.Api;
+using MultiSeat.Service.Sessions;
+using MultiSeat.Service.Streaming;
+using MultiSeat.Shared.Models;
+
+namespace MultiSeat.Service.Monitoring;
+
+/// <summary>
+/// Periodic liveness probe for all active seats.
+///
+/// Checks that the Windows session, Apollo process, and virtual display
+/// are all still alive. Degraded seats trigger auto-recovery:
+///   - Apollo crash → auto-restart (up to ApolloManager.MaxRestartAttempts)
+///   - Apollo Restart from its web UI or tray (exit 0) → relaunch, not counted (issue #124)
+///   - Apollo Quit from its web UI or tray (exit 1115) → left stopped (issue #124)
+///   - Session death → seat enters Error state (requires manual teardown)
+///
+/// Runs on the MultiSeatWorker's health check timer (default: every 5 seconds).
+/// State changes are broadcast to connected WebSocket clients.
+/// </summary>
+public sealed class SessionHealthCheck
+{
+    private readonly ILogger<SessionHealthCheck> _logger;
+    private readonly SessionLauncher _sessionLauncher;
+    private readonly ApolloManager _apolloManager;
+    private readonly SeatManager _seatManager;
+    private readonly OnConnectAppLauncher _onConnectApps;
+    private readonly ClientResolutionFollower _resolutionFollower;
+    private readonly SeatLifecycleGate _lifecycleGate;
+
+    /// <summary>
+    /// Asked for a reconciliation pass when a seat's session is found gone, so a seat with
+    /// auto-start on is set up again instead of staying in Error (issue #87). Optional so tests
+    /// that build this class can leave it out.
+    /// </summary>
+    private readonly SeatReconcileRequests? _reconcileRequests;
+
+    public SessionHealthCheck(
+        ILogger<SessionHealthCheck> logger,
+        SessionLauncher sessionLauncher,
+        ApolloManager apolloManager,
+        SeatManager seatManager,
+        OnConnectAppLauncher onConnectApps,
+        ClientResolutionFollower resolutionFollower,
+        SeatLifecycleGate lifecycleGate,
+        SeatReconcileRequests? reconcileRequests = null)
+    {
+        _reconcileRequests = reconcileRequests;
+        _logger = logger;
+        _sessionLauncher = sessionLauncher;
+        _apolloManager = apolloManager;
+        _seatManager = seatManager;
+        _onConnectApps = onConnectApps;
+        _resolutionFollower = resolutionFollower;
+        _lifecycleGate = lifecycleGate;
+    }
+
+    /// <summary>
+    /// Run health checks on all active seats.
+    /// Returns a list of seats that changed state (for broadcasting).
+    /// </summary>
+    public async Task<IReadOnlyList<SeatInfo>> CheckAllSeatsAsync(
+        SeatManager seatManager, CancellationToken ct)
+    {
+        var changedSeats = new List<SeatInfo>();
+
+        foreach (var seat in seatManager.GetAllSeats())
+        {
+            if (!IsWorthChecking(seat.Status)) continue;
+
+            var changed = await CheckSeatAsync(seat, ct);
+            if (changed)
+                changedSeats.Add(seat);
+        }
+
+        // Broadcast state changes to WebSocket clients
+        foreach (var seat in changedSeats)
+        {
+            try
+            {
+                await WebSocketHub.BroadcastSeatUpdateAsync(seat);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to broadcast state change for seat {Id}", seat.Id);
+            }
+        }
+
+        return changedSeats;
+    }
+
+    /// <summary>
+    /// Check a single seat's health. Returns true if state changed.
+    /// </summary>
+    /// <summary>
+    /// Which seats this check looks at.
+    ///
+    /// A seat mid-provision or mid-teardown is expected to be in flux, so watching it would fight
+    /// whatever is moving it. Error is skipped for a blunter reason: a seat parked there has no
+    /// live session to check.
+    ///
+    /// ⚠️ That last one has a consequence worth stating, because it caused a real bug (PR #22):
+    /// nothing here ever takes a seat OUT of Error, and the Apollo-restart check below only runs
+    /// for a seat this method admits. So a seat that lands in Error stays broken until something
+    /// outside this class hands it back - POST /api/seats/{id}/session-reconnect, or, for a seat
+    /// with auto-start on, a <see cref="SeatReconciler"/> pass, which this class asks for when a
+    /// session is lost (issue #87). Widening this set is not the fix; it would have the check
+    /// fighting a teardown.
+    /// </summary>
+    internal static bool IsWorthChecking(SeatStatus status) =>
+        status is not (SeatStatus.Idle or SeatStatus.Provisioning
+                       or SeatStatus.TearingDown or SeatStatus.Error);
+
+    /// <summary>
+    /// Relaunch the seat session's anchor if it has exited.
+    ///
+    /// Runs only once the session is known Active, which is how the anchor is launched at
+    /// provision time. The exit is reported once by the launcher whatever happens here, so a
+    /// failed relaunch costs one log line, not one every 5 seconds.
+    ///
+    /// The relaunch takes the lifecycle gate so it cannot interleave with a teardown, which
+    /// removes and kills the anchor under the same gate. After waiting for it, the seat is
+    /// checked again: if it was torn down or its session changed meanwhile, nothing is launched.
+    /// The ordering itself is in <see cref="RelaunchExitedAnchorAsync"/>.
+    /// </summary>
+    private async Task EnsureSessionAnchorAsync(SeatInfo seat, CancellationToken ct)
+    {
+        var sessionId = seat.SessionId;
+        try
+        {
+            var outcome = await RelaunchExitedAnchorAsync(
+                hasExitedAnchor: () => _sessionLauncher.HasExitedSessionAnchor(sessionId),
+                acquireGate: c => _lifecycleGate.AcquireAsync(seat.Id, c),
+                takeExitedAnchor: () => _sessionLauncher.TakeExitedSessionAnchor(sessionId),
+                seatStillHoldsSession: () => IsWorthChecking(seat.Status)
+                    && seat.SessionId == sessionId
+                    && _sessionLauncher.IsSessionActive(sessionId, seat.AccountName),
+                relaunch: c => _sessionLauncher.RelaunchSessionAnchorAsync(sessionId, seat.AccountName, c),
+                ct);
+
+            if (outcome == AnchorRelaunchOutcome.SeatChanged)
+            {
+                _logger.LogInformation(
+                    "Seat {Id}: not relaunching the anchor for session {Sid}; the seat or its " +
+                    "session changed while waiting", seat.Id, sessionId);
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Shutdown.
+        }
+        catch (TimeoutException)
+        {
+            // The gate is held by a reconnect, a resolution change or a teardown. Nothing has
+            // been taken, so the exited anchor is still tracked and the next check tries again.
+            _logger.LogInformation(
+                "Seat {Id}: lifecycle gate busy; will retry relaunching the session anchor for " +
+                "session {Sid} on the next check", seat.Id, sessionId);
+        }
+        catch (Exception ex)
+        {
+            // Never let the anchor affect the seat's health verdict. The session is held Active
+            // by the console-side mstsc without it.
+            _logger.LogWarning(ex,
+                "Seat {Id}: could not relaunch the session anchor for session {Sid}; the session " +
+                "is still held by the console-side mstsc", seat.Id, sessionId);
+        }
+    }
+
+    /// <summary>What <see cref="RelaunchExitedAnchorAsync"/> did.</summary>
+    internal enum AnchorRelaunchOutcome
+    {
+        /// <summary>The anchor is running, or none is tracked. The gate was not touched.</summary>
+        NoExitedAnchor,
+
+        /// <summary>By the time the gate was held, the anchor had gone, e.g. teardown removed it.</summary>
+        AlreadyGone,
+
+        /// <summary>Taken and reported, but it died too young to be relaunched.</summary>
+        NotRelaunched,
+
+        /// <summary>Taken and reported, but the seat or its session changed while waiting.</summary>
+        SeatChanged,
+
+        /// <summary>Taken, reported, and the relaunch was started.</summary>
+        Relaunched,
+    }
+
+    /// <summary>
+    /// The order the anchor relaunch runs in, separated from the launcher so it can be tested.
+    ///
+    /// 1. Look without taking. A running anchor costs nothing, and the gate is not touched.
+    /// 2. Wait for the seat's lifecycle gate. This can time out (a reconnect or a resolution
+    ///    change holds it for 15-30 s); the exception propagates, and because nothing was taken
+    ///    the anchor is still tracked, so the next 5-second check tries again.
+    /// 3. Under the gate, take the anchor. The take is what reports the exit, and it removes the
+    ///    entry, so the exit is reported once however the rest goes.
+    /// 4. Check the seat again, then relaunch.
+    ///
+    /// Taking before the gate, as this used to, lost the anchor for good on a gate timeout: the
+    /// entry was gone, so no later check found anything to relaunch.
+    /// </summary>
+    internal static async Task<AnchorRelaunchOutcome> RelaunchExitedAnchorAsync(
+        Func<bool> hasExitedAnchor,
+        Func<CancellationToken, Task<SeatLifecycleGate.ILease>> acquireGate,
+        Func<ExitedSessionAnchor?> takeExitedAnchor,
+        Func<bool> seatStillHoldsSession,
+        Func<CancellationToken, Task> relaunch,
+        CancellationToken ct)
+    {
+        if (!hasExitedAnchor())
+            return AnchorRelaunchOutcome.NoExitedAnchor;
+
+        using var lease = await acquireGate(ct);
+
+        if (takeExitedAnchor() is not { } exited)
+            return AnchorRelaunchOutcome.AlreadyGone;
+
+        if (!exited.ShouldRelaunch)
+            return AnchorRelaunchOutcome.NotRelaunched;
+
+        if (!seatStillHoldsSession())
+            return AnchorRelaunchOutcome.SeatChanged;
+
+        await relaunch(ct);
+        return AnchorRelaunchOutcome.Relaunched;
+    }
+
+    /// <summary>What <see cref="RescueDisconnectedSessionAsync"/> did.</summary>
+    internal enum SessionRescueOutcome
+    {
+        /// <summary>The seat's session was Active once the gate was held: nothing was touched.</summary>
+        AlreadyRecovered,
+
+        /// <summary>The seat changed state while waiting, e.g. a teardown: nothing was touched.</summary>
+        SeatChanged,
+
+        /// <summary>The session was still down under the gate, so the rescue ran.</summary>
+        Rescued,
+    }
+
+    /// <summary>
+    /// The order the Disconnected-session rescue (Check 1b) runs in, separated from the launcher
+    /// so it can be tested.
+    ///
+    /// 1. Wait for the seat's lifecycle gate.
+    /// 2. Under the gate, look at the session again. The check saw it Disconnected before
+    ///    waiting, but the gate is held by exactly the operations that disconnect a session on
+    ///    purpose: a resize or rescale kills Apollo, disconnects, relaunches and starts Apollo,
+    ///    all under it. If the seat's session is Active by now, that operation already did the
+    ///    rescue's job, and running it anyway kills the Apollo it just started (issue #70). The
+    ///    session looked at is the seat's CURRENT one, so a session the operation replaced
+    ///    counts too. This comes before the status test on purpose: that resize also moves the
+    ///    seat off Connecting (measured live, 2 of 7 runs).
+    /// 3. If the session is still down but the seat is no longer in this check's Connecting
+    ///    (a teardown, say), leave it to whatever moved it.
+    /// 4. Otherwise rescue, still holding the gate.
+    ///
+    /// Check 2 does the same for a dead Apollo: it looks again after the gate, because a manual
+    /// restart or teardown may have completed while it waited.
+    /// </summary>
+    internal static async Task<SessionRescueOutcome> RescueDisconnectedSessionAsync(
+        Func<CancellationToken, Task<SeatLifecycleGate.ILease>> acquireGate,
+        Func<bool> seatStillOurs,
+        Func<bool> sessionActiveNow,
+        Func<CancellationToken, Task> rescue,
+        CancellationToken ct)
+    {
+        using var lease = await acquireGate(ct);
+
+        // The session first: a resize that finished while we waited has also moved the seat off
+        // this check's Connecting (its Apollo readiness wait ends in Ready).
+        if (sessionActiveNow())
+            return SessionRescueOutcome.AlreadyRecovered;
+
+        if (!seatStillOurs())
+            return SessionRescueOutcome.SeatChanged;
+
+        await rescue(ct);
+        return SessionRescueOutcome.Rescued;
+    }
+
+    /// <summary>
+    /// Check 1b's rescue: reconnect the session, then restart Apollo on it. The caller holds the
+    /// seat's lifecycle gate. This rewrites SessionId and restarts Apollo, so it needs the same
+    /// gate as every other lifecycle mutation; otherwise a resolution change or manual reconnect
+    /// arriving mid-recovery interleaves with it and strands the old session's mstsc. Nothing
+    /// called here takes the gate, so there is no reentrancy: the semaphore is not recursive
+    /// and a nested acquire would deadlock the seat until the 30s timeout.
+    /// </summary>
+    private async Task RescueSessionUnderGateAsync(SeatInfo seat, CancellationToken ct)
+    {
+        // The session is still down with the gate held, so no resize or rescale explains it:
+        // this is the unexpected drop the Warning is for.
+        _logger.LogWarning(
+            "Seat {Id}: session {Sid} is still Disconnected (PC may have slept) — reconnecting",
+            seat.Id, seat.SessionId);
+
+        // Kill the existing Apollo first — it survived sleep but with a broken
+        // display pipeline (DXGI/QueryDisplayConfig fail on Disconnected sessions).
+        // Without this, RestartAsync launches a second Apollo alongside the first,
+        // causing a port conflict. KillForReconnect also resets RestartCount so
+        // sleep cycles don't exhaust the crash-restart limit.
+        _apolloManager.KillForReconnect(seat);
+
+        // Pass the geometry: if the stale session has to be logged off and recreated,
+        // the replacement must come back at the seat's own size rather than inheriting
+        // the console desktop's — and at its own scale, or an override set through the
+        // API would be lost on every sleep (issue #70).
+        //
+        // Keep the id it answers with: that path returns a NEW session, and the
+        // Apollo restart and display isolation just below both act on SessionId.
+        seat.SessionId = await _sessionLauncher.LaunchSessionAsync(
+            seat.AccountName, ct, _seatManager.GeometryFor(seat));
+
+        // Do not start Apollo against a session that is not ACTIVE yet. Apollo calls
+        // QueryDisplayConfig at startup, and a Disconnected session answers
+        // ERROR_ACCESS_DENIED — so it comes up without a display, dies, and the
+        // health check restarts it into the same state. A fixed delay is not enough
+        // on its own: it is a guess about how long the session takes, and losing that
+        // race produces exactly this loop.
+        if (!await WaitForSessionActiveAsync(
+                id => _sessionLauncher.IsSessionActive(id, seat.AccountName), seat.SessionId, ct))
+        {
+            _logger.LogWarning(
+                "Seat {Id}: session {Sid} did not become ACTIVE within 10s after reconnect — aborting",
+                seat.Id, seat.SessionId);
+            try { _sessionLauncher.DisconnectSession(seat.SessionId); } catch { /* best effort */ }
+            seat.TransitionTo(SeatStatus.Error, _logger);
+            seat.ErrorMessage = "RDP session did not become active after reconnect";
+            return;
+        }
+
+        // Read the scale the reconnected session is running at and record it beside the one the
+        // seat is meant to have (#93). Not awaited, and never acted on here: a session that
+        // dropped on its own keeps the scale it had, so a mismatch is something to report.
+        _seatManager.RecordAppliedScaleInBackground(seat, "after health-check reconnect");
+
+        // The user stopped this seat's Apollo (Quit or the dashboard's Stop) before the session
+        // dropped. Reconnecting the session is ours to do; starting Apollo is not (issue #124).
+        var newPid = await RestartApolloAfterReconnectAsync(
+            stoppedByUser: () => _apolloManager.IsStoppedByUser(seat.Id),
+            restart: async c =>
+            {
+                // Give the display pipeline a moment to reinitialize after the session
+                // transitions back to Active — SudoVDA and DXGI need a beat to be ready.
+                await Task.Delay(2000, c);
+
+                _logger.LogInformation(
+                    "Seat {Id}: session reconnected — restarting Apollo",
+                    seat.Id);
+                return await _apolloManager.RestartAsync(seat, c);
+            },
+            ct);
+
+        if (newPid is null)
+        {
+            _logger.LogInformation(
+                "Seat {Id}: session reconnected; Apollo was stopped by the user, so it is left stopped",
+                seat.Id);
+            seat.ApolloProcessId = 0;
+            seat.TransitionTo(SeatStatus.Ready, _logger);
+            return;
+        }
+
+        if (newPid > 0)
+        {
+            seat.ApolloProcessId = newPid.Value;
+            _logger.LogInformation(
+                "Seat {Id}: Apollo restarted after reconnect (PID {Pid})",
+                seat.Id, newPid);
+
+            // The session disconnect/reconnect wiped display-isolation state
+            // (SudoVDA is no longer primary; the RDP adapter has come back at
+            // its 1024×768 wake default). Without this, Apollo's mode change
+            // ends up on the wrong display and the stream stays at 1024×768.
+            await _seatManager.ApplyDisplayIsolationAsync(seat, ct);
+
+            // API readiness does not prove that the client resumed streaming.
+            seat.TransitionTo(SeatStatus.Ready, _logger);
+            return;
+        }
+
+        // RestartAsync has exhausted the readiness retry budget.
+        seat.TransitionTo(SeatStatus.Error, _logger);
+        seat.ErrorMessage ??= "Apollo did not become ready after reconnect; check its log.";
+    }
+
+    /// <summary>
+    /// The Apollo step of the reconnect rescue, separated so it can be tested (issue #124). While
+    /// the seat is marked as stopped by the user, Apollo is not started and the result is null.
+    /// Otherwise <paramref name="restart"/> runs and its PID (or -1) is returned.
+    /// </summary>
+    internal static async Task<int?> RestartApolloAfterReconnectAsync(
+        Func<bool> stoppedByUser,
+        Func<CancellationToken, Task<int>> restart,
+        CancellationToken ct)
+    {
+        if (stoppedByUser())
+            return null;
+
+        return await restart(ct);
+    }
+
+    private async Task<bool> CheckSeatAsync(SeatInfo seat, CancellationToken ct)
+    {
+        // ── Check 1: Is the Windows session still alive, and still the seat's? ──────────
+        var session = _sessionLauncher.CheckSession(seat.SessionId, seat.AccountName);
+
+        if (session.Verdict == SessionLauncher.SessionVerdict.NotOurs)
+        {
+            // The number is logged on as another account now (or as nobody), so the seat's own
+            // session is gone just the same. Unlike the branch below, do NOT call
+            // DisconnectSession: the mstsc tracked under this number may belong to whoever holds
+            // it now, and killing it would knock that session over instead.
+            _logger.LogWarning(
+                "Seat {Id}: Windows session {Sid} is now logged on as '{Owner}', not {Account}; " +
+                "the seat's own session has ended. Leaving that session alone",
+                seat.Id, seat.SessionId, session.Owner, seat.AccountName);
+            seat.TransitionTo(SeatStatus.Error, _logger);
+            seat.ErrorMessage =
+                $"Windows session {seat.SessionId} no longer belongs to {seat.AccountName}; the seat's session ended";
+            RequestReconcileAfterSessionLoss(seat);
+            return true;
+        }
+
+        if (session.Verdict == SessionLauncher.SessionVerdict.Gone)
+        {
+            _logger.LogWarning(
+                "Seat {Id}: Windows session {Sid} no longer active",
+                seat.Id, seat.SessionId);
+            // Release the seat's mstsc on the way to Error. Nothing else will: teardown is
+            // what normally calls DisconnectSession, and a seat parked in Error may never be
+            // torn down — leaving a hidden mstsc alive for the rest of the host's uptime.
+            try { _sessionLauncher.DisconnectSession(seat.SessionId); } catch { /* best effort */ }
+            seat.TransitionTo(SeatStatus.Error, _logger);
+            seat.ErrorMessage = "Windows session terminated unexpectedly";
+            RequestReconcileAfterSessionLoss(seat);
+            return true;
+        }
+
+        // ── Check 1b: Is the session Active (not just Disconnected)? ──
+        // Sessions go Disconnected when the PC sleeps (mstsc drops). A Disconnected
+        // session breaks QueryDisplayConfig / DXGI, so Apollo cannot stream.
+        // Reconnect via mstsc to restore Active state, then restart Apollo.
+        if (session.Verdict != SessionLauncher.SessionVerdict.Active)
+        {
+            // Information, not Warning: at this point the drop may be our own. A resize or rescale
+            // disconnects the session on purpose while holding the lifecycle gate, so every one of
+            // them lands here (issue #70). Which case it was is only known under the gate below;
+            // the Warning is logged there, once the rescue is actually going to run.
+            _logger.LogInformation(
+                "Seat {Id}: session {Sid} is Disconnected — checking under the lifecycle gate " +
+                "whether it needs reconnecting",
+                seat.Id, seat.SessionId);
+
+            // Show the repair while it is happening. Recovery takes 15-30s (relaunch, up to 10s
+            // waiting for ACTIVE, a 2s settle, an Apollo restart, display isolation) and the seat
+            // used to read Ready/Streaming throughout - claiming health at the one moment it is
+            // least true. Restored to whatever it was on success; Error on any failure below.
+            var previousStatus = seat.Status;
+            seat.TransitionTo(SeatStatus.Connecting, _logger);
+
+            // Broadcast here rather than leaving it to CheckAllSeatsAsync: that only publishes
+            // after CheckSeatAsync returns, by which point recovery has finished and Connecting
+            // would never be seen by a client.
+            try { await WebSocketHub.BroadcastSeatUpdateAsync(seat); }
+            catch (Exception ex) { _logger.LogDebug(ex, "Seat {Id}: could not broadcast Connecting", seat.Id); }
+
+            var triggeringSessionId = seat.SessionId;
+            try
+            {
+                var outcome = await RescueDisconnectedSessionAsync(
+                    acquireGate: c => _lifecycleGate.AcquireAsync(seat.Id, c),
+                    // Connecting is what this check just set. Anything else means another
+                    // operation (a teardown, say) has taken the seat over while we waited.
+                    seatStillOurs: () => seat.Status == SeatStatus.Connecting,
+                    sessionActiveNow: () => _sessionLauncher.IsSessionActive(seat.SessionId, seat.AccountName),
+                    rescue: c => RescueSessionUnderGateAsync(seat, c),
+                    ct);
+
+                switch (outcome)
+                {
+                    case SessionRescueOutcome.AlreadyRecovered:
+                        // Typically a resize or rescale: it disconnects the session on purpose,
+                        // this check saw the gap, and by the time the gate was free the resize
+                        // had relaunched the session and started Apollo on it. That usually also
+                        // set the status (Apollo's readiness wait ends in Ready); only put ours
+                        // back if nothing else has.
+                        _logger.LogInformation(
+                            "Seat {Id}: session {Sid} was Active again once the lifecycle gate was " +
+                            "free (seen Disconnected as session {OldSid}); another operation already " +
+                            "reconnected it, so Apollo is left alone",
+                            seat.Id, seat.SessionId, triggeringSessionId);
+                        if (seat.Status == SeatStatus.Connecting)
+                            seat.TransitionTo(previousStatus, _logger);
+                        return true;
+
+                    case SessionRescueOutcome.SeatChanged:
+                        // The seat's status now belongs to whatever moved it on.
+                        _logger.LogInformation(
+                            "Seat {Id}: not reconnecting session {Sid}; the seat became {Status} " +
+                            "while waiting for the lifecycle gate",
+                            seat.Id, triggeringSessionId, seat.Status);
+                        return false;
+                }
+                return true;
+            }
+            catch (OperationCanceledException)
+            {
+                // Shutdown. Put the status back rather than leaving the seat stuck in Connecting
+                // for whatever a future run makes of it.
+                _logger.LogInformation("Seat {Id}: session reconnect canceled", seat.Id);
+                seat.TransitionTo(previousStatus, _logger);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "Seat {Id}: failed to reconnect session after sleep", seat.Id);
+                seat.TransitionTo(SeatStatus.Error, _logger);
+                seat.ErrorMessage = "Session reconnect failed: " + ex.Message;
+            }
+            return true;
+        }
+
+        // ── Check 1c: Is the session anchor still running? ────────
+        // It expires on its own after 27.8 hours (timeout.exe's cap). The session does not
+        // depend on it, so this never changes the seat's state; it only puts the anchor back.
+        await EnsureSessionAnchorAsync(seat, ct);
+
+        // ── Check 2: Is Apollo still running? ─────────────────────
+        var apolloAlive = IsProcessAlive(seat.ApolloProcessId);
+
+        if (!apolloAlive && seat.ApolloProcessId > 0 &&
+            seat.Status is SeatStatus.Ready or SeatStatus.Streaming)
+        {
+            // Restarting mutates ApolloProcessId and the ApolloManager instance record, so it
+            // must not interleave with a manual restart or a resolution change for the same
+            // seat. The dead-session branch above stays outside the gate deliberately: it only
+            // writes Status and never touches lifecycle state.
+            using var lease = await _lifecycleGate.AcquireAsync(seat.Id, ct);
+
+            // A manual restart or teardown may have completed while we waited for the gate.
+            // Nothing is logged before this point on purpose: a resize kills Apollo and holds
+            // the gate while it starts a new one, so a check landing in that gap used to log
+            // "attempting restart" and an early-exit warning for a restart that never ran.
+            if (seat.Status is not (SeatStatus.Ready or SeatStatus.Streaming)
+                || _apolloManager.IsAlive(seat.Id)) return false;
+
+            // Why did it exit? Read the code before RestartAsync or Stop replaces the record, since
+            // both dispose the handle it comes from (issue #124).
+            var exitCode = _apolloManager.GetExitCode(seat.Id);
+            var (action, newPid) = await ResolveApolloExitAsync(
+                exitCode,
+                _apolloManager.GetUptime(seat.Id),
+                leaveStopped: () => LeaveApolloStoppedAfterQuit(_apolloManager, seat, exitCode, _logger),
+                relaunch: countsAsCrash => RelaunchAfterExitAsync(seat, exitCode, countsAsCrash, ct));
+
+            if (action == ApolloExitAction.LeaveStopped)
+                return true; // PID and message changed — worth broadcasting
+
+            if (newPid > 0)
+            {
+                seat.ApolloProcessId = newPid;
+                seat.TransitionTo(SeatStatus.Ready, _logger);
+                _logger.LogInformation(
+                    "Seat {Id}: Apollo restarted successfully (PID {Pid})",
+                    seat.Id, newPid);
+
+                // Apollo restart re-creates the SudoVDA monitor — the in-session
+                // display-isolation state (SudoVDA-as-primary, RDP shrunk to 640×480)
+                // doesn't survive that, so reapply it.
+                await _seatManager.ApplyDisplayIsolationAsync(seat, ct);
+                return true; // state metadata changed (PID)
+            }
+            else
+            {
+                // Restart failed — give up, and release the session's mstsc with it.
+                WarnIfApolloDiedOnStartup(seat);
+                try { _sessionLauncher.DisconnectSession(seat.SessionId); } catch { /* best effort */ }
+                seat.TransitionTo(SeatStatus.Error, _logger);
+                seat.ErrorMessage ??= "Apollo stopped and could not be restarted; check its log for the cause.";
+                return true;
+            }
+        }
+
+        // ── Check 3: Is a launched app still running? ─────────────
+        // If a game was launched and has exited, transition back to Ready
+        if (seat.Status == SeatStatus.Streaming && !string.IsNullOrEmpty(seat.LaunchApp))
+        {
+            // We don't track the game PID separately (it could spawn children),
+            // so we only flag if Apollo itself died (handled above).
+            // In the future, we could track the game PID for auto-restart.
+        }
+
+        // ── Client connect/disconnect: tail Apollo's log for the edges ──────────
+        // Moves the seat between Ready and Streaming, and launches (or kills) the configured
+        // per-seat apps. Cheap: reads only the bytes appended since the previous tick.
+        //
+        // ⚠️ This DOES change seat state now. It used to be skipped entirely unless
+        // MultiSeat:LaunchOnConnect was configured, which is empty by default — so on a normal
+        // host nothing ever noticed a client connecting and a streaming seat reported Ready
+        // forever (#43). The app launching is still gated; the observation is not.
+        if (_onConnectApps.ProcessSeat(seat, ct))
+            return true; // Ready <-> Streaming changed — worth broadcasting
+
+        // ── Follow the client's requested resolution ──────────────
+        // Apollo cannot apply it itself inside an RDP seat, so resize by reconnecting the
+        // session. No-op unless MultiSeat:FollowClientResolution is on.
+        if (await _resolutionFollower.ProcessSeatAsync(seat, ct))
+            return true; // seat geometry changed — worth broadcasting
+
+        // ── Late SudoVDA detection ────────────────────────────────
+        // Apollo creates the seat's virtual display when a client connects, not at startup,
+        // so provisioning's one-shot lookup always misses it and display isolation gets
+        // skipped for the seat's whole life. Retry here until it appears. No-op once
+        // DisplayDevicePath is set, and silent while there is still nothing to find.
+        if (string.IsNullOrEmpty(seat.DisplayDevicePath))
+        {
+            try
+            {
+                if (await _seatManager.TryLateDisplayDetectionAsync(seat, ct))
+                    return true; // DisplayDevicePath changed — worth broadcasting
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Seat {Id}: late display detection failed", seat.Id);
+            }
+        }
+
+        return false; // no state change
+    }
+
+    /// <summary>
+    /// A seat just went to Error because its session is gone. Ask for a reconciliation pass,
+    /// which sets the seat up again if it has auto-start on and otherwise leaves it as it is.
+    /// This is also what recovers seats when no resume notification arrives, for whatever reason.
+    /// </summary>
+    private void RequestReconcileAfterSessionLoss(SeatInfo seat) =>
+        _reconcileRequests?.Request(
+            $"seat {seat.Id} ({seat.AccountName}) lost its Windows session", includeMissing: false);
+
+    /// <summary>
+    /// What Check 2 does about an exited Apollo, separated from ApolloManager so it can be tested
+    /// (issue #124). The exit code decides: Quit calls <paramref name="leaveStopped"/> and never
+    /// relaunches, a Restart relaunches without counting, and anything else relaunches counted,
+    /// as every exit did before. <paramref name="relaunch"/> takes "counts as a crash" and returns
+    /// the new PID, or -1 when the relaunch failed or the restart budget is spent.
+    /// </summary>
+    internal static async Task<(ApolloExitAction Action, int NewPid)> ResolveApolloExitAsync(
+        int? exitCode,
+        TimeSpan? uptime,
+        Action leaveStopped,
+        Func<bool, Task<int>> relaunch)
+    {
+        var action = ApolloExit.Decide(ApolloExit.Classify(exitCode), IsEarlyExit(uptime));
+        if (action == ApolloExitAction.LeaveStopped)
+        {
+            leaveStopped();
+            return (action, 0);
+        }
+
+        var pid = await relaunch(action == ApolloExitAction.RelaunchCounted);
+        return (action, pid);
+    }
+
+    /// <summary>Check 2's relaunch: log why, show Connecting, and restart Apollo.</summary>
+    private async Task<int> RelaunchAfterExitAsync(
+        SeatInfo seat, int? exitCode, bool countsAsCrash, CancellationToken ct)
+    {
+        if (countsAsCrash)
+        {
+            _logger.LogWarning(
+                "Seat {Id}: Apollo (PID {Pid}) is no longer running (exit code {Code}) — attempting restart",
+                seat.Id, seat.ApolloProcessId, exitCode?.ToString() ?? "unknown");
+
+            WarnIfApolloDiedOnStartup(seat);
+        }
+        else
+        {
+            _logger.LogInformation(
+                "Seat {Id}: Apollo (PID {Pid}) exited with code {Code}, which is its own Restart " +
+                "(web UI or tray) — relaunching it",
+                seat.Id, seat.ApolloProcessId, exitCode);
+        }
+
+        seat.TransitionTo(SeatStatus.Connecting, _logger);
+
+        // Only a crash spends one of MaxRestartAttempts.
+        return await _apolloManager.RestartAsync(seat, ct, countsAsCrash);
+    }
+
+    /// <summary>
+    /// Apollo was quit from its web UI or tray (exit code 1115, issue #124). The user asked for it
+    /// to stop, so it stays stopped: no relaunch, and no restart attempt spent.
+    ///
+    /// The seat ends where the dashboard's own "Stop Apollo" leaves it (SeatManager.StopApollo):
+    /// the record dropped, ApolloProcessId 0, the seat marked as stopped by the user, and the seat
+    /// status kept, so the health check goes on watching the session. Check 2 only relaunches when
+    /// ApolloProcessId is above 0, and the reconnect after a sleep checks the mark; together they
+    /// keep it down. The message says why on the seat card. POST /api/seats/{id}/apollo/start or
+    /// /apollo/restart brings it back and clears the mark, and a successful start clears the message.
+    /// </summary>
+    internal static void LeaveApolloStoppedAfterQuit(
+        ApolloManager apolloManager, SeatInfo seat, int? exitCode, ILogger logger)
+    {
+        logger.LogWarning(
+            "Seat {Id}: Apollo (PID {Pid}) exited with code {Code}, which is Quit from its web UI or " +
+            "tray — leaving it stopped. Start it again from the dashboard",
+            seat.Id, seat.ApolloProcessId, exitCode);
+
+        // Drops the record and its handle, kills any stray Apollo still on this seat's config, and
+        // marks the seat as stopped by the user.
+        apolloManager.StopByUser(seat);
+
+        // Nobody can be streaming from an Apollo that is gone.
+        if (seat.Status == SeatStatus.Streaming)
+            seat.TransitionTo(SeatStatus.Ready, logger);
+
+        seat.ErrorMessage =
+            "Apollo was quit from its web UI or tray and was left stopped. Use Start on the seat's Apollo row to bring it back.";
+    }
+
+    private static bool IsProcessAlive(int pid)
+    {
+        if (pid <= 0) return false;
+        try
+        {
+            using var proc = Process.GetProcessById(pid);
+            return !proc.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Elapsed time selects extra diagnostics; it does not establish the cause.</summary>
+    private void WarnIfApolloDiedOnStartup(SeatInfo seat)
+    {
+        var uptime = _apolloManager.GetUptime(seat.Id);
+        if (!IsEarlyExit(uptime)) return;
+        _logger.LogWarning(
+            "Seat {Id}: Apollo was observed stopped {Seconds:F1}s after launch. "
+            + "Timing alone does not identify the cause. Check the seat's Apollo log for "
+            + "HTTP/TLS, configuration or encoder errors. If it is inconclusive, set "
+            + "MultiSeat:ApolloLogLevel to verbose (not debug), restart when nobody is streaming, "
+            + "and reproduce.", seat.Id, uptime!.Value.TotalSeconds);
+    }
+
+    internal static readonly TimeSpan ApolloStartupWindow = TimeSpan.FromSeconds(30);
+
+    internal static bool IsEarlyExit(TimeSpan? uptime) =>
+        uptime is not null && uptime >= TimeSpan.Zero && uptime <= ApolloStartupWindow;
+
+    /// <summary>
+    /// Poll until the session reports Active, or the timeout expires.
+    /// </summary>
+    /// <remarks>
+    /// Takes the probe as a delegate rather than calling SessionLauncher directly so the timing
+    /// can be tested without a Windows session.
+    /// </remarks>
+    /// <returns>true if the session became Active within the timeout.</returns>
+    internal static async Task<bool> WaitForSessionActiveAsync(
+        Func<int, bool> isSessionActive,
+        int sessionId,
+        CancellationToken ct,
+        int pollMs = 500,
+        int timeoutMs = 10_000)
+    {
+        // Deviation from the ported original, which only observed cancellation through the
+        // Task.Delay inside the loop: an already-cancelled token skipped the loop entirely and
+        // returned a plain false, which the caller cannot tell from "the session never came up"
+        // and so parks the seat in Error during an ordinary shutdown. Cancelling always throws
+        // here, matching both Task.Delay below and LaunchSessionAsync in the same try block.
+        ct.ThrowIfCancellationRequested();
+
+        var waited = 0;
+        while (waited < timeoutMs && !ct.IsCancellationRequested)
+        {
+            if (isSessionActive(sessionId))
+                return true;
+            await Task.Delay(pollMs, ct);
+            waited += pollMs;
+        }
+
+        // One last look: the final sleep may have covered the transition.
+        return isSessionActive(sessionId);
+    }
+}

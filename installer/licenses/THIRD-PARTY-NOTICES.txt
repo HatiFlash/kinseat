@@ -1,0 +1,26 @@
+Kinseat — composants tiers / third-party components
+===================================================
+
+Kinseat (MIT, voir LICENSE-Kinseat-MIT.txt) est un dérivé de MultiSeat (MIT).
+Les composants suivants sont redistribués sous leur propre licence (sans modification, sauf mention).
+
+ApolloVibe v2026.6.1-ms8 — serveur de streaming (paquet Hôte)
+  Licence : GNU GPL version 3 (GPL-3.0.txt)
+  Source correspondante : https://github.com/vibesoftwarecoder/ApolloVibe/releases/tag/v2026.6.1-ms8
+  Copie de la source jointe à la publication Kinseat 0.3.2 : ApolloVibe-v2026.6.1-ms8-source.tar.gz
+
+Moonlight Qt 6.2.0 — moteur de streaming (setup Client Windows)
+  Licence : GNU GPL version 3 (GPL-3.0.txt)
+  Source correspondante : https://github.com/moonlight-stream/moonlight-qt/releases/tag/v6.2.0
+  Copie de la source jointe à la publication Kinseat 0.3.2 : MoonlightSrc-6.2.0.tar.gz
+
+Ces programmes sont lancés comme processus séparés ; Kinseat ne les lie pas à son propre code.
+Pendant au moins trois ans, la source correspondante de ces versions peut aussi être obtenue en
+ouvrant une demande sur le dépôt Kinseat.
+
+HidHide 1.5.230 — filtre de périphériques d'entrée (paquet Hôte, isolation des manettes par place)
+  Licence : MIT — Copyright (c) 2020 Eric Korff de Gidts (texte : x64/HidHide/LICENSE.rtf dans l'archive)
+  Source : https://github.com/nefarius/HidHide/releases/tag/v1.5.230.0
+  Modification : dans HidHide.msi, seules les actions RegisterUpdater et DeregisterUpdater sont retirées
+  de InstallExecuteSequence (l'outil de mise à jour ne se termine pas en installation silencieuse).
+  Pilote et binaires inchangés.

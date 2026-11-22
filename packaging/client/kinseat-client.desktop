@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Kinseat Client
+Comment=Client Kinseat (démonstration sans streaming)
+Exec=kinseat-client
+Icon=kinseat-client
+Terminal=false
+Categories=Game;

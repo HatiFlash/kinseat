@@ -1,0 +1,4 @@
+# Kinseat doit démarrer sur un Windows vierge, sans le redistribuable Visual C++ :
+# runtime C lié statiquement (sans cela : STATUS_DLL_NOT_FOUND sur un Windows sans runtime VC++).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

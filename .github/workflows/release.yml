@@ -1,0 +1,321 @@
+---
+name: Release - MultiSeat Windows x64
+
+# Every release from v0.2.0 to v0.5.1 shipped ZERO assets, so installing meant cloning the
+# repo and building it. scripts/install-service.ps1 runs `dotnet publish` and rebuilds the
+# dashboard, so a consumer needed the .NET 9 SDK *and* Node 20+ on their gaming host just to
+# try a seat manager. See issue #32.
+#
+# This publishes multiseat-windows-x64.zip on a v* tag.
+#
+# SELF-CONTAINED, deliberately. A framework-dependent build is far smaller (7.9 MB zipped
+# against 53.7 MB, measured 2026-09-09) but its runtimeconfig.json requires BOTH
+# Microsoft.NETCore.App and Microsoft.AspNetCore.App. That means the target has to install the
+# ASP.NET Core Runtime specifically - not the plain .NET Runtime, not the Desktop Runtime,
+# all three of which Microsoft offers on the same page. Trading 46 MB for "no runtime, ever"
+# is the right side of that deal for this audience, and it removes a whole class of support
+# round trip where the real answer is "you installed the wrong runtime".
+#
+# The asset name carries NO version, so releases/latest/download/ always resolves and nothing
+# downstream needs editing when a version changes - the same trick ApolloVibe uses and that
+# this repo's own prerequisite script already depends on.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:      # builds and uploads an artifact, never publishes a release
+
+permissions:
+  contents: write         # required to create the release
+
+jobs:
+  # The native Steam isolation helpers ship in the asset, under SteamIsolation\, so an upgrade
+  # replaces them together with the service. Without that, the installer's wipe of the install
+  # folder deleted any copy a host had placed there by hand, and with the feature switched on
+  # every Steam launch was then refused.
+  #
+  # Its own job, on windows-2022, because build.ps1 asks for Visual Studio 2022 and
+  # windows-latest is free to move to a newer Visual Studio. The same smoke tests that run on
+  # every push to src/MultiSeat.SteamIsolation run again here, so a shipped binary has passed
+  # them, rather than relying on the last push having been green.
+  steam-isolation:
+    name: Build Steam isolation helpers (x64 and x86)
+    runs-on: windows-2022
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build launchers, hooks and the safe fixtures
+        shell: pwsh
+        run: ./src/MultiSeat.SteamIsolation/build.ps1 -BuildFixture
+
+      - name: Check native isolation policies
+        shell: pwsh
+        run: |
+          foreach ($architecture in @('x64', 'Win32')) {
+            ctest --test-dir "src/MultiSeat.SteamIsolation/build-$architecture" -C Release --output-on-failure
+            if ($LASTEXITCODE -ne 0) { throw "Policy checks failed for $architecture" }
+          }
+
+      - name: Check launch, restart, readiness, and cleanup
+        shell: pwsh
+        run: ./src/MultiSeat.SteamIsolation/tests/LauncherSmoke.ps1
+
+      - name: Check direct game environment and working directory
+        shell: pwsh
+        run: ./src/MultiSeat.SteamIsolation/tests/GameLauncherSmoke.ps1
+
+      - name: Require all five helper binaries
+        shell: pwsh
+        # Half a set is worse than none: the service picks the launcher and hook by the
+        # architecture of the Steam it starts, so a missing one fails for one Steam only.
+        run: |
+          $dir = 'src/MultiSeat.SteamIsolation/artifacts'
+          $names = @('MultiSeat.SteamLauncher.exe', 'MultiSeat.SteamLauncher32.exe',
+                     'MultiSeat.SteamHook.dll', 'MultiSeat.SteamHook32.dll',
+                     'MultiSeat.SteamShim.exe')
+          $missing = @($names | Where-Object { -not (Test-Path (Join-Path $dir $_)) })
+          if ($missing.Count) { throw "build.ps1 did not produce: $($missing -join ', ')" }
+          $names | ForEach-Object { Get-Item (Join-Path $dir $_) | Select-Object Name, Length | Format-Table -HideTableHeaders }
+
+      - name: Upload the helper binaries for the release job
+        uses: actions/upload-artifact@v6
+        with:
+          name: steam-isolation-binaries
+          # Listed one by one so the test fixtures built beside them never reach the asset.
+          path: |
+            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamLauncher.exe
+            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamLauncher32.exe
+            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamHook.dll
+            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamHook32.dll
+            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamShim.exe
+          if-no-files-found: error
+
+  release:
+    name: Publish windows-x64 asset
+    needs: steam-isolation
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '9.0.x'
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+
+      - name: Resolve version, and refuse a tag that disagrees with version.txt
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(tr -d ' \r\n' < version.txt)
+          if [ -z "$VERSION" ]; then
+            echo "::error::version.txt is empty."
+            exit 1
+          fi
+          # On a tag build the tag and version.txt must agree, or the release title and the
+          # binary would claim different versions - invisible until someone reports it. This
+          # is the failure MoonlightVibe already guards the same way.
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            if [ "v${VERSION}" != "$TAG" ]; then
+              echo "::error::Tag ${TAG} does not match version.txt (${VERSION}). Bump version.txt or move the tag."
+              exit 1
+            fi
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          # Hand-written notes for this version if they exist, otherwise the generic body
+          # below. Release text is public and worth writing deliberately, but a release must
+          # never be blocked on someone having remembered to write it.
+          NOTES="docs/release-notes/${VERSION}.md"
+          if [ -f "$NOTES" ]; then
+            echo "notes_file=${NOTES}" >> "$GITHUB_OUTPUT"
+            echo "Using hand-written notes from ${NOTES}"
+          else
+            echo "No ${NOTES}; falling back to the generic release body."
+          fi
+
+      - name: Publish service (self-contained)
+        run: >
+          dotnet publish src/MultiSeat.Service
+          -c Release -r win-x64 --self-contained
+          -o publish/MultiSeat
+
+      - name: Build dashboard
+        working-directory: src/MultiSeat.Dashboard
+        run: |
+          npm ci
+          npm run build
+
+      - name: Stage dashboard into wwwroot
+        shell: pwsh
+        # install-service.ps1 puts the built dashboard in wwwroot beside the exe; the zip has
+        # to match that layout exactly or the extract-based install serves nothing.
+        run: |
+          $dist = "src/MultiSeat.Dashboard/dist"
+          if (-not (Test-Path $dist)) { throw "dashboard build produced no dist/ - refusing to ship a zip with no UI" }
+          Copy-Item $dist "publish/MultiSeat/wwwroot" -Recurse -Force
+
+      # The InputHook is built with CMake + Ninja under MSYS2's ucrt64 toolchain, exactly as
+      # scripts/install-service.ps1 does it. The runner ships MSYS2 at C:\msys64 but without
+      # that toolchain, so install it INTO THAT INSTANCE.
+      #
+      # The first run of this workflow used msys2/setup-msys2 here, which installs its own
+      # separate MSYS2 under the temp dir. The packages went there while the build step below
+      # invoked C:\msys64\usr\bin\bash.exe, so the build died on "cmake: command not found" -
+      # the toolchain was installed into one MSYS2 and the build ran in another. Using pacman
+      # against C:\msys64 keeps a single instance and matches install-service.ps1 exactly.
+      - name: Install ucrt64 toolchain into the runner's MSYS2
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $bash = "C:\msys64\usr\bin\bash.exe"
+          if (-not (Test-Path $bash)) {
+            Write-Host "::warning::no MSYS2 at C:\msys64 on this runner image"
+            exit 0
+          }
+          & $bash -lc "pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja" 2>&1 | Write-Host
+          exit 0
+
+      - name: Build InputHook DLL
+        shell: pwsh
+        # Optional by design, and it must stay that way. EnableKeyboardMouseIsolation is OFF by
+        # default and, as issue #18 established, the hook is a no-op as architected - a missing
+        # DLL changes nothing about how MultiSeat runs. So a failure here must never sink a
+        # release. It must still be VISIBLE, because a silently absent DLL is how a feature
+        # quietly stops existing.
+        continue-on-error: true
+        run: |
+          $src = "src/MultiSeat.InputHook"
+          if (-not (Test-Path "$src/CMakeLists.txt")) {
+            Write-Host "::warning::no InputHook CMakeLists.txt; skipping"
+            exit 0
+          }
+          $bash = "C:\msys64\usr\bin\bash.exe"
+          if (-not (Test-Path $bash)) {
+            Write-Host "::warning::MSYS2 not present; zip ships without MultiSeatInputHook.dll"
+            exit 0
+          }
+          # Windows path -> MSYS path. Same conversion install-service.ps1 uses, and for the
+          # same reason: CMake under MSYS will not accept a C:\ path.
+          $srcFull = (Resolve-Path $src).Path
+          $srcUnix = '/' + $srcFull.Substring(0,1).ToLower() + ($srcFull.Substring(2) -replace '\\','/')
+          $script = "export PATH='/ucrt64/bin:`$PATH'; cmake -B '$srcUnix/build/Release' -S '$srcUnix' -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=/ucrt64/bin/g++.exe -DCMAKE_MAKE_PROGRAM=/ucrt64/bin/ninja.exe && cmake --build '$srcUnix/build/Release'"
+          & $bash -lc $script 2>&1 | Write-Host
+          $dll = "$src/build/Release/MultiSeatInputHook.dll"
+          if (Test-Path $dll) {
+            Copy-Item $dll "publish/MultiSeat/MultiSeatInputHook.dll" -Force
+            Write-Host "MultiSeatInputHook.dll included"
+          } else {
+            Write-Host "::warning::MultiSeatInputHook.dll was not produced - the zip ships without it. Harmless today (the feature is off by default and a no-op per #18), but it means a zip install and a source install differ."
+          }
+          # Exit clean deliberately. A failing native command leaves $LASTEXITCODE non-zero, so
+          # without this the step exits 1 and is only rescued by continue-on-error - which
+          # renders it GREEN in the UI while something really did fail. The warning above is
+          # the signal; a green step here should mean "handled", not "hidden".
+          exit 0
+
+      # The asset has to carry the installer, not just the binary. v0.6.0 shipped without these and
+      # its own release notes told people to run `.\scripts\install-service.ps1` - a path that only
+      # existed if they had already cloned the repo. The release removed the SDK and Node
+      # requirement but not the clone, which is not what the notes claimed.
+      #
+      # These land at the zip ROOT alongside the service payload. install-service.ps1 -FromZip
+      # explicitly skips them when copying into Program Files, so they ship without polluting the
+      # install directory.
+      - name: Stage the installer scripts into the asset
+        shell: pwsh
+        run: |
+          foreach ($d in @('scripts','prerequisites')) {
+            if (-not (Test-Path $d)) { throw "$d/ is missing from the checkout - the asset would ship without the installer" }
+            Copy-Item $d "publish/MultiSeat/$d" -Recurse -Force
+          }
+          Copy-Item 'README.md' 'publish/MultiSeat/README.md' -Force
+          Write-Host "staged scripts/, prerequisites/ and README.md into the asset"
+
+      - name: Download the Steam isolation helpers into the payload
+        uses: actions/download-artifact@v6
+        with:
+          name: steam-isolation-binaries
+          path: publish/MultiSeat/SteamIsolation
+
+      - name: Verify the payload before zipping it
+        shell: pwsh
+        # A release that extracts to a broken tree is worse than no release, because it looks
+        # installed. Check the things the installer relies on.
+        run: |
+          $root = "publish/MultiSeat"
+          $problems = @()
+          if (-not (Test-Path "$root/scripts/install-service.ps1")) { $problems += "scripts/install-service.ps1 missing - the asset cannot install itself" }
+          if (-not (Test-Path "$root/scripts/lib/install-lib.ps1")) { $problems += "scripts/lib/install-lib.ps1 missing - install-service.ps1 dot-sources it and would fail on the first step" }
+          if (-not (Test-Path "$root/prerequisites/install-prerequisites.ps1")) { $problems += "prerequisites/install-prerequisites.ps1 missing" }
+          if (-not (Test-Path "$root/MultiSeat.Service.exe")) { $problems += "MultiSeat.Service.exe missing" }
+          if (-not (Test-Path "$root/wwwroot/index.html"))    { $problems += "wwwroot/index.html missing (dashboard not staged)" }
+          if (-not (Test-Path "$root/appsettings.json"))      { $problems += "appsettings.json missing" }
+          # Self-contained means the runtime must be inside. If this is absent the zip would
+          # silently require a .NET install, which is the entire thing this release fixes.
+          if (-not (Test-Path "$root/hostfxr.dll"))           { $problems += "hostfxr.dll missing - build is NOT self-contained" }
+          # The installer replaces the whole install folder, so the helpers have to ride in the
+          # asset or an upgrade removes them. All five or nothing; see the steam-isolation job.
+          foreach ($n in @('MultiSeat.SteamLauncher.exe', 'MultiSeat.SteamLauncher32.exe', 'MultiSeat.SteamHook.dll', 'MultiSeat.SteamHook32.dll', 'MultiSeat.SteamShim.exe')) {
+            if (-not (Test-Path "$root/SteamIsolation/$n")) { $problems += "SteamIsolation/$n missing - an upgrade would remove the Steam isolation helpers" }
+          }
+          if ($problems.Count) {
+            $problems | ForEach-Object { Write-Host "::error::$_" }
+            throw "payload verification failed"
+          }
+          $mb = [math]::Round((Get-ChildItem $root -Recurse | Measure-Object Length -Sum).Sum / 1MB, 1)
+          Write-Host "payload OK, $mb MB before compression"
+
+      - name: Zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "publish/MultiSeat/*" -DestinationPath "dist/multiseat-windows-x64.zip" -CompressionLevel Optimal
+          $mb = [math]::Round((Get-Item "dist/multiseat-windows-x64.zip").Length / 1MB, 1)
+          Write-Host "multiseat-windows-x64.zip is $mb MB"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        # On a tag this is a convenience copy; the release below is the real output. Transient
+        # artifact-storage failures have aborted a tag build elsewhere in these repos and left
+        # a tag with no release, so on tags this must not be fatal. On workflow_dispatch the
+        # artifact IS the only output, so there it must still fail the job.
+        continue-on-error: ${{ startsWith(github.ref, 'refs/tags/') }}
+        with:
+          name: multiseat-windows-x64-${{ steps.version.outputs.version }}
+          path: dist/multiseat-windows-x64.zip
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        # Tag pushes only. workflow_dispatch builds and stops, which is what makes it safe for
+        # verifying this workflow without publishing anything.
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: MultiSeat ${{ steps.version.outputs.version }}
+          files: dist/multiseat-windows-x64.zip
+          # body_path wins when docs/release-notes/<version>.md exists; body is the fallback.
+          # softprops ignores an empty body_path, so this degrades cleanly.
+          body_path: ${{ steps.version.outputs.notes_file }}
+          body: |
+            **`multiseat-windows-x64.zip` is a complete, self-contained install.** No clone, no
+            .NET SDK, no .NET runtime, no Node — it carries the installer scripts too. Extract it
+            anywhere and run, from inside the extracted folder:
+
+            ```powershell
+            .\prerequisites\install-prerequisites.ps1     # drivers - needed either way
+            .\scripts\install-service.ps1 -FromZip .
+            ```
+
+            Built from `${{ github.sha }}`.
+
+            The asset name carries no version on purpose, so
+            `releases/latest/download/multiseat-windows-x64.zip` always resolves to the newest
+            release and scripts that fetch it never need editing.

@@ -1,0 +1,1379 @@
+using System.Diagnostics;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using Microsoft.Extensions.Options;
+using MultiSeat.Service.Configuration;
+using MultiSeat.Service.Library;
+using MultiSeat.Shared;
+using MultiSeat.Shared.Models;
+
+namespace MultiSeat.Service.Streaming;
+
+/// <summary>
+/// Generates per-seat Apollo/Sunshine configuration files.
+///
+/// Each seat gets a unique sunshine.conf with:
+///   - Unique server name (for Moonlight client identification)
+///   - Isolated port range (HTTPS, HTTP, Video, Audio, Control)
+///   - Display output target (SudoVDA device path)
+///   - Audio sink (VAC cable device ID)
+///   - Encoder preferences (NVENC → AMF → software)
+///   - Controller and input settings
+///   - Logging paths
+///
+/// Apollo/Sunshine config format is key=value pairs (INI-like).
+/// Documentation: https://docs.lizardbyte.dev/projects/sunshine/
+///
+/// The config file is written to:
+///   {configDir}/{seatId:N}/sunshine.conf
+/// </summary>
+public sealed class ApolloConfigBuilder
+{
+    private readonly ILogger<ApolloConfigBuilder> _logger;
+    private readonly MultiSeatOptions _options;
+    private readonly LibraryStore? _library;
+    private readonly GameLaunchManifestWriter? _gameManifests;
+
+    public ApolloConfigBuilder(ILogger<ApolloConfigBuilder> logger, IOptions<MultiSeatOptions> options,
+        LibraryStore? library = null, GameLaunchManifestWriter? gameManifests = null)
+    {
+        _logger = logger;
+        _options = options.Value;
+        _library = library;
+        _gameManifests = gameManifests;
+    }
+
+    /// <summary>
+    /// Generate a per-seat sunshine.conf and write it to the Apollo config directory.
+    /// Returns the absolute path to the generated config file.
+    /// </summary>
+    public string BuildConfig(SeatInfo seat, string configDir)
+    {
+        // Use accountName as the directory so the same account always lands in the same
+        // directory across teardown/re-provision. This lets sunshine_state.json (and thus
+        // the server UUID and paired clients) survive seat teardowns, avoiding the need
+        // to re-enter a PIN in Moonlight after every re-provision.
+        var seatDir = Path.GetFullPath(Path.Combine(configDir, seat.AccountName));
+        // Guard against path traversal — seat.AccountName must stay inside configDir.
+        if (!seatDir.StartsWith(Path.GetFullPath(configDir) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException(
+                $"Account name '{seat.AccountName}' would escape the Apollo config directory.");
+        Directory.CreateDirectory(seatDir);
+        // Lock the seat directory before anything is written into it (GH #28). Left inheriting, it
+        // carries ProgramData's BUILTIN\Users:(W) on the directory itself, so any local account -
+        // including every other seat - can create files here. Re-applied on every provision, so an
+        // existing host is fixed the next time its seats come up rather than needing a migration.
+        ProtectSeatDirectory(seatDir, seat.AccountName, SeatDirConsequence);
+
+        var configPath = Path.Combine(seatDir, "sunshine.conf");
+        // Requested, not guaranteed: some builds ignore log_path (Vibepollo writes timestamped
+        // files under <seatDir>\logs\ regardless). Never assume the log is here — read it back
+        // through ApolloManager.ResolveLogPath.
+        var logPath = Path.Combine(seatDir, "apollo.log").Replace('\\', '/');
+        var statePath = Path.Combine(seatDir, "config", "sunshine_state.json").Replace('\\', '/');
+        var appsPath = Path.Combine(seatDir, "config", "apps.json").Replace('\\', '/');
+        // All seats share one credentials file so web UI login persists across re-provisioning.
+        // The file is created by MultiSeat on first run (from Apollo's default config) and survives seat teardown.
+        var credPath = Path.Combine(configDir, "shared_credentials.json").Replace('\\', '/');
+        var tlsDir = Path.Combine(seatDir, "config", "credentials").Replace('\\', '/');
+        EnsureSharedCredentials(configDir);
+        // platf::appdata() on Windows resolves to {exe_dir}/config/ — not the working directory.
+        // To isolate each seat's state file (and thus its UUID), we seed sunshine_state.json in
+        // the per-seat config/ dir and write an explicit file_state = <absolute_path> in the
+        // generated sunshine.conf so Apollo uses that path instead of the shared exe-dir default.
+        // Only create if absent — pairings (stored in sunshine_state) survive re-provisioning.
+        EnsureSeatConfigDir(seatDir, seat.AccountName);
+        EnsureSeatStateFile(seatDir, seat.AccountName);
+        EnsureSeatAppsJson(seatDir, seat.AccountName);
+        EnsureSeatLogWritable(seatDir, seat.AccountName);
+
+        var sb = new StringBuilder(2048);
+
+        // ── Header ────────────────────────────────────────────────────
+        sb.AppendLine($"# Auto-generated by MultiSeat for seat {seat.Id}");
+        sb.AppendLine($"# Account: {seat.AccountName}");
+        sb.AppendLine($"# Generated: {DateTimeOffset.UtcNow:O}");
+        sb.AppendLine($"# Do not edit — changes will be overwritten on next seat provision.");
+        sb.AppendLine();
+
+        // ── Server identity ───────────────────────────────────────────
+        // Each seat has a unique name visible in Moonlight's server list.
+        // Include a seat number derived from the port block so multiple seats
+        // with the same account are distinguishable (e.g. MultiSeat-RogAlly-1).
+        var seatNumber = (seat.PortBase - Constants.PortBase) / Constants.PortsPerSeat + 1;
+        sb.AppendLine("# Server identity");
+        sb.AppendLine($"sunshine_name = MultiSeat-{seat.AccountName}-{seatNumber}");
+        sb.AppendLine();
+
+        // ── Network ports ─────────────────────────────────────────────
+        // 'port' is Apollo's base; all other ports are derived via map_port(N) = base+N:
+        //   base-5  = GFE HTTPS (Moonlight pairing + launch)
+        //   base+0  = GFE HTTP  (same, plaintext fallback)  ← this is the 'port' value
+        //   base+1  = Apollo web UI HTTPS
+        //   base+9  = RTP video
+        //   base+10 = ENet control
+        //   base+11 = RTP audio
+        //   base+12 = RTP mic
+        //   base+26 = RTSP session setup
+        sb.AppendLine("# Network — unique port range for this seat");
+        sb.AppendLine($"port = {seat.PortBase + Constants.OffsetGfeHttp}");
+        sb.AppendLine();
+
+        // ── Display ───────────────────────────────────────────────────
+        // output_name is set after SudoVDA creates the virtual display (UpdateDisplayOutput).
+        // always_use_virtual_display is NOT a sunshine.conf key in ClassicOldSong/Apollo — it
+        // was moved to per-paired-device state in sunshine_state.json. MultiSeat manages the
+        // virtual display externally via VirtualDisplayManager; output_name points Apollo at it.
+        sb.AppendLine("# Display — output_name set to SudoVDA virtual display UUID");
+        if (!string.IsNullOrEmpty(seat.DisplayDevicePath))
+            sb.AppendLine($"output_name = {seat.DisplayDevicePath}");
+        else
+            sb.AppendLine("# output_name = pending");
+        sb.AppendLine($"resolutions = [{seat.Width}x{seat.Height}]");
+        // Provide all standard framerates up to the seat's configured max so Moonlight
+        // can offer the user a choice. Apollo picks the closest supported rate.
+        var allFps = new[] { 30, 60, 90, 120, 144, 160, 240 };
+        var fpsList = string.Join(", ", allFps.Where(f => f <= seat.Fps));
+        sb.AppendLine($"fps = [{fpsList}]");
+        sb.AppendLine();
+
+        // ── Display-device auto-configuration ─────────────────────────
+        // Make Apollo actively set the SudoVDA display mode when a client connects.
+        // Without these keys, dd_configuration_option defaults to "disabled" and Apollo
+        // never reconfigures SudoVDA — the virtual display stays at its creation default
+        // (the host/RDP surface size), so the stream ignores the client's requested
+        // resolution/fps entirely (GitHub issue #11).
+        //   ensure_active — activate + configure the SudoVDA output. It does NOT force the
+        //                   display primary or disable others, so it won't fight MultiSeat's
+        //                   own display isolation (which already sets SudoVDA primary).
+        //   auto          — follow the resolution/refresh the Moonlight client requests.
+        // NOTE: Apollo only applies these when the Moonlight client has "Optimize game
+        // settings" (SOPS) enabled — otherwise it logs a warning and leaves the mode as-is.
+        // Do NOT add dd_use_sunshine_virtual_display_driver here. It is not a key this Apollo
+        // build has — it only ever appeared in the config dump because Apollo echoes unknown
+        // keys back, which is what made it look like it was doing something. Measured and
+        // reported in issue #15.
+        sb.AppendLine("# Display device — match the Moonlight client's requested resolution/fps");
+        sb.AppendLine("dd_configuration_option = ensure_active");
+        sb.AppendLine("dd_resolution_option = auto");
+        sb.AppendLine("dd_refresh_rate_option = auto");
+        sb.AppendLine();
+
+        // ── Force a virtual display for the seat ──────────────────────
+        // The dd_* keys above only configure a virtual display that already exists;
+        // nothing above causes Apollo to CREATE one. Apollo gates creation on
+        // (process.cpp): headless_mode || client-requested || per-app virtual_display
+        // || !allow_encoder_probing(). Inside an RDP-loopback seat the RDP surface is an
+        // active display, so encoder probing succeeds and none of the other triggers fire
+        // — Apollo creates nothing and the seat silently captures the RDP desktop instead
+        // (SeatManager then logs "SudoVDA display not found in Apollo log").
+        // headless_mode is the only trigger that is a config key, so it is the one we can
+        // set from here: "When enabled, all apps will start in virtual display."
+        sb.AppendLine("# Headless — force every app into a virtual display. Without this,");
+        sb.AppendLine("# Apollo never creates SudoVDA in an RDP seat and captures the RDP surface.");
+        sb.AppendLine("headless_mode = enabled");
+        sb.AppendLine();
+
+        // ── Encoder ───────────────────────────────────────────────────
+        // NVENC by default, for hardware-accelerated low-latency encoding, and
+        // Apollo falls back on its own where it is absent. That fallback is not
+        // safe everywhere: on AMD it lands on AMF, whose startup probe runs
+        // against the RDP surface a seat provides — 1000Hz refresh, no real
+        // display — and hangs there. Apollo then never reaches the point where
+        // it opens its HTTP servers, so the seat reports Ready with no port
+        // listening. MultiSeat:Encoder lets such a host say what to use.
+        var encoder = SanitizeConfigValue(_options.Encoder, "nvenc", "Encoder",
+            ["nvenc", "quicksync", "amdvce", "software"]);
+        sb.AppendLine($"# Encoder — {encoder} (MultiSeat:Encoder)");
+        sb.AppendLine($"encoder = {encoder}");
+        sb.AppendLine();
+
+        // ── NVENC tuning ──────────────────────────────────────────────
+        var (nvencPresetNum, nvencTwopass, nvencSpatialAq, nvencVbvIncrease) =
+            GetNvencSettings(seat.NvencPreset);
+        sb.AppendLine($"# NVENC tuning — {seat.NvencPreset} preset");
+        sb.AppendLine($"nvenc_preset = {nvencPresetNum}");
+        sb.AppendLine($"nvenc_twopass = {nvencTwopass}");
+        sb.AppendLine($"nvenc_spatial_aq = {nvencSpatialAq}");
+        sb.AppendLine($"nvenc_vbv_increase = {nvencVbvIncrease}");
+        sb.AppendLine("nvenc_latency_over_power = enabled");
+        sb.AppendLine();
+
+        // ── Audio output (game audio → Moonlight) ─────────────────────
+        // Route game audio to the seat's dedicated virtual device via Apollo's virtual_sink —
+        // the sink Apollo uses when the client does NOT play audio on the host (the normal seat
+        // case). Apollo captures this named device (WASAPI loopback) and streams it to Moonlight.
+        // Requires audiomode:i:1 in the RDP session (set in Default.rdp) so host audio devices
+        // (VB-CABLE, VoiceMeeter) are visible via WASAPI inside the session.
+        //
+        // We deliberately use virtual_sink (not audio_sink) and set keep_sink_default = disabled
+        // to avoid hijacking the console/host audio (issue #10). Windows has a single machine-wide
+        // default output device shared by the console session and every seat. Apollo's set_sink()
+        // changes that default globally at stream start; with keep_sink_default enabled (Apollo's
+        // default) it would also *re-assert* the seat's device as the global default whenever
+        // anything else changes it — fighting the console and other seats and leaving the host with
+        // no sound. With it disabled, Apollo still points the game at the sink for the duration of
+        // the stream and restores the previous default afterwards, without holding it. MultiSeat no
+        // longer sets the global default itself (see SeatManager — the --set-default-render step was
+        // removed for the same reason).
+        if (_options.AudioMode == AudioMode.PerSession)
+        {
+            // PerSession: the seat's RDP session has its OWN "Remote Audio" endpoint, already
+            // the session default, and Apollo runs inside that session — so it captures the
+            // right thing with no sink named at all.
+            //
+            // Naming it is not merely unnecessary, it BREAKS it:
+            //   audio_sink   → Apollo re-roles the endpoint;
+            //   virtual_sink → Apollo REWRITES the endpoint's wave format, after which loopback
+            //                  capture fails for every client including Apollo itself.
+            // Both were tried in the field and both failed. Leave both keys unset.
+            //
+            // The endpoint's friendly name is localized by Windows ("Audio remoto" on a Spanish
+            // install), which is a second, independent reason never to match it by name here.
+            sb.AppendLine("# Audio output — per-session: Apollo captures this RDP session's own");
+            sb.AppendLine("# 'Remote Audio' endpoint, which Windows already made the session default.");
+            sb.AppendLine("# Both audio_sink and virtual_sink are deliberately UNSET — naming this");
+            sb.AppendLine("# endpoint makes Apollo re-role it or rewrite its wave format, breaking capture.");
+        }
+        else if (!string.IsNullOrEmpty(seat.AudioGameRenderFriendlyName))
+        {
+            sb.AppendLine("# Audio output — capture the seat's virtual device without holding the global default");
+            sb.AppendLine($"virtual_sink = {seat.AudioGameRenderFriendlyName}");
+        }
+        else
+        {
+            sb.AppendLine("# virtual_sink = (no game audio device assigned)");
+        }
+        // Both modes: never let Apollo take or re-assert ownership of an endpoint. Under
+        // SharedHost that protects the console's default (#10); under PerSession it keeps
+        // Apollo's hands off the session endpoint it is only supposed to read.
+        sb.AppendLine("keep_sink_default = disabled");
+        sb.AppendLine("auto_capture_sink = disabled");
+        sb.AppendLine();
+
+        // ── Audio input (mic from Moonlight → game) ────────────────────
+        // stream_mic: Apollo receives Moonlight mic audio, decodes Opus frames, and renders
+        // them into "Speakers (Steam Streaming Microphone)". SeatManager sets
+        // "Microphone (Steam Streaming Microphone)" as the session default capture so games
+        // automatically use it. Requires Steam installed for its audio driver.
+        // Client must be logabell/moonlight-qt-mic (standard Moonlight does not send mic packets).
+        //
+        // PerSession has no mic path: a session that keeps its own audio cannot see the host's
+        // Steam Streaming Microphone, and there is no in-session equivalent to render into. This
+        // is the mode's one real cost, so it is written explicitly rather than left to default.
+        if (_options.AudioMode == AudioMode.PerSession)
+        {
+            sb.AppendLine("# Audio input — unavailable under per-session audio: the seat session");
+            sb.AppendLine("# cannot see the host's Steam Streaming Microphone. Use SharedHost if you need mic.");
+            sb.AppendLine("stream_mic = disabled");
+        }
+        else
+        {
+            sb.AppendLine("# Audio input — Apollo streams Moonlight mic into Steam Streaming Microphone");
+            sb.AppendLine("stream_mic = enabled");
+        }
+        sb.AppendLine();
+
+        // ── Input ─────────────────────────────────────────────────────
+        // ViGEm virtual controllers are auto-detected by Apollo
+        sb.AppendLine("# Input — ViGEm virtual controllers are auto-detected");
+        sb.AppendLine("controller = enabled");
+        sb.AppendLine("gamepad = auto");
+        sb.AppendLine("# Moonlight sends KBM input; Apollo creates virtual KBM in-session");
+        sb.AppendLine("keybindings_enabled = enabled");
+        sb.AppendLine("mouse = enabled");
+        sb.AppendLine("keyboard = enabled");
+        sb.AppendLine();
+
+        // ── USB forwarding: always OFF for a seat ─────────────────────
+        // ApolloVibe's USB tunnel (main port + 7) is off by default, but a default can change.
+        // An imported USB device is a machine-wide PnP device, not a per-session one, so a seat
+        // must never open a tunnel. Written explicitly, with the spelling the rest of this file
+        // uses ("disabled"; ApolloVibe's to_bool reads anything not true/yes/enable(d)/on/containing
+        // '1' as false). usb_forwarding_port is deliberately NOT written: with the feature off it is
+        // never bound, and main + 7 stays reserved (Constants.OffsetUsbForwarding), not opened.
+        sb.AppendLine("# USB forwarding stays off in every seat (machine-wide devices; see docs)");
+        sb.AppendLine("usb_forwarding_enabled = disabled");
+        sb.AppendLine();
+
+        // ── Second video stream (MultiSeat:SecondVideoStream) ─────────
+        // Lets a client such as MoonlightVibe show one WINDOW of this seat in a second client window.
+        // Written either way, in the spelling the rest of this file uses, so a seat never depends on
+        // ApolloVibe's own default. A seat cannot offer a whole display: its session is RDP, and
+        // ApolloVibe only offers one outside a remote session, so a request for one falls back to a
+        // single stream with no setting needed here.
+        sb.AppendLine("# Second video stream — a window of this seat in a second client window");
+        sb.AppendLine(_options.SecondVideoStream ? "second_video_stream = enabled" : "second_video_stream = disabled");
+        sb.AppendLine();
+
+        // ── Security ──────────────────────────────────────────────────
+        // file_state must be an absolute path — Apollo resolves relative paths against
+        // {exe_dir}/config/, which is shared by all instances. Each seat needs its own
+        // sunshine_state.json so Moonlight sees distinct UUIDs and lists them separately.
+        sb.AppendLine("# Security");
+        sb.AppendLine($"file_state = {statePath}");
+        sb.AppendLine($"credentials_file = {credPath}");
+        // file_apps needs the same treatment, and not having it was a seat-killing bug (#63).
+        // Left at its default, Apollo resolves apps.json to {exe_dir}/config/apps.json — inside
+        // Program Files — and if that file is absent it tries to CREATE it there by copying
+        // assets/apps.json. A seat is a standard user with ReadAndExecute on that directory, so
+        // the copy fails and Apollo exits before logging::init. The seat then fails provisioning
+        // with no apollo.log at all, and the error points at a log file that was never written.
+        //
+        // The install-dir file exists on any host where Apollo has been run elevated once, which
+        // is why this never reproduced here and did reproduce on a clean install.
+        //
+        // EnsureSeatAppsJson already seeds a per-seat copy and grants the seat Modify on it. This
+        // is the line that makes Apollo actually read it, so each seat also gets its own app list
+        // rather than sharing one in Program Files.
+        //
+        // ⚠️ CORRECTION: this line alone did not fix #63. Apollo creates {exe_dir}/config/ and
+        // copies assets/apps.json to the DEFAULT path before it reads file_apps, so a clean
+        // install still failed the same way. ApolloManager now seeds that install-dir copy as
+        // SYSTEM before every launch — see ApolloInstallSeed.
+        sb.AppendLine($"file_apps = {appsPath}");
+        // The same reasoning covers the TLS material. Left at its default Apollo
+        // looks for cakey.pem under {exe_dir}/config/credentials/, inside Program
+        // Files — which a seat account cannot write, so it cannot even generate
+        // one. It dies on "HTTP interface failed to initialize" and never opens a
+        // port. The per-seat credentials/ dir is already created for this.
+        sb.AppendLine($"pkey = {tlsDir}/cakey.pem");
+        sb.AppendLine($"cert = {tlsDir}/cacert.pem");
+        // Each seat has independent pairing — Moonlight pairs per-seat
+        sb.AppendLine("origin_web_ui_allowed = lan");
+        sb.AppendLine();
+
+        // ── Streaming quality ─────────────────────────────────────────
+        sb.AppendLine("# Streaming quality");
+        sb.AppendLine("min_threads = 2");
+        sb.AppendLine("hevc_mode = 2");  // allow HEVC if client supports it
+        sb.AppendLine("av1_mode = 2");   // allow AV1 if client supports it — with encoder=software, AV1 probe just warns and continues (harmless)
+        sb.AppendLine("fec_percentage = 20");
+        sb.AppendLine();
+
+        // ── Color settings ────────────────────────────────────────────
+        // color_space = 1 → Rec. 709 (correct for HD content; default 0 = Rec. 601 SD)
+        // color_range = 1 → full range (0–255); default 0 = limited range (16–235), which
+        //   crushes blacks/whites and makes text look washed out / blurry on PC monitors.
+        // For sharpest text, also enable "4:4:4 color mode" in Moonlight's Advanced settings
+        // on the client — that negotiates YUV 4:4:4 instead of 4:2:0 chroma subsampling.
+        sb.AppendLine("# Color — Rec. 709 full-range for sharp text on PC monitors");
+        sb.AppendLine("color_space = 1");
+        sb.AppendLine("color_range = 1");
+        sb.AppendLine();
+
+        // ── Logging ───────────────────────────────────────────────────
+        sb.AppendLine("# Logging");
+        var logLevel = SanitizeConfigValue(_options.ApolloLogLevel, "info", "ApolloLogLevel",
+            ["verbose", "debug", "info", "warning", "error"]);
+        sb.AppendLine($"min_log_level = {logLevel}");
+        sb.AppendLine($"log_path = {logPath}");
+        sb.AppendLine();
+
+        // ── Advanced ──────────────────────────────────────────────────
+        sb.AppendLine("# Advanced — notify MultiSeat on client connect/disconnect");
+        sb.AppendLine("# ping_timeout = 10000");
+        sb.AppendLine("# back_button_timeout = 2000");
+
+        // Atomic replacement: Apollo reads this file at every (re)start, so a crash
+        // mid-write must never leave a torn config behind. Same bytes as before.
+        AtomicFile.WriteAllText(configPath, sb.ToString(), Encoding.UTF8);
+        _logger.LogDebug("Wrote Apollo config to {Path} ({Bytes} bytes)",
+            configPath, sb.Length);
+
+        return configPath;
+    }
+
+    /// <summary>
+    /// Update an existing config file with the virtual display device path.
+    /// Called after SudoVDA creation.
+    /// </summary>
+    public void UpdateDisplayOutput(string configPath, string displayDevicePath)
+    {
+        if (!File.Exists(configPath))
+        {
+            _logger.LogWarning("Config file not found for display update: {Path}", configPath);
+            return;
+        }
+
+        var lines = File.ReadAllLines(configPath);
+        var updated = false;
+
+        for (int i = 0; i < lines.Length; i++)
+        {
+            if (lines[i].StartsWith("output_name = ") ||
+                lines[i].StartsWith("# output_name = "))
+            {
+                lines[i] = $"output_name = {displayDevicePath}";
+                updated = true;
+                break;
+            }
+        }
+
+        if (updated)
+        {
+            // Byte-identical to the previous File.WriteAllLines call (each line followed
+            // by a newline, including the last), written atomically: this runs on live
+            // seats whose Apollo may re-read the file, so a torn write is not acceptable.
+            var contents = lines.Length == 0
+                ? string.Empty
+                : string.Join(Environment.NewLine, lines) + Environment.NewLine;
+            AtomicFile.WriteAllText(configPath, contents, Encoding.UTF8);
+            _logger.LogInformation("Updated output_name={DevicePath} in {Path}", displayDevicePath, configPath);
+        }
+    }
+
+    /// <summary>
+    /// Ensure the per-seat config/ and config/credentials/ subdirectories exist,
+    /// and seed the TLS cert/key from Apollo's install dir.
+    ///
+    /// Apollo resolves config files from {exe_dir}/config/ by default.
+    /// We override file_state, file_apps and credentials_file to absolute per-seat paths in the conf:
+    ///   sunshine_state.json — unique UUID per seat (Moonlight server identity)
+    ///   apps.json           — game/app list, copied fresh each provision
+    ///   credentials/        — TLS cert + key for HTTPS pairing
+    ///
+    /// ⛔ apps.json used to be seeded WITHOUT the file_apps override, which is issue #63: Apollo
+    /// then read {exe_dir}/config/apps.json, and on a host where that file did not exist it tried
+    /// to create it inside Program Files as a standard user and exited before logging started.
+    /// Seeding a file is not enough — Apollo has to be told to read it. Telling it was not enough
+    /// either: Apollo still touches the install-dir copy before reading file_apps, which
+    /// <see cref="ApolloInstallSeed"/> covers.
+    ///
+    /// ProcessInjector sets workingDir = seatDir. BUILTIN\Users only has Write
+    /// (create files), not Modify (create subdirectories), on ProgramData dirs.
+    /// Pre-creating these dirs as SYSTEM avoids Apollo exiting on credentials mkdir failure.
+    /// </summary>
+    private void EnsureSeatConfigDir(string seatDir, string accountName)
+    {
+        var configDir = Path.Combine(seatDir, "config");
+        var credDir = Path.Combine(configDir, "credentials");
+        Directory.CreateDirectory(configDir);
+        Directory.CreateDirectory(credDir);
+
+        // Lock the credentials dir before anything is seeded into it. Left inheriting, it
+        // carries ProgramData's BUILTIN\Users:(RX), so every standard user on the host -
+        // including every OTHER seat - can read the TLS private key and impersonate this
+        // seat's pairing endpoint.
+        ProtectSeatDirectory(credDir, accountName, CredentialsDirConsequence);
+
+        // Apollo uses relative paths for its assets and tools directories
+        // (e.g. ./assets/shaders/ for GPU shaders). Create junction points so
+        // Apollo can find these when running with workingDir = seatDir.
+        var apolloRoot = Path.GetDirectoryName(_options.ApolloExePath)
+                         ?? @"C:\Program Files\Apollo";
+        CreateJunctionIfMissing(Path.Combine(seatDir, "assets"),
+                                Path.Combine(apolloRoot, "assets"));
+        CreateJunctionIfMissing(Path.Combine(seatDir, "tools"),
+                                Path.Combine(apolloRoot, "tools"));
+
+        // A seat is NOT seeded with a TLS identity any more.
+        //
+        // It used to be handed a copy of the console Apollo's cakey.pem, with a comment saying
+        // all seats could share one cert because Moonlight identifies seats by uniqueid. The
+        // second half is wrong: pairing hands the client the SERVER CERTIFICATE (root.plaincert,
+        // nvhttp.cpp getservercert), so the cert is pinned per host entry. And sharing one key
+        // across every seat and the console means any of them can impersonate the others - while
+        // the source copy under the Apollo install stays readable by every local user, which no
+        // permission work on our side can fix.
+        //
+        // Apollo generates its own 2048-bit credentials when either file is missing
+        // (httpcommon.cpp: "if (!fs::exists(pkey) || !fs::exists(cert)) create_creds(...)"), and
+        // the credentials dir is now writable by the seat, so doing nothing is what gives each
+        // seat a key of its own.
+        //
+        // Seats provisioned before this still hold the shared key. Replacing it breaks their
+        // pairings, so it happens only when asked for.
+        if (_options.RotateSharedSeatTls)
+            RotateSeededTlsIdentity(credDir);
+    }
+
+    /// <summary>
+    /// Copy apps.json from the Apollo install dir to the per-seat config/ dir.
+    /// Apollo looks for apps in {workingDir}/config/apps.json. Without it the
+    /// seat will have an empty app list. Always overwrites so the seat picks up
+    /// any games the user adds to the main Apollo installation.
+    ///
+    /// The copy is not verbatim: per-app keys that only make sense for the console
+    /// install are stripped on the way in — see <see cref="ConsoleOnlyAppKeys"/>.
+    /// </summary>
+    private void EnsureSeatAppsJson(string seatDir, string accountName)
+    {
+        var dest = Path.Combine(seatDir, "config", "apps.json");
+
+        var source = ResolveAppsJsonSource();
+        if (source is null && _library is null)
+        {
+            _logger.LogDebug("No Apollo apps.json found to seed — seat will use built-in defaults");
+            return;
+        }
+
+        try
+        {
+            // The seat still needs a Desktop entry on a fresh Apollo install without a seeded list.
+            var json = source is null ? "{\"apps\":[{\"name\":\"Desktop\"}]}" : File.ReadAllText(source);
+            var stripped = StripConsoleOnlyAppKeys(json, out var removed);
+            if (_library is not null)
+            {
+                var games = _library.Get().Games;
+                var manifests = _gameManifests?.Sync(accountName, games);
+                if (manifests is { Count: > 0 } && _gameManifests?.LauncherAvailable(_options) != true)
+                    manifests = null;
+                stripped = AddAssignedGames(stripped, games, accountName, _options.SteamIsolationEnabled,
+                    manifests, GameLaunchManifestWriter.LauncherPath(_options), _gameManifests?.FileExistsCheck,
+                    name => _logger.LogWarning("Jeu {Name} non publié pour {Account} : isolation des fichiers indisponible (manifeste ou lanceur absent)", name, accountName));
+            }
+            stripped = WrapSteamEntries(stripped);
+
+            // Atomic: Apollo reads this at startup. The seat grant below targets the
+            // NEW file object, so it stays after the move (a rename does not carry ACEs).
+            AtomicFile.WriteAllText(dest, stripped, Encoding.UTF8);
+
+            // Same hazard as the state file: the service writes this, so the seat inherits
+            // read-and-execute and cannot save app edits made in Apollo's web UI. The write
+            // fails with nothing logged at either end.
+            //
+            // Note this file is deliberately overwritten on every provision so a seat picks up
+            // games added to the main install, so an edit made inside a seat survives only
+            // until the next provision. That is a separate design decision, and it is still
+            // better than the edit failing invisibly the moment it is made.
+            GrantSeatWrite(dest, accountName, AppsJsonConsequence);
+
+            if (removed > 0)
+                _logger.LogInformation(
+                    "Seeded apps.json from {Source} — stripped {Count} console-only key(s)", source, removed);
+            else
+                _logger.LogDebug("Seeded apps.json from {Source} to {Dest}", source, dest);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not seed apps.json to {Dest}", dest);
+        }
+    }
+
+    /// <summary>Rebuild the seat's application list after a library assignment changes.</summary>
+    public void RegenerateAppsJson(string seatDir, string accountName) => EnsureSeatAppsJson(seatDir, accountName);
+
+    internal static string AddAssignedGames(string json, IEnumerable<GameEntry> games, string accountName, bool steamIsolation = false,
+        IReadOnlyDictionary<string, string>? manifests = null, string? launcherPath = null,
+        Func<string, bool>? fileExists = null, Action<string>? skipped = null)
+    {
+        var launcherAvailable = launcherPath is not null &&
+            GameLaunchManifestWriter.LauncherFilesExist(launcherPath, fileExists ?? File.Exists);
+        var root = JsonNode.Parse(json) as JsonObject ?? throw new JsonException("apps.json doit contenir un objet");
+        var apps = root["apps"] as JsonArray ?? throw new JsonException("apps.json doit contenir apps");
+        foreach (var game in games.Where(g => g.AssignedTo.Contains(accountName, StringComparer.OrdinalIgnoreCase)))
+        {
+            var steamLink = steamIsolation && game.Source == "steam" && game.LaunchUri?.StartsWith("steam://", StringComparison.OrdinalIgnoreCase) == true;
+            var command = steamLink ? null : !string.IsNullOrWhiteSpace(game.LaunchUri)
+                ? "cmd /c start \"\" \"" + game.LaunchUri + "\""
+                : game.ExePath;
+            if (!steamLink && GameLaunchManifestWriter.IsIsolatable(game))
+            {
+                string? manifest = null;
+                if (!launcherAvailable || manifests is null || !manifests.TryGetValue(game.Id, out manifest) || manifest is null)
+                {
+                    skipped?.Invoke(game.Name);
+                    continue;
+                }
+                command = GameLaunchManifestWriter.Command(launcherPath!, manifest, game.ExePath!);
+            }
+            if (string.IsNullOrWhiteSpace(command) && !steamLink) continue;
+            if (apps.Any(a => string.Equals(a?["name"]?.GetValue<string>(), game.Name, StringComparison.OrdinalIgnoreCase))) continue;
+            var app = new JsonObject { ["name"] = game.Name };
+            if (steamLink) app["detached"] = new JsonArray(JsonValue.Create(game.LaunchUri));
+            else app["cmd"] = command;
+            if (!steamLink && string.IsNullOrWhiteSpace(game.LaunchUri) && game.ExePath is not null)
+                app["working-dir"] = Path.GetDirectoryName(game.ExePath);
+            apps.Add(app);
+        }
+        return root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+    }
+
+    /// <summary>
+    /// With Steam isolation on, send the app list's Steam entries through the launcher. Apollo
+    /// starts these entries itself, so the service's own launch path never sees them.
+    ///
+    /// This fails closed, like the service's explicit launch. A Steam entry whose Steam cannot be
+    /// isolated (a launcher, hook or Steam missing, or a path that cannot be checked) is left out
+    /// of the seat's list and logged at Error, so it is a missing tile and not a Steam that
+    /// starts without the hook and can hand its command to another session.
+    /// </summary>
+    private string WrapSteamEntries(string json)
+    {
+        if (!_options.SteamIsolationEnabled) return json;
+
+        var wrapped = SteamAppListRewriter.Rewrite(json, _options.SteamIsolationLauncherPath,
+            SteamExecutableResolver(), CheckSteamCanBeIsolated, out var count, out var refused);
+
+        foreach (var entry in refused)
+            _logger.LogError(
+                "Steam isolation is on, so the Steam app entry '{App}' was left out of this seat's app list: {Reason}",
+                entry.App, entry.Reason);
+        if (count > 0)
+            _logger.LogInformation("Steam isolation: {Count} Steam app entr{Plural} now start through the launcher",
+                count, count == 1 ? "y" : "ies");
+        return wrapped;
+    }
+
+    /// <summary>The reason this Steam executable cannot be isolated, or null when it can. Same checks as an explicit launch.</summary>
+    private string? CheckSteamCanBeIsolated(string steamExe)
+    {
+        try
+        {
+            return Sessions.SteamIsolationLaunchPlan.Create(steamExe, null, _options).Supervised
+                ? null
+                : $"'{steamExe}' is not recognized as Steam";
+        }
+        catch (InvalidOperationException ex)
+        {
+            return ex.Message;
+        }
+    }
+
+    /// <summary>Tests point this at a fixture; the service always uses <see cref="ResolveSteamExecutable"/>.</summary>
+    internal Func<string> SteamExecutableResolver { get; set; } = ResolveSteamExecutable;
+
+    /// <summary>Where Steam is installed: the registry's answer, else the default 32-bit path.</summary>
+    internal static string ResolveSteamExecutable()
+    {
+        foreach (var view in new[] { Microsoft.Win32.RegistryView.Registry32, Microsoft.Win32.RegistryView.Registry64 })
+        {
+            try
+            {
+                using var hklm = Microsoft.Win32.RegistryKey.OpenBaseKey(Microsoft.Win32.RegistryHive.LocalMachine, view);
+                using var key = hklm.OpenSubKey(@"SOFTWARE\Valve\Steam");
+                if (key?.GetValue("InstallPath") is string dir && dir.Length > 0)
+                {
+                    var exe = Path.Combine(dir, "steam.exe");
+                    if (File.Exists(exe)) return exe;
+                }
+            }
+            catch (Exception ex) when (ex is System.Security.SecurityException or UnauthorizedAccessException or IOException)
+            {
+                // Fall through to the default path.
+            }
+        }
+        return @"C:\Program Files (x86)\Steam\steam.exe";
+    }
+
+    /// <summary>
+    /// Per-app keys that must never ride from the console's apps.json into a seat.
+    ///
+    /// <c>virtual-display</c> makes Apollo attempt to create a virtual display every time a
+    /// client connects to that app. Inside an RDP seat that attempt cannot succeed — the
+    /// monitor is created but attaches to the CONSOLE session's desktop, where the seat can
+    /// never see it — and it is only removed on an explicit app quit, so every dropped
+    /// session leaves a phantom monitor behind in the console user's topology. Measured and
+    /// reported by jmlopezdona in issue #15 (he accumulated 10).
+    /// </summary>
+    private static readonly string[] ConsoleOnlyAppKeys = ["virtual-display"];
+
+    /// <summary>
+    /// Where to seed a seat's app list from. Prefer MultiSeat's own Apollo install; fall back
+    /// to a standalone Apollo so a host that curates its games there still inherits them.
+    /// Returns null when neither exists.
+    /// </summary>
+    private string? ResolveAppsJsonSource()
+    {
+        var candidates = new List<string>(2);
+
+        var apolloRoot = Path.GetDirectoryName(_options.ApolloExePath);
+        if (!string.IsNullOrEmpty(apolloRoot))
+            candidates.Add(Path.Combine(apolloRoot, "config", "apps.json"));
+
+        candidates.Add(@"C:\Program Files\Apollo\config\apps.json");
+
+        return candidates.FirstOrDefault(File.Exists);
+    }
+
+    /// <summary>
+    /// Remove <see cref="ConsoleOnlyAppKeys"/> from every entry in an apps.json document.
+    /// Returns the original text unchanged if it cannot be parsed — a seat with an
+    /// unstripped app list is still better than a seat with none.
+    /// </summary>
+    internal static string StripConsoleOnlyAppKeys(string json, out int removed)
+    {
+        removed = 0;
+
+        JsonNode? root;
+        try
+        {
+            root = JsonNode.Parse(json);
+        }
+        catch (JsonException)
+        {
+            return json;
+        }
+
+        if (root?["apps"] is not JsonArray apps)
+            return json;
+
+        foreach (var app in apps)
+        {
+            if (app is not JsonObject entry) continue;
+            foreach (var key in ConsoleOnlyAppKeys)
+                if (entry.Remove(key)) removed++;
+        }
+
+        return root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+    }
+
+    /// <summary>
+    /// Ensure a per-seat sunshine_state.json exists with a unique server UUID.
+    /// Apollo is pointed here via file_state = {seatDir}/config/sunshine_state.json in the config.
+    /// Only creates the file if absent — preserves pairings on re-provision.
+    /// </summary>
+    // What a failed grant actually costs, said at the call site rather than baked into the
+    // helper - the two files fail in completely different ways.
+    private const string StateFileConsequence =
+        "Apollo cannot remember the clients this seat pairs; pairing will appear to succeed and "
+        + "then be refused on the next request";
+    private const string AppsJsonConsequence =
+        "changes made to this seat's app list in Apollo's web UI will not save";
+    private const string LogFileConsequence =
+        "this seat's Apollo will run but write no log at all, so the next fault on this seat has "
+        + "to be diagnosed blind";
+    private const string CredentialsDirConsequence =
+        "its TLS private key stays readable by every local user";
+    private const string SeatDirConsequence =
+        "every local user - including every OTHER seat - can keep creating files in this seat's "
+        + "directory, so a planted apollo*.log can impersonate or suppress this seat's real log";
+
+    /// <summary>
+    /// Make sure the seat can write the log its Apollo is about to open.
+    ///
+    /// A seat is a standard user. It owns what it creates, but a log left behind by an earlier
+    /// run — one made while seats were administrators, or by the service — is owned by
+    /// Administrators with BUILTIN\Users:(RX), so the seat cannot open it for writing. Apollo
+    /// does not complain: it runs, serves, streams, and logs nowhere.
+    ///
+    /// That is worse than it sounds, because the absent log then looks exactly like the symptom
+    /// of a seat Apollo that died early (see ApolloManager.ResolveLogPath and the config::parse
+    /// ordering) — the same evidence, two unrelated causes. Measured on the reference host:
+    /// a healthy seat Apollo serving TLS on its ports had written nothing anywhere, purely
+    /// because a stale root-owned apollo.log was in the way.
+    ///
+    /// Nothing is created here. A seat dir already grants Users:Write, so when no log exists
+    /// Apollo makes its own and owns it; only a pre-existing unwritable one needs the grant.
+    /// </summary>
+    private void EnsureSeatLogWritable(string seatDir, string accountName)
+    {
+        // Both layouts ApolloManager.ResolveLogPath knows about: the flat apollo.log we ask
+        // for via log_path, and the timestamped files builds that ignore it write under logs\.
+        foreach (var dir in new[] { seatDir, Path.Combine(seatDir, "logs") })
+        {
+            if (!Directory.Exists(dir)) continue;
+
+            if (dir != seatDir)
+                GrantSeatWriteToDirectory(dir, accountName, LogFileConsequence);
+
+            foreach (var log in Directory.EnumerateFiles(dir, "apollo*.log"))
+                GrantSeatWrite(log, accountName, LogFileConsequence);
+        }
+    }
+
+    private void EnsureSeatStateFile(string seatDir, string accountName)
+    {
+        var statePath = Path.Combine(seatDir, "config", "sunshine_state.json");
+        if (File.Exists(statePath))
+        {
+            // Seats provisioned before this ran still carry the read-only ACL.
+            GrantSeatWrite(statePath, accountName, StateFileConsequence);
+            return;
+        }
+
+        // UUID format matches what Apollo writes: uppercase 8-4-4-4-12
+        var uuid = Guid.NewGuid().ToString("D").ToUpperInvariant();
+        var json = $$"""
+            {
+                "root": {
+                    "named_devices": [],
+                    "uniqueid": "{{uuid}}"
+                }
+            }
+            """;
+
+        // Atomic create: a torn initial file would satisfy the File.Exists check above
+        // forever, permanently breaking this seat's pairing. The grant targets the new
+        // file object, so it stays after the move.
+        AtomicFile.WriteAllText(statePath, json, Encoding.UTF8);
+        GrantSeatWrite(statePath, accountName, StateFileConsequence);
+        _logger.LogInformation("Created per-seat state file with UUID {Uuid}: {Path}", uuid, statePath);
+    }
+
+    /// <summary>
+    /// Give the seat account write access to a file the service created.
+    ///
+    /// Files written here inherit ProgramData's ACL, where Users get read and
+    /// execute but not write. Apollo runs as the seat account and rewrites the
+    /// state file every time it pairs a client — add_authorized_client() calls
+    /// save_state() then load_state(). The write fails silently, the reload puts
+    /// the old contents back, and the client that just paired is gone. The seat
+    /// pairs successfully and then refuses that client's certificate on every
+    /// call after, which is a hard failure to trace from either end.
+    /// </summary>
+    /// <summary>
+    /// Read a host-supplied value that is written verbatim into sunshine.conf.
+    ///
+    /// These land as "key = value" lines, so a value carrying a newline writes a SECOND Apollo
+    /// key that nobody chose. Only an administrator can set these today - nothing in the API
+    /// writes MultiSeatOptions and nothing rewrites appsettings at runtime - so this is not a
+    /// privilege boundary. It is here because a value pasted with a stray newline should fail
+    /// loudly and fall back, rather than quietly reconfigure Apollo.
+    /// </summary>
+    /// <summary>
+    /// Delete a seat's TLS identity ONLY when it is byte-identical to the console Apollo's, i.e.
+    /// it is still the copy MultiSeat seeded. Apollo regenerates a fresh one on next start.
+    ///
+    /// The identity check is the whole safety of this: a seat that has already generated its own
+    /// key does not match, so it is never touched. Deleting a key Apollo made for itself would
+    /// break that seat's pairings for no reason at all.
+    /// </summary>
+    private void RotateSeededTlsIdentity(string credDir)
+    {
+        var sourceDir = Path.Combine(@"C:\Program Files\Apollo", "config", "credentials");
+        var key = Path.Combine(credDir, "cakey.pem");
+        var cert = Path.Combine(credDir, "cacert.pem");
+
+        if (!File.Exists(key)) return;   // nothing seeded, or Apollo already owns this seat
+
+        if (!IsSameFile(key, Path.Combine(sourceDir, "cakey.pem")))
+        {
+            _logger.LogDebug(
+                "Seat TLS key in {Dir} is not the seeded one - leaving it alone", credDir);
+            return;
+        }
+
+        try
+        {
+            File.Delete(key);
+            if (File.Exists(cert)) File.Delete(cert);
+            _logger.LogWarning(
+                "Removed the shared TLS identity from {Dir}; Apollo will generate one for this "
+                + "seat alone. EVERY CLIENT PAIRED TO THIS SEAT MUST PAIR AGAIN - a client pins "
+                + "the server certificate it was given when it paired.",
+                credDir);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Could not remove the shared TLS identity from {Dir}; the seat keeps a key the "
+                + "console Apollo and every other seat also hold", credDir);
+        }
+    }
+
+    /// <summary>True when both files exist and have identical bytes.</summary>
+    internal static bool IsSameFile(string a, string b)
+    {
+        if (!File.Exists(a) || !File.Exists(b)) return false;
+
+        var infoA = new FileInfo(a);
+        var infoB = new FileInfo(b);
+        if (infoA.Length != infoB.Length) return false;
+
+        return File.ReadAllBytes(a).AsSpan().SequenceEqual(File.ReadAllBytes(b));
+    }
+
+    /// <summary>
+    /// The DACL a seat's credentials directory should carry: SYSTEM and Administrators in full,
+    /// the seat itself able to write, and nobody else - no inheritance, so ProgramData's
+    /// BUILTIN\Users:(RX) does not reach the private key.
+    ///
+    /// Separate from the applying code so the shape can be asserted without a real seat account.
+    /// </summary>
+    internal static DirectorySecurity BuildSeatCredentialsAcl(SecurityIdentifier seatSid)
+    {
+        var acl = new DirectorySecurity();
+
+        // Drop inheritance entirely rather than preserving what was inherited: preserving it is
+        // what leaves the Users entry in place, which is the whole problem.
+        acl.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+
+        const InheritanceFlags Inherit = InheritanceFlags.ObjectInherit | InheritanceFlags.ContainerInherit;
+
+        acl.AddAccessRule(new FileSystemAccessRule(
+            new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+            FileSystemRights.FullControl, Inherit, PropagationFlags.None, AccessControlType.Allow));
+        acl.AddAccessRule(new FileSystemAccessRule(
+            new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+            FileSystemRights.FullControl, Inherit, PropagationFlags.None, AccessControlType.Allow));
+        // Modify, not FullControl: the seat must read, rewrite and create files here, but has no
+        // reason to be able to rewrite the ACL itself.
+        acl.AddAccessRule(new FileSystemAccessRule(
+            seatSid, FileSystemRights.Modify, Inherit, PropagationFlags.None, AccessControlType.Allow));
+
+        return acl;
+    }
+
+    /// <summary>
+    /// Apply that DACL. Existing files inside pick it up because Windows recalculates inherited
+    /// entries on children when a parent's inheritable entries change.
+    ///
+    /// If the seat account cannot be resolved this does NOTHING and says so. Protecting the
+    /// directory without granting the seat would leave Apollo unable to read or write its own
+    /// files, which breaks the seat outright - a worse outcome than the exposure this closes, and
+    /// that exposure is the state the host was already in.
+    ///
+    /// Used for two directories, and the seat one matters most (GH #28). ProgramData grants
+    /// BUILTIN\Users Write on the seat directory itself - ContainerInherit without ObjectInherit,
+    /// so existing files are safe but the directory is not - which let any local account, including
+    /// every OTHER seat, create files there. That is reachable: ApolloManager.ResolveLogPath picks
+    /// the newest apollo*.log by write time, and OnConnectAppLauncher acts on its CLIENT CONNECTED
+    /// lines, so a planted file could drive or suppress another seat's connect handling.
+    ///
+    /// ⭐ Applying this to the seat directory also makes the seat's Modify grant INHERITED rather
+    /// than a single explicit ACE per file, so a file replaced by rename keeps it. The explicit
+    /// GrantSeatWrite calls stay as defence in depth - do not remove them on the strength of this.
+    /// </summary>
+    private void ProtectSeatDirectory(string dir, string accountName, string consequence)
+    {
+        SecurityIdentifier sid;
+        try
+        {
+            sid = (SecurityIdentifier)new NTAccount(Environment.MachineName, accountName)
+                .Translate(typeof(SecurityIdentifier));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Could not resolve {Account} to a SID, so {Dir} keeps its inherited permissions - "
+                + "{Consequence}",
+                accountName, dir, consequence);
+            return;
+        }
+
+        try
+        {
+            new DirectoryInfo(dir).SetAccessControl(BuildSeatCredentialsAcl(sid));
+            _logger.LogInformation(
+                "Restricted {Dir} to SYSTEM, Administrators and {Account}", dir, accountName);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex, "Could not restrict {Dir} - {Consequence}", dir, consequence);
+        }
+    }
+
+    /// <summary>
+    /// Validate a host-supplied string that is written verbatim into sunshine.conf.
+    /// Empty, injection-shaped, or (when <paramref name="allowed"/> is given) undocumented
+    /// values warn and keep <paramref name="fallback"/> instead of reaching Apollo: an
+    /// unknown encoder or log level would otherwise be baked into every seat's live config
+    /// from a single appsettings typo. Matching is ordinal — Apollo's own keys are lowercase.
+    /// </summary>
+    private string SanitizeConfigValue(string? value, string fallback, string key, string[]? allowed = null)
+    {
+        var trimmed = (value ?? string.Empty).Trim();
+        if (trimmed.Length == 0) return fallback;
+
+        if (trimmed.Any(c => char.IsControl(c)) || trimmed.Contains('='))
+        {
+            _logger.LogWarning(
+                "MultiSeat:{Key} contains a newline, control character or '=' and was ignored; "
+                + "using {Fallback}. A value written straight into sunshine.conf can otherwise "
+                + "inject Apollo keys nobody chose.",
+                key, fallback);
+            return fallback;
+        }
+
+        if (allowed is not null && !allowed.Contains(trimmed, StringComparer.Ordinal))
+        {
+            _logger.LogWarning(
+                "MultiSeat:{Key} has unsupported value '{Value}' and was ignored; "
+                + "using {Fallback}. Supported values: {Allowed}.",
+                key, trimmed, fallback, string.Join(", ", allowed));
+            return fallback;
+        }
+
+        return trimmed;
+    }
+
+    private void GrantSeatWrite(string path, string accountName, string consequence)
+    {
+        try
+        {
+            // Resolve to a SID, qualified with THIS machine, before touching the ACL. A bare
+            // account name goes through NTAccount, and on a domain-joined host "Gaming" can
+            // resolve to a DOMAIN account of the same name — handing a stranger Modify on a
+            // seat's file. Seat accounts are always local, so say so rather than let the
+            // resolver choose. Same shape as the group-SID fix in AccountManager (S4), where
+            // English literals silently failed on non-English Windows.
+            var sid = (SecurityIdentifier)new NTAccount(Environment.MachineName, accountName)
+                .Translate(typeof(SecurityIdentifier));
+
+            var info = new FileInfo(path);
+            var acl = info.GetAccessControl();
+            acl.AddAccessRule(new FileSystemAccessRule(sid, FileSystemRights.Modify, AccessControlType.Allow));
+            info.SetAccessControl(acl);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Could not grant {Account} write access to {Path} — {Consequence}",
+                accountName, path, consequence);
+        }
+    }
+
+    /// <summary>
+    /// Directory counterpart of <see cref="GrantSeatWrite"/>: grants the seat Modify on the
+    /// directory itself and on anything created in it later, so a build that rotates its log
+    /// can keep writing new files rather than only the ones present at provision time.
+    /// </summary>
+    private void GrantSeatWriteToDirectory(string path, string accountName, string consequence)
+    {
+        try
+        {
+            var sid = (SecurityIdentifier)new NTAccount(Environment.MachineName, accountName)
+                .Translate(typeof(SecurityIdentifier));
+
+            var info = new DirectoryInfo(path);
+            var acl = info.GetAccessControl();
+            acl.AddAccessRule(new FileSystemAccessRule(
+                sid,
+                FileSystemRights.Modify,
+                InheritanceFlags.ObjectInherit | InheritanceFlags.ContainerInherit,
+                PropagationFlags.None,
+                AccessControlType.Allow));
+            info.SetAccessControl(acl);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Could not grant {Account} write access to directory {Path} — {Consequence}",
+                accountName, path, consequence);
+        }
+    }
+
+    /// <summary>
+    /// Ensure the shared credentials file exists in the Apollo config root.
+    /// If it doesn't exist yet, seed it from Apollo's default install location
+    /// so the user doesn't have to set up credentials again from scratch.
+    /// Apollo reads this file lazily on each web-UI/pairing request.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ This file is deliberately NOT granted to seat accounts, unlike the per-seat state and
+    /// apps files. It carries the web UI login shared by every seat, so granting one seat Modify
+    /// would let that seat change the credentials for all of them — a standard user on one seat
+    /// silently locking the others out. The cost of leaving it read-only is that changing the web
+    /// UI password from inside a seat does not persist; do it as an administrator instead.
+    /// Recorded in docs/security-posture.md so the trade-off is findable rather than folklore.
+    /// </remarks>
+    private void EnsureSharedCredentials(string configDir)
+    {
+        var sharedCred = Path.Combine(configDir, "shared_credentials.json");
+        if (File.Exists(sharedCred)) return;
+
+        // Try to seed from Apollo's default credentials location
+        var apolloDefault = @"C:\Program Files\Apollo\config\credentials.json";
+        if (File.Exists(apolloDefault))
+        {
+            try
+            {
+                File.Copy(apolloDefault, sharedCred);
+                _logger.LogInformation("Seeded shared credentials from Apollo default: {Path}", apolloDefault);
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Could not seed credentials from Apollo default");
+            }
+        }
+
+        // Create a placeholder — user must visit the Apollo web UI (https://localhost:PORT) to set credentials
+        _logger.LogWarning(
+            "No shared credentials found at {Path}. " +
+            "Visit the Apollo web UI after provisioning a seat to create credentials, " +
+            "then the file will persist for future seats.",
+            sharedCred);
+    }
+
+    /// <summary>
+    /// Create a directory junction (mklink /J) at linkPath pointing to targetPath.
+    /// Junction points work without SeCreateSymbolicLinkPrivilege so they work in SYSTEM context.
+    ///
+    /// A junction whose target has gone away is repaired rather than skipped, because the
+    /// failure it causes is invisible. Apollo resolves SUNSHINE_ASSETS_DIR — the literal
+    /// relative string "assets" on Windows — against its working directory, which for a seat
+    /// is the per-seat dir. So a stale assets junction makes apply_config() throw while copying
+    /// assets/apps.json, and Apollo exits inside config::parse — which runs BEFORE
+    /// logging::init. The seat's Apollo then dies having written no log at all.
+    ///
+    /// ⚠️ Neither obvious probe detects this: Directory.Exists() returns true for a dangling
+    /// junction, and ResolveLinkTarget() still hands back the target path for one. The test
+    /// that works is the reparse-point attribute plus whether LinkTarget itself exists.
+    /// Measured on Windows 11 26200; deleting the link leaves the target untouched.
+    /// </summary>
+    // Characters that would allow escaping a double-quoted cmd.exe argument.
+    private static readonly char[] CmdMetachars = { '"', '\'' };
+
+    private void CreateJunctionIfMissing(string linkPath, string targetPath)
+    {
+        if (Directory.Exists(linkPath))
+        {
+            if (!IsDanglingLink(linkPath)) return;
+
+            // Stale junction left by an Apollo that moved or was uninstalled. Removing the
+            // link does not touch whatever it pointed at; it is recreated below.
+            try
+            {
+                Directory.Delete(linkPath);
+                _logger.LogWarning(
+                    "Removed stale junction {Link} — its target no longer exists; recreating", linkPath);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Could not remove stale junction {Link}", linkPath);
+                return;
+            }
+        }
+
+        if (!Directory.Exists(targetPath))
+        {
+            _logger.LogWarning("Junction target missing — skipping: {Target}", targetPath);
+            return;
+        }
+
+        // Reject paths with characters that could break out of the quoted cmd.exe argument.
+        if (linkPath.IndexOfAny(CmdMetachars) >= 0 || targetPath.IndexOfAny(CmdMetachars) >= 0)
+        {
+            _logger.LogWarning("Junction paths contain unsafe characters — skipping: {Link} -> {Target}", linkPath, targetPath);
+            return;
+        }
+
+        try
+        {
+            using var proc = Process.Start(new ProcessStartInfo("cmd.exe",
+                $"/C mklink /J \"{linkPath}\" \"{targetPath}\"")
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            })!;
+            proc.WaitForExit(5000);
+            if (proc.ExitCode != 0)
+                _logger.LogWarning("mklink /J failed (exit {Code}) for {Link} -> {Target}",
+                    proc.ExitCode, linkPath, targetPath);
+            else
+                _logger.LogDebug("Junction created: {Link} -> {Target}", linkPath, targetPath);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not create junction {Link} -> {Target}", linkPath, targetPath);
+        }
+    }
+
+    /// <summary>
+    /// True when <paramref name="path"/> is a reparse point (junction or symlink) whose target
+    /// no longer exists. A plain directory returns false, and so does a healthy link.
+    /// </summary>
+    internal static bool IsDanglingLink(string path)
+    {
+        try
+        {
+            var info = new DirectoryInfo(path);
+            if (!info.Attributes.HasFlag(FileAttributes.ReparsePoint)) return false;
+
+            var target = info.LinkTarget;
+            if (target is null) return false;
+
+            // Junctions record an absolute target, but a relative one would otherwise be
+            // resolved against the process working directory rather than the link's parent.
+            if (!Path.IsPathRooted(target))
+                target = Path.GetFullPath(
+                    Path.Combine(Path.GetDirectoryName(path) ?? ".", target));
+
+            return !Directory.Exists(target);
+        }
+        catch
+        {
+            // An unreadable link is not something we can repair; leave it alone.
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Clean up ephemeral files for a seat on teardown.
+    /// Removes junction points (assets, tools) so they are recreated fresh on the next
+    /// provision — important if Apollo is reinstalled to a different path.
+    /// The config/ subdirectory (sunshine_state.json, certs) is intentionally preserved
+    /// so that Moonlight pairing survives seat teardown and re-provision.
+    /// </summary>
+    public void CleanupConfig(string accountName, string configDir)
+    {
+        var seatDir = Path.Combine(configDir, accountName);
+        if (!Directory.Exists(seatDir)) return;
+
+        try
+        {
+            // Only delete junction points (assets, tools). Leave everything else —
+            // particularly config/sunshine_state.json — so Moonlight stays paired.
+            foreach (var entry in Directory.EnumerateFileSystemEntries(seatDir))
+            {
+                var di = new DirectoryInfo(entry);
+                if (di.Exists && di.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                    di.Delete();
+            }
+
+            _logger.LogDebug("Cleaned up Apollo junctions for seat {Account}: {Path}",
+                accountName, seatDir);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to clean up Apollo config dir: {Path}", seatDir);
+        }
+    }
+
+    // ── Paired client management ──────────────────────────────────────────
+
+    /// <summary>
+    /// Returns the names of all Moonlight clients currently paired to this seat.
+    /// Reads named_devices from sunshine_state.json. Returns empty if not provisioned.
+    /// </summary>
+    public IReadOnlyList<string> GetPairedClients(string accountName, string configDir)
+    {
+        var statePath = GetStateFilePath(accountName, configDir);
+        if (!File.Exists(statePath)) return Array.Empty<string>();
+
+        try
+        {
+            var node = JsonNode.Parse(File.ReadAllText(statePath));
+            var devices = node?["root"]?["named_devices"]?.AsArray();
+            if (devices == null) return Array.Empty<string>();
+
+            return devices
+                .Select(d => d?["name"]?.GetValue<string>() ?? "(unknown)")
+                .ToList();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to read paired clients from {Path}", statePath);
+            return Array.Empty<string>();
+        }
+    }
+
+    /// <summary>
+    /// Removes a single paired Moonlight client by name from sunshine_state.json.
+    /// Returns true if a matching entry was found and removed.
+    /// Changes take effect after Apollo restarts (it holds the file in memory).
+    /// </summary>
+    public bool UnpairClient(string accountName, string configDir, string clientName)
+    {
+        var statePath = GetStateFilePath(accountName, configDir);
+        if (!File.Exists(statePath)) return false;
+
+        try
+        {
+            var node = JsonNode.Parse(File.ReadAllText(statePath));
+            var devices = node?["root"]?["named_devices"]?.AsArray();
+            if (devices == null) return false;
+
+            var removed = false;
+            for (int i = devices.Count - 1; i >= 0; i--)
+            {
+                if (devices[i]?["name"]?.GetValue<string>() == clientName)
+                {
+                    devices.RemoveAt(i);
+                    removed = true;
+                }
+            }
+
+            if (removed)
+            {
+                WriteStateFile(statePath, accountName, node!);
+                _logger.LogInformation("Unpaired client '{Name}' from seat {Account}", clientName, accountName);
+            }
+
+            return removed;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to unpair client '{Name}' from {Account}", clientName, accountName);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Removes all paired Moonlight clients from sunshine_state.json.
+    /// The server UUID is preserved so no re-pairing is needed — clients just
+    /// need to re-pair once to re-establish trust.
+    /// </summary>
+    public void UnpairAllClients(string accountName, string configDir)
+    {
+        var statePath = GetStateFilePath(accountName, configDir);
+        if (!File.Exists(statePath)) return;
+
+        try
+        {
+            var node = JsonNode.Parse(File.ReadAllText(statePath));
+            var devices = node?["root"]?["named_devices"]?.AsArray();
+            if (devices == null) return;
+
+            devices.Clear();
+            WriteStateFile(statePath, accountName, node!);
+            _logger.LogInformation("Unpaired all clients from seat {Account}", accountName);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to unpair all clients from {Account}", accountName);
+        }
+    }
+
+    /// <summary>Last write time of the seat's Apollo state file (paired devices), or null.</summary>
+    public DateTime? GetPairedStateWriteTimeUtc(string accountName, string configDir)
+    {
+        var statePath = GetStateFilePath(accountName, configDir);
+        try { return File.Exists(statePath) ? File.GetLastWriteTimeUtc(statePath) : null; }
+        catch (IOException) { return null; }
+        catch (UnauthorizedAccessException) { return null; }
+    }
+
+    private static string GetStateFilePath(string accountName, string configDir) =>
+        Path.Combine(configDir, accountName, "config", "sunshine_state.json");
+
+    /// <summary>
+    /// Atomic read-modify-write of a seat's pairing state. Apollo holds that state in memory and
+    /// rewrites the file, so a torn write loses pairings with no error at either end.
+    ///
+    /// ⛔ The re-grant is not optional. <see cref="AtomicFile.WriteAllText"/> replaces the target by
+    /// rename, and a renamed file is a NEW file object that carries none of the explicit ACEs the
+    /// old one had — including the seat's Modify, which is granted per file by
+    /// <see cref="GrantSeatWrite"/>. Without this the seat's Apollo silently loses write access to
+    /// its own pairing state after any unpair, and the failure only shows up on the NEXT pairing
+    /// request. That is exactly what <see cref="StateFileConsequence"/> describes.
+    ///
+    /// ⚠️ This method was `static` when the atomic write was introduced, which is how it shipped
+    /// without the re-grant while both sibling call sites had one — a static helper has no
+    /// accountName to grant with. Keep it an instance method.
+    ///
+    /// ⚠️ Since the seat directory is locked down (GH #28) the seat also inherits Modify from the
+    /// directory, so on a current host this grant is belt as well as braces. Do not remove it on
+    /// that basis: relying on directory inheritance to cover a missing per-file grant breaks
+    /// quietly if that ACL is ever loosened.
+    /// </summary>
+    private void WriteStateFile(string path, string accountName, JsonNode node)
+    {
+        AtomicFile.WriteAllText(path,
+            node.ToJsonString(new JsonSerializerOptions { WriteIndented = true }),
+            Encoding.UTF8);
+        GrantSeatWrite(path, accountName, StateFileConsequence);
+    }
+
+    // ── NVENC preset tables ───────────────────────────────────────────────
+
+    private static (int preset, string twopass, string spatialAq, int vbvIncrease)
+        GetNvencSettings(NvencQualityPreset quality) => quality switch
+    {
+        NvencQualityPreset.Latency  => (1, "disabled",    "disabled", 0),
+        NvencQualityPreset.Quality  => (7, "full_res",    "enabled",  40),
+        _                           => (4, "quarter_res", "enabled",  20),  // Balanced
+    };
+}

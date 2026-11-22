@@ -1,0 +1,250 @@
+<#
+.SYNOPSIS
+    Measure the host audio path automatically, every time this machine resumes from sleep.
+
+.DESCRIPTION
+    Exists to settle one question that repeated manual testing could not: does the VB-CABLE endpoint
+    wedge during SLEEP itself, or only once a Moonlight client connects afterwards?
+
+    Nobody is at this host (it is headless), and by the time the silence is noticed the moment has
+    passed. So this runs unattended on resume, before any stream necessarily exists, and writes a
+    verdict with a timestamp. Two possible outcomes, and they point at different causes:
+
+        wedged already at resume  -> sleep/resume breaks the endpoint
+        healthy at resume         -> something AFTER resume breaks it, and the leading suspect is
+                                     Apollo's "Failed to install Steam Streaming Speakers: 259",
+                                     logged at every stream start
+
+    Trigger note, measured rather than assumed: the usual resume trigger
+    (Microsoft-Windows-Power-Troubleshooter, event 1) has fired ONCE on this host, back in April. It
+    is not reliable here. Kernel-Power 107 fires on every real resume, so that is what the task
+    subscribes to.
+
+    Runs INTERACTIVELY in the console session on purpose. Audio APIs are session-scoped: the same
+    check running as SYSTEM in session 0 would measure silence forever and report a wedge every
+    single time - a confident answer to nothing.
+
+    Uses a quiet generated tone rather than a Windows alert sound, because this task tends to fire at
+    exactly the moment a Moonlight client connects, and the tone goes to the default endpoint that
+    client is listening to.
+
+.PARAMETER Register
+    Create or refresh the scheduled task, then exit.
+
+.PARAMETER Unregister
+    Remove the scheduled task, then exit.
+
+.PARAMETER ShowLog
+    Print the log collected so far, then exit.
+
+.PARAMETER SettleSeconds
+    How long to wait after the resume event before measuring, so the audio stack can finish coming
+    back. Default 45.
+
+.EXAMPLE
+    .\wake-audio-check.ps1 -Register
+    .\wake-audio-check.ps1 -ShowLog
+    .\wake-audio-check.ps1 -SettleSeconds 0
+
+.NOTES
+    Exit codes match fix-host-audio.ps1: 0 healthy, 1 wedged, 2 no verdict.
+
+    VERIFIED END TO END on a real sleep/wake, 2026-08-18:
+
+        slept (S3)                  10:11:23
+        woke                        10:12:24  (~61 s, wake source: Realtek NIC)
+        Kernel-Power 107 logged     yes, 10:11:24
+        this task auto-launched      yes, 10:12:23, LastTaskResult 0
+        verdict after 45 s settle   HEALTHY - app 0.080048 = endpoint 0.080048 = loopback 0.080048
+
+    That run proves the INSTRUMENT, not the absence of the fault: the sleep was a minute long and no
+    Moonlight stream had run beforehand, and the suspected cause only fires at stream start. A
+    HEALTHY line here after a short unstreamed sleep says nothing about the overnight case.
+
+    TESTING THIS ON A HEADLESS HOST - read before sleeping a machine you cannot walk over to.
+    Sleeping a headless host with no way back strands it. Confirm all three first:
+
+        powercfg /a                     -> Standby (S3) available
+        powercfg -devicequery wake_armed -> a NIC is listed (wake on LAN can reach it)
+        powercfg /q <scheme> SUB_SLEEP RTCWAKE -> "Allow wake timers" index is 1
+
+    Then register a one-shot guaranteed return before sleeping, and remove it afterwards:
+
+        $t = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(4)
+        $s = New-ScheduledTaskSettingsSet -WakeToRun -StartWhenAvailable
+        Register-ScheduledTask -TaskName 'WakeSafetyNet' -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c exit') -Trigger $t -Settings $s -Principal (New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest) -Force
+
+    Sleep with the API rather than rundll32: rundll32 powrprof.dll,SetSuspendState hibernates when
+    hibernation is enabled, which is a different test.
+
+        Add-Type -MemberDefinition '[DllImport("powrprof.dll")] public static extern bool SetSuspendState(bool hibernate, bool forceCritical, bool disableWakeEvent);' -Name PowerState -Namespace Win32
+        [Win32.PowerState]::SetSuspendState($false, $false, $false)   # standby, wake events ENABLED
+
+    ASCII only, same reason as fix-host-audio.ps1: PowerShell 5.1 reads these files as ANSI and
+    non-ASCII punctuation becomes mojibake that breaks parsing.
+#>
+[CmdletBinding()]
+param(
+    [switch] $Register,
+    [switch] $Unregister,
+    [switch] $ShowLog,
+    [int]    $SettleSeconds = 45
+)
+
+$ErrorActionPreference = 'Stop'
+
+$TaskName  = 'MultiSeat-WakeAudioCheck'
+$Root      = 'C:\ProgramData\MultiSeat\wake-audio'
+$LogPath   = Join-Path $Root 'wake-audio.log'
+$Diagnoser = Join-Path $PSScriptRoot 'fix-host-audio.ps1'
+
+function Write-Log($text) {
+    Add-Content -LiteralPath $LogPath -Value $text -Encoding ASCII
+}
+
+function Get-LastResumeTime {
+    # 107 does NOT fire on every resume. Measured twice - 2026-08-19 and 2026-08-20 - where a real
+    # S3 resume logged only the firmware events 130/131 and no 107 at all, leaving this header line
+    # stale by 14 and 16 hours while the verdict beneath it was seconds fresh. Take the newest of
+    # either source so the log stops misattributing when the machine woke.
+    $newest = $null
+    foreach ($id in 107, 131) {
+        try {
+            $e = Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Microsoft-Windows-Kernel-Power'; Id=$id} -MaxEvents 1 -ErrorAction Stop
+            if ($e -and ($null -eq $newest -or $e.TimeCreated -gt $newest.Time)) {
+                $newest = [pscustomobject]@{ Time = $e.TimeCreated; Id = $id }
+            }
+        }
+        catch { }
+    }
+    return $newest
+}
+
+function Get-EndpointNodeCount {
+    # Every audio endpoint has an SWD\MMDEVAPI device node: 27 on this host when healthy, 1 when the
+    # endpoint stack has collapsed. It is the cheapest wedge signal available and, unlike the tone
+    # probe, it needs nothing playing.
+    #
+    # Added 2026-08-20 because the first WEDGED verdict this task ever produced was UNDECIDABLE
+    # without it: it reported wedged 45 s after a resume, and half an hour later the host was healthy
+    # with AudioEndpointBuilder never having restarted. Nodes = 1 would have meant a real collapse;
+    # nodes = 27 would have meant a stack still settling. The log recorded neither.
+    try {
+        return @(Get-PnpDevice -ErrorAction Stop | Where-Object { $_.InstanceId -like 'SWD\MMDEVAPI*' }).Count
+    }
+    catch { return -1 }
+}
+
+function Get-ApolloContext {
+    $procs = @(Get-Process -Name 'sunshine','apollo' -ErrorAction SilentlyContinue)
+    if ($procs.Count -eq 0) { return 'none running' }
+    $names = ($procs | ForEach-Object { $_.ProcessName + '/' + $_.Id }) -join ', '
+    return ('{0} running: {1}' -f $procs.Count, $names)
+}
+
+function Invoke-Check {
+    New-Item -ItemType Directory -Force -Path $Root | Out-Null
+
+    $resume = Get-LastResumeTime
+
+    # Count nodes BEFORE the settle as well as after: if the stack is merely coming back up, the
+    # count climbs between the two readings. A genuine collapse stays low in both.
+    $nodesAtStart = Get-EndpointNodeCount
+    if ($SettleSeconds -gt 0) { Start-Sleep -Seconds $SettleSeconds }
+    $nodesAtCheck = Get-EndpointNodeCount
+
+    $apollo = Get-ApolloContext
+    # *>&1, not 2>&1: the diagnoser reports through Write-Host, which goes to the information
+    # stream. With 2>&1 this captured NOTHING and the log recorded a verdict with no evidence
+    # under it - measured, not theorised.
+    $out    = & $Diagnoser -DiagnoseOnly *>&1 | ForEach-Object { "$_" }
+    $code   = $LASTEXITCODE
+
+    switch ($code) {
+        0       { $verdict = 'HEALTHY    - audio path works at this point in time' }
+        1       { $verdict = 'WEDGED     - audio is submitted but does not come out' }
+        2       { $verdict = 'NO VERDICT - nothing measurable, or the diagnoser failed' }
+        default { $verdict = "UNEXPECTED - diagnoser exited $code" }
+    }
+
+    if ($resume) {
+        $resumeText = '{0}  (Kernel-Power {1})' -f $resume.Time.ToString('yyyy-MM-dd HH:mm:ss'), $resume.Id
+        $age = [int]((Get-Date) - $resume.Time).TotalMinutes
+        # A resume the task did not actually fire on means this run is a StartWhenAvailable catch-up
+        # of an older missed trigger, so the verdict is fresh but the attribution is not.
+        if ($age -gt 10) { $resumeText += ' - {0} min ago, so this run is NOT that resume' -f $age }
+    }
+    else { $resumeText = 'unknown' }
+
+    if ($nodesAtStart -lt 0 -or $nodesAtCheck -lt 0) {
+        $nodeText = 'could not enumerate'
+    }
+    else {
+        $nodeText = '{0} at start, {1} at check' -f $nodesAtStart, $nodesAtCheck
+        if ($nodesAtCheck -le 1)               { $nodeText += '  <- COLLAPSED, this is a real wedge' }
+        elseif ($nodesAtCheck -gt $nodesAtStart) { $nodeText += '  <- still rising, stack was settling' }
+    }
+
+    $header = @(
+        '================================================================'
+        ('{0}  wake-audio-check' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
+        ('  last resume  : {0}' -f $resumeText)
+        ('  settle wait  : {0} s' -f $SettleSeconds)
+        ('  endpoint nodes: {0}' -f $nodeText)
+        ('  apollo       : {0}' -f $apollo)
+        ('  VERDICT      : {0}  (exit {1})' -f $verdict, $code)
+        '----------------------------------------------------------------'
+    )
+    Write-Log ($header -join "`r`n")
+    Write-Log (($out | ForEach-Object { '  ' + $_ }) -join "`r`n")
+    Write-Log ''
+
+    Write-Host ($header -join "`n")
+    $out | ForEach-Object { Write-Host "  $_" }
+    Write-Host "logged to $LogPath"
+    return $code
+}
+
+function Register-WakeTask {
+    if (-not (Test-Path $Diagnoser)) { throw "fix-host-audio.ps1 not found next to this script ($Diagnoser)" }
+    $self = Join-Path $PSScriptRoot 'wake-audio-check.ps1'
+
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $self)
+
+    # Kernel-Power 107, NOT Power-Troubleshooter 1 - see the trigger note in the description.
+    $subscription = "<QueryList><Query Id='0' Path='System'><Select Path='System'>*[System[Provider[@Name='Microsoft-Windows-Kernel-Power'] and (EventID=107)]]</Select></Query></QueryList>"
+
+    $class   = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace Root/Microsoft/Windows/TaskScheduler
+    $trigger = New-CimInstance -CimClass $class -ClientOnly
+    $trigger.Enabled      = $true
+    $trigger.Subscription = $subscription
+
+    # Interactive, in the console session: audio APIs are session-scoped and session 0 sees nothing.
+    $principal = New-ScheduledTaskPrincipal -UserId ('{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME) -LogonType Interactive -RunLevel Highest
+    $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Measures host audio on resume from sleep (VB-CABLE wedge investigation).' -Force | Out-Null
+
+    Write-Host "registered task '$TaskName'" -ForegroundColor Green
+    Write-Host "  runs as     : $($principal.UserId) (interactive, highest)"
+    Write-Host "  triggers on : System / Microsoft-Windows-Kernel-Power / EventID 107"
+    Write-Host "  writes      : $LogPath"
+}
+
+function Unregister-WakeTask {
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+        Write-Host "removed task '$TaskName'" -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "task '$TaskName' was not registered" -ForegroundColor Gray
+    }
+}
+
+if ($Register)   { Register-WakeTask;   exit 0 }
+if ($Unregister) { Unregister-WakeTask; exit 0 }
+if ($ShowLog) {
+    if (Test-Path $LogPath) { Get-Content -LiteralPath $LogPath } else { Write-Host "no log yet at $LogPath" }
+    exit 0
+}
+exit (Invoke-Check)

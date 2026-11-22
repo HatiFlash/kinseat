@@ -1,0 +1,22 @@
+[package]
+name = "kinseat-client-setup"
+version = "0.3.16"
+edition.workspace = true
+rust-version.workspace = true
+license = "GPL-3.0-only"
+
+[dependencies]
+eframe = { version = "=0.32.3", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
+# Moteurs graphiques de wgpu : sans eux, l'exe compilé seul (cargo build -p) plante au lancement
+# (« No wgpu backend feature … enabled »), cas du setup Client 0.3.5.
+wgpu = { version = "=25.0.2", default-features = false, features = ["dx12", "vulkan", "gles", "metal", "wgsl"] }
+egui = "=0.32.3"
+image = { version = "=0.25.9", default-features = false, features = ["png"] }
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[build-dependencies]
+sha2 = "0.10"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

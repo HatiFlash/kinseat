@@ -1,0 +1,1018 @@
+using System.Collections.Concurrent;
+using Microsoft.Extensions.Options;
+using MultiSeat.Service.Configuration;
+using MultiSeat.Service.Interop;
+using MultiSeat.Shared.Models;
+
+namespace MultiSeat.Service.Input;
+
+/// <summary>
+/// Per-seat gamepad isolation, via HidHide's undocumented session jail.
+///
+/// <b>What this replaced, and why.</b> The old design hid every gaming device globally and
+/// whitelisted Apollo's executable so it could still see them. That cannot isolate seats from
+/// each other even in principle: the whitelist is global and cannot pair an application with a
+/// device, so one whitelisted binary sees every hidden pad — and every seat runs the same Apollo
+/// binary. It also hid the wrong node (see <see cref="HidHideDevice"/>), and neither defect was
+/// ever observable because two independent bugs meant the CLI was never invoked at all.
+///
+/// The mechanism now is <see cref="HidHideSessionJail"/>: a blacklist entry suffixed with
+/// <c>!&lt;sessionId&gt;</c> is visible only inside that session. It acts on the DEVICE rather
+/// than on the reader, so it does not care how a game enumerates — including
+/// <c>Windows.Gaming.Input</c>, which no local filter can reach.
+///
+/// <b>Three rules that are not negotiable</b>, each of which cost @jmlopezdona real time in
+/// issue #19 before it was understood:
+///
+///   1. <b>Both nodes.</b> XInput reads the XUSB node, not the HID one.
+///   2. <b>Rules must be written BEFORE the pad exists.</b> HidHide filters at open time, so a
+///      rule that lands after the pad is late by definition — and <c>dwm</c>, <c>explorer</c> and
+///      <c>GameInputSvc</c> of EVERY session open each new pad within that window, keeping handles
+///      that never expire. A rule for an absent device matches nothing, so pre-writing is free.
+///   3. <b>Ownership is derived, never named.</b> Nothing in the device tree says "ViGEm"; the
+///      test is bus versus PnP root. And a placement made by elimination is never remembered and
+///      always said out loud — his worst failure of the week was a free seat being handed the
+///      console player's pad by elimination while the panel reported a healthy verified jail.
+///
+/// Off by default (<see cref="MultiSeatOptions.EnableHidHideCloaking"/>). A host that sets
+/// nothing behaves exactly as before.
+/// </summary>
+public sealed class HidHideConfigurator
+{
+    private readonly ILogger<HidHideConfigurator> _logger;
+    private readonly MultiSeatOptions _options;
+    private readonly HidHideCli _cli;
+    private readonly Func<int> _consoleSessionId;
+    private readonly Func<string, bool> _restartDevice;
+    private readonly Func<DateTimeOffset> _clock;
+    private readonly ConcurrentDictionary<Guid, DateTimeOffset> _streamingSince = new();
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _padFirstSeen = new(StringComparer.OrdinalIgnoreCase);
+    // Retained across stream stops; only a successfully confined pad establishes ownership.
+    private readonly ConcurrentDictionary<Guid, string> _lastSeatPad = new();
+    private string? _lastAmbiguity;
+
+    // What we confined, so teardown can release exactly that and nothing else.
+    private readonly ConcurrentDictionary<Guid, SeatJailState> _seatStates = new();
+
+    // One entry per configured MultiSeatOptions.ExcludedPhysicalPadDevicePaths path, so a later
+    // tick can tell "never written" from "written, but for a console session that has since
+    // changed" without re-reading HidHide's blacklist on every pass.
+    private readonly ConcurrentDictionary<string, ExcludedPadState> _excludedPadStates =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    public HidHideConfigurator(
+        ILogger<HidHideConfigurator> logger,
+        IOptions<MultiSeatOptions> options,
+        Func<int>? consoleSessionIdProvider = null,
+        Func<string, bool>? restartDevice = null,
+        Func<DateTimeOffset>? clock = null)
+    {
+        _logger = logger;
+        _options = options.Value;
+        _restartDevice = restartDevice ?? RestartDeviceWithPnputil;
+        _clock = clock ?? (() => DateTimeOffset.UtcNow);
+        _cli = new HidHideCli(logger, _options.HidHideCliPath);
+
+        // Overridable so tests can drive the active-console-session-changes-over-time behaviour
+        // without a live Windows session. Production gets the real answer.
+        _consoleSessionId = consoleSessionIdProvider ?? (() => (int)Kernel32.WTSGetActiveConsoleSessionId());
+
+        if (!_cli.IsAvailable)
+        {
+            _logger.LogWarning(
+                "HidHide CLI not found at {Path}. Per-seat gamepad isolation unavailable. " +
+                "Install HidHide from https://github.com/nefarius/HidHide/releases",
+                _options.HidHideCliPath);
+        }
+    }
+
+    public bool IsDriverAvailable => _cli.IsAvailable;
+
+    /// <summary>
+    /// True when the feature is both switched on and able to run.
+    /// </summary>
+    public bool IsEnabled => _options.EnableHidHideCloaking && _cli.IsAvailable;
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  STARTUP
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Clear jail rules this service left behind, and only those.
+    ///
+    /// HidHide's blacklist is kernel-side and persists across reboots, while our in-memory state
+    /// does not — so without this a crash would strand a pad confined to a session that no longer
+    /// exists, and it would stay that way forever.
+    ///
+    /// ⚠️ Only entries carrying a session suffix are removed. A plain, unsuffixed hide is
+    /// something a user (or HidHide's own GUI) put there by hand, and this is precisely the
+    /// situation where an empty read must not be mistaken for an empty configuration.
+    /// </summary>
+    public void ResetOnStartup()
+    {
+        if (!_cli.IsAvailable) return;
+
+        try
+        {
+            var read = _cli.Read("--dev-list");
+            if (!read.Answered)
+            {
+                _logger.LogWarning(
+                    "HidHide startup reset skipped: the CLI did not answer, so its configuration is " +
+                    "unknown. Removing nothing is the safe reading — an empty answer from this tool " +
+                    "is indistinguishable from an empty blacklist.");
+                return;
+            }
+
+            var jailed = HidHideDeviceParser.ParseHiddenDevices(read.Output)
+                .Where(entry => HidHideSessionJail.Split(entry).SessionId is not null)
+                .ToList();
+
+            if (jailed.Count == 0)
+            {
+                _logger.LogInformation("HidHide startup reset: no session-jail rules left behind.");
+                return;
+            }
+
+            var release = HidHideCli.Sequence(jailed.Select(HidHideConfigurator.UnhideDeviceArgs).ToArray());
+            var result = _cli.Write(release);
+
+            _logger.LogInformation(
+                "HidHide startup reset: released {Count} stale session-jail rule(s) [{Rules}]{Failed}",
+                jailed.Count, string.Join(", ", jailed), result.Succeeded ? "" : " — the CLI reported a failure");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "HidHide startup reset failed (non-critical)");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  READS
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Gaming devices HidHide can see, absent nodes dropped.
+    /// </summary>
+    public List<HidHideDevice> ListGamingDevices()
+    {
+        if (!_cli.IsAvailable) return [];
+
+        var read = _cli.Read(ListGamingDevicesCommand);
+        if (!read.Answered)
+        {
+            _logger.LogWarning(
+                "HidHide did not answer a device listing. Treating this as a FAILED READ, not as " +
+                "'no gamepads' — those two look identical from this tool and only one of them is " +
+                "safe to act on.");
+            return [];
+        }
+
+        return HidHideDeviceParser.Parse(read.Output);
+    }
+
+    /// <summary>
+    /// Applications allowed to see hidden devices.
+    ///
+    /// ⚠️ Under confinement this list must stay empty. It is global and cannot pair an app with a
+    /// device, so a single entry sees EVERY confined pad — his had twelve, and a game in one seat
+    /// was moved by both players' controllers.
+    /// </summary>
+    public List<string> ListWhitelistedApps()
+    {
+        if (!_cli.IsAvailable) return [];
+
+        var read = _cli.Read("--app-list");
+        return read.Answered ? HidHideDeviceParser.ParseAppList(read.Output) : [];
+    }
+
+    /// <summary>
+    /// Whitelist entries that would defeat confinement, i.e. everything except HidHide's own
+    /// binaries.
+    ///
+    /// HidHide whitelists its own CLI and GUI and <c>--app-unreg</c> on them does not stick, so a
+    /// check for "the list is empty" reports a problem on every host that has ever installed
+    /// HidHide — which is how @jmlopezdona's first version of this warning came to read
+    /// "not guaranteed" everywhere and was therefore ignored on the day it mattered.
+    /// </summary>
+    public List<string> ForeignWhitelistEntries() =>
+        ListWhitelistedApps()
+            .Where(app => !app.Contains(@"\HidHide\", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PRE-WRITE — rules before the pad exists
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Write a seat's jail rules before its Apollo creates a pad.
+    ///
+    /// This is correctness, not optimisation. HidHide filters at open time and a pass costs
+    /// seconds: measured, a pad appeared at 13:27:33 and its rule landed at 13:27:39.9. Inside
+    /// that window <c>dwm</c>, <c>explorer</c> and <c>GameInputSvc</c> of every session open the
+    /// new pad and keep handles that never expire — and releasing a wrong rule afterwards does
+    /// NOT hand the pad back, because the real owner tried once and does not retry.
+    ///
+    /// A rule for an absent device matches nothing, so writing one in advance is inert and free.
+    ///
+    /// ⚠️ It can only pre-write paths whose ownership was established by EVIDENCE. Paths guessed
+    /// by elimination are deliberately not remembered: pre-writing one hands another player's pad
+    /// to this seat before anything has had a chance to look at it.
+    /// </summary>
+    public void PreWriteRules(SeatInfo seat)
+    {
+        if (!IsEnabled || !_options.EnablePadRulePreWrite) return;
+        if (seat.SessionId <= 0) return;
+
+        var known = _options.SeatPadDevicePaths.TryGetValue(seat.AccountName, out var paths) ? paths : [];
+        if (known.Length == 0)
+        {
+            _logger.LogInformation(
+                "Seat {Id}: nothing to pre-write — no pad path is known for account {Account} by " +
+                "evidence. The reactive path will confine its pad after creation, which leaves the " +
+                "open-time window that pre-writing exists to close. Configure " +
+                "MultiSeat:SeatPadDevicePaths:{Account} once the seat's XUSB path is known.",
+                seat.Id, seat.AccountName, seat.AccountName);
+            return;
+        }
+
+        var rules = known.Select(p => HidHideSessionJail.Confine(p, seat.SessionId)).ToList();
+        var result = _cli.Write(HidHideCli.Sequence(rules.Select(HideDeviceArgs).ToArray()));
+
+        if (result.Succeeded)
+        {
+            var state = _seatStates.GetOrAdd(seat.Id, _ => new SeatJailState());
+            foreach (var rule in rules) state.Rules.Add(rule);
+
+            _logger.LogInformation(
+                "Seat {Id}: pre-wrote {Count} jail rule(s) for session {Session} [{Rules}]",
+                seat.Id, rules.Count, seat.SessionId, string.Join(", ", rules));
+        }
+        else
+        {
+            _logger.LogWarning("Seat {Id}: pre-writing jail rules failed; falling back to the reactive path", seat.Id);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  CONFINE
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Confine this seat's pad to this seat's session.
+    /// </summary>
+    public void CloakForSession(SeatInfo seat)
+    {
+        if (!_options.EnableHidHideCloaking)
+        {
+            _logger.LogInformation(
+                "Seat {Id}: per-seat gamepad isolation is off (MultiSeat:EnableHidHideCloaking). " +
+                "Pads created by any Apollo instance are visible to every session on this host.",
+                seat.Id);
+            return;
+        }
+
+        if (!_cli.IsAvailable)
+        {
+            _logger.LogWarning("Seat {Id}: gamepad isolation is on but HidHide is not installed — nothing is isolated", seat.Id);
+            return;
+        }
+
+        if (seat.SessionId <= 0)
+        {
+            _logger.LogWarning(
+                "Seat {Id}: no session id yet, so no jail rule can be written. The driver requires " +
+                "sessionId != 0; a rule for session 0 hides the pad everywhere instead of confining it.",
+                seat.Id);
+            return;
+        }
+
+        try
+        {
+            WarnAboutForeignWhitelistEntries(seat);
+
+            var pad = AttributePadTo(seat);
+            if (pad is null) return;
+
+            ConfinePad(seat, pad);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Seat {Id}: failed to confine a gamepad", seat.Id);
+        }
+    }
+
+    /// <summary>
+    /// Write the jail for one pad, then restart its device node so handles opened before the
+    /// rule existed (the console's GameInput/Game Bar open a pad the moment it arrives) are
+    /// dropped. HidHide filters at open time only; without the restart the console keeps the
+    /// Guide button. Measured on the lab host: no rule → Game Bar opens in both sessions; rule
+    /// + restart → only in the seat's session, and the seat still reads the pad.
+    /// </summary>
+    private void ConfinePad(SeatInfo seat, HidHideDevice pad)
+    {
+        {
+            var rules = HidHideSessionJail.ConfineAll(pad, seat.SessionId);
+            var result = _cli.Write(HidHideCli.Sequence(rules.Select(HideDeviceArgs).ToArray()));
+
+            if (!result.Succeeded)
+            {
+                _logger.LogWarning("Seat {Id}: writing jail rules failed — the pad is NOT confined", seat.Id);
+                return;
+            }
+
+            // Cloaking has to be on for any of it to take effect.
+            _cli.Write("--cloak-on");
+
+            var state = _seatStates.GetOrAdd(seat.Id, _ => new SeatJailState());
+            foreach (var rule in rules) state.Rules.Add(rule);
+            state.SymbolicLink = pad.SymbolicLink;
+            state.DevicePath = pad.DeviceInstancePath;
+            _lastSeatPad[seat.Id] = pad.DeviceInstancePath;
+
+            _logger.LogInformation(
+                "Seat {Id}: confined '{Pad}' to session {Session} with {Count} rule(s) [{Rules}]",
+                seat.Id, pad.FriendlyName, seat.SessionId, rules.Count, string.Join(", ", rules));
+
+            RestartPad(seat, pad);
+            VerifyJail(seat, pad);
+        }
+    }
+
+    private void RestartPad(SeatInfo seat, HidHideDevice pad)
+    {
+        var node = string.IsNullOrWhiteSpace(pad.BaseContainerDeviceInstancePath)
+            ? pad.DeviceInstancePath
+            : pad.BaseContainerDeviceInstancePath;
+        var ok = _restartDevice(node);
+        if (ok) Thread.Sleep(1500); // let the node re-enumerate before the probe opens it
+        _logger.Log(ok ? LogLevel.Information : LogLevel.Warning,
+            "Seat {Id}: restart of '{Node}' {Result} — handles opened before the rule {Effect}",
+            seat.Id, node, ok ? "succeeded" : "FAILED", ok ? "are dropped" : "may still be held by another session");
+    }
+
+    internal static bool RestartDeviceWithPnputil(string instanceId)
+    {
+        try
+        {
+            using var proc = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = Path.Combine(Environment.SystemDirectory, "pnputil.exe"),
+                ArgumentList = { "/restart-device", instanceId },
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            });
+            if (proc is null) return false;
+            proc.StandardOutput.ReadToEndAsync();
+            proc.StandardError.ReadToEndAsync();
+            if (!proc.WaitForExit(15_000)) { try { proc.Kill(); } catch { } return false; }
+            return proc.ExitCode == 0;
+        }
+        catch { return false; }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  FOLLOW THE STREAM — Apollo creates the pad only when a client connects
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Called every health-check tick. Confines the pad that appears after a seat starts
+    /// streaming to that seat's session, and releases the rules when the client leaves (ViGEm
+    /// reuses instance paths, so a stale rule would hide the next seat's pad from its owner).
+    ///
+    /// Attribution requires a single waiting seat and an unclaimed emulated pad: either first
+    /// observed since stream start or previously confined successfully to that same seat.
+    /// Paths reserved by other live seats are never candidates; ambiguous arrivals wait.
+    /// </summary>
+    public void ReconcileSeatPads(IReadOnlyCollection<SeatInfo> seats)
+    {
+        if (!IsEnabled) return;
+        var now = _clock();
+
+        // 1. Release seats that stopped streaming or disappeared; forget deleted seats only.
+        foreach (var id in _lastSeatPad.Keys.ToList())
+            if (!seats.Any(s => s.Id == id)) _lastSeatPad.TryRemove(id, out _);
+        foreach (var id in _seatStates.Keys.ToList())
+        {
+            var seat = seats.FirstOrDefault(s => s.Id == id);
+            if (seat is null || seat.Status != SeatStatus.Streaming)
+                ReleaseSeat(id);
+        }
+        foreach (var id in _streamingSince.Keys.ToList())
+        {
+            if (!seats.Any(s => s.Id == id && s.Status == SeatStatus.Streaming))
+                _streamingSince.TryRemove(id, out _);
+        }
+
+        // 2. Seats streaming without a confined pad.
+        var waiting = new List<SeatInfo>();
+        foreach (var seat in seats)
+        {
+            if (seat.Status != SeatStatus.Streaming || seat.SessionId <= 0) continue;
+            _streamingSince.GetOrAdd(seat.Id, now);
+            if (!_seatStates.ContainsKey(seat.Id)) waiting.Add(seat);
+        }
+
+        // Pad arrival times are tracked even with no one waiting, so a console-side pad that
+        // was already there never looks "new" to a seat that connects later.
+        var listing = _cli.Read(ListGamingDevicesCommand);
+        if (!listing.Answered) return; // A failed read is not evidence that a pad disappeared.
+        var devices = HidHideDeviceParser.Parse(listing.Output);
+        foreach (var path in _padFirstSeen.Keys.ToList())
+            if (!devices.Any(d => d.DeviceInstancePath.Equals(path, StringComparison.OrdinalIgnoreCase)))
+                _padFirstSeen.TryRemove(path, out _);
+        foreach (var d in devices)
+            _padFirstSeen.TryAdd(d.DeviceInstancePath, now);
+
+        if (waiting.Count == 0) return;
+
+        var claimed = ClaimedPaths();
+        if (claimed is null) return; // Unknown rules: never steal an already confined pad.
+        var plan = PlanSeatPad(
+            waiting.Select(s => (s.Id, _streamingSince[s.Id])).ToList(),
+            devices.Where(HidHideSessionJail.IsEmulatedPad)
+                   .Where(d => !d.Nodes.Any(n => claimed.Contains(n)))
+                   .Select(d => (d, _padFirstSeen[d.DeviceInstancePath])).ToList(),
+            _options.HealthCheckIntervalMs,
+            // ViGEm reuses instance paths: a path only stays reserved while its owner streams,
+            // otherwise a stopped seat would block another seat's new pad on the same path.
+            _lastSeatPad.Where(kv => seats.Any(s => s.Id == kv.Key && s.Status == SeatStatus.Streaming))
+                        .ToDictionary(kv => kv.Key, kv => kv.Value));
+
+        if (plan.Seat is { } seatId && plan.Pad is { } pad)
+        {
+            var seat = waiting.First(s => s.Id == seatId);
+            _lastAmbiguity = null;
+            try { ConfinePad(seat, pad); }
+            catch (Exception ex) { _logger.LogError(ex, "Seat {Id}: failed to confine a gamepad", seat.Id); }
+        }
+        else if (plan.Reason is { } reason && reason != _lastAmbiguity)
+        {
+            _lastAmbiguity = reason;
+            _logger.LogInformation("Gamepad isolation waiting: {Reason}", reason);
+        }
+    }
+
+    internal readonly record struct SeatPadPlan(Guid? Seat, HidHideDevice? Pad, string? Reason);
+
+    /// <summary>Pure attribution decision, unit-tested without HidHide.</summary>
+    internal static SeatPadPlan PlanSeatPad(
+        IReadOnlyList<(Guid Seat, DateTimeOffset StreamingSince)> waiting,
+        IReadOnlyList<(HidHideDevice Pad, DateTimeOffset FirstSeen)> freePads,
+        int tickMs,
+        IReadOnlyDictionary<Guid, string>? lastSeatPad = null)
+    {
+        if (waiting.Count == 0) return new(null, null, null);
+        if (waiting.Count > 1)
+            return new(null, null, $"{waiting.Count} seats started streaming without a confined pad; which pad is whose cannot be proven");
+        var (seat, since) = waiting[0];
+        // A prior successful confinement is evidence even if disappearance/recreation was
+        // missed between ticks. Never use another seat's reserved path, even if it looks new.
+        var reserved = lastSeatPad ?? new Dictionary<Guid, string>();
+        var fresh = freePads.Where(p =>
+            !reserved.Any(kv => kv.Key != seat &&
+                kv.Value.Equals(p.Pad.DeviceInstancePath, StringComparison.OrdinalIgnoreCase)) &&
+            (p.FirstSeen >= since - TimeSpan.FromMilliseconds(tickMs) ||
+             (reserved.TryGetValue(seat, out var previous) &&
+              previous.Equals(p.Pad.DeviceInstancePath, StringComparison.OrdinalIgnoreCase)))).ToList();
+        if (fresh.Count == 0) return new(null, null, "no emulated pad has appeared since the client connected (keyboard/mouse only, or pad not created yet)");
+        if (fresh.Count > 1) return new(null, null, $"{fresh.Count} new emulated pads and one streaming seat; nothing confined rather than guessing");
+        return new(seat, fresh[0].Pad, null);
+    }
+
+    private void ReleaseSeat(Guid seatId)
+    {
+        if (!_seatStates.TryRemove(seatId, out var state) || state.Rules.Count == 0) return;
+        try
+        {
+            var result = _cli.Write(HidHideCli.Sequence(state.Rules.Select(UnhideDeviceArgs).ToArray()));
+            if (_seatStates.IsEmpty && _excludedPadStates.IsEmpty) _cli.Write("--cloak-off");
+            _logger.LogInformation("Seat {Id}: client left — released {Count} jail rule(s){Failed}",
+                seatId, state.Rules.Count, result.Succeeded ? "" : " (the CLI reported a failure)");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Seat {Id}: failed to release jail rules", seatId);
+        }
+    }
+
+    /// <summary>
+    /// Release the rules written for this seat, and nothing else.
+    /// </summary>
+    public void UncloakForSession(SeatInfo seat)
+    {
+        _lastSeatPad.TryRemove(seat.Id, out _);
+        _streamingSince.TryRemove(seat.Id, out _);
+        if (!_cli.IsAvailable) return;
+        if (!_seatStates.TryRemove(seat.Id, out var state) || state.Rules.Count == 0) return;
+
+        try
+        {
+            var result = _cli.Write(HidHideCli.Sequence(state.Rules.Select(UnhideDeviceArgs).ToArray()));
+
+            // Cloaking is a single global switch — it has to stay on while EITHER a seat or an
+            // excluded physical pad (ReconcileExcludedPhysicalPads) still has a live rule, or the
+            // other feature's confinement silently stops working too.
+            if (_seatStates.IsEmpty && _excludedPadStates.IsEmpty)
+            {
+                _cli.Write("--cloak-off");
+                _logger.LogInformation(
+                    "Seat {Id}: released {Count} jail rule(s), cloaking off — no confined seats " +
+                    "or excluded physical pads remain",
+                    seat.Id, state.Rules.Count);
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "Seat {Id}: released {Count} jail rule(s); {Remaining} confined seat(s) and " +
+                    "{ExcludedPads} excluded physical pad(s) still need cloaking on",
+                    seat.Id, state.Rules.Count, _seatStates.Count, _excludedPadStates.Count);
+            }
+
+            if (!result.Succeeded)
+                _logger.LogWarning("Seat {Id}: the CLI reported a failure while releasing jail rules", seat.Id);
+
+            // ⚠️ Releasing a rule does not hand the pad back to whoever should have had it. HidHide
+            // filters at open time: the session that already opened the device keeps its handle,
+            // and the rightful owner tried once and does not retry. Measured recovery took two
+            // reconnections. Worth saying plainly rather than implying teardown restored anything.
+            _logger.LogInformation(
+                "Seat {Id}: a pad opened under the released rule stays open in whichever session " +
+                "grabbed it — reconnecting the client is what re-creates the pad.",
+                seat.Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Seat {Id}: failed to release jail rules", seat.Id);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  EXCLUDE PHYSICAL PADS FROM SEATS — the inverse jail (issue #92)
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Confine the operator's named PHYSICAL controller(s) to the CONSOLE's own session, so they
+    /// are invisible to every seat — the mirror image of <see cref="CloakForSession"/>, built on
+    /// the exact same <see cref="HidHideSessionJail"/> mechanism, just pointed the other way.
+    ///
+    /// Fixes issue #92 (RageMC): a real gamepad plugged into the main/console PC was detected
+    /// inside a seat's game too, because nothing had ever stopped a seat session's own
+    /// <c>dwm</c>/<c>explorer</c>/<c>GameInputSvc</c> from opening it — the existing per-seat
+    /// jail only ever isolates seats' own EMULATED pads from each other, and deliberately never
+    /// touches a physical controller (see <see cref="AttributePadTo"/>).
+    ///
+    /// Opt-in via <see cref="MultiSeatOptions.ExcludedPhysicalPadDevicePaths"/> ALONE — an empty
+    /// list (the default) returns immediately without even resolving the console session, and
+    /// this is independent of <see cref="MultiSeatOptions.EnableHidHideCloaking"/>: an operator
+    /// may want their own controller protected without turning on per-seat isolation at all.
+    ///
+    /// Called every health-check tick (<see cref="MultiSeatWorker"/>'s existing
+    /// <c>HealthCheckIntervalMs</c> cadence — the same self-healing pattern
+    /// <c>SeatReconciler</c> uses for issue #87), not a one-shot startup action. Two things here
+    /// can change with nothing to notify us: the ACTIVE CONSOLE SESSION (fast user switch,
+    /// logon/logoff) and whether the named controller is even plugged in yet.
+    /// </summary>
+    public void ReconcileExcludedPhysicalPads()
+    {
+        var configured = _options.ExcludedPhysicalPadDevicePaths;
+        if (configured.Length == 0) return; // feature inert — zero I/O, nothing resolved either
+
+        if (!_cli.IsAvailable)
+        {
+            _logger.LogWarning(
+                "{Count} physical pad(s) are configured for console-only confinement " +
+                "(MultiSeat:ExcludedPhysicalPadDevicePaths) but HidHide is not installed — none " +
+                "of them are isolated from seats", configured.Length);
+            return;
+        }
+
+        var consoleSessionId = _consoleSessionId();
+        if (consoleSessionId <= 0)
+        {
+            // HidHideSessionJail.Confine refuses session <= 0 outright (session 0 never matches
+            // the driver's jail check, so a rule for it would hide the device from EVERY
+            // session, including the console's own — far louder than doing nothing this tick).
+            _logger.LogInformation(
+                "No active console session right now (WTSGetActiveConsoleSessionId returned " +
+                "{Sid}) — the {Count} configured physical pad exclusion(s) are skipped until one exists",
+                consoleSessionId, configured.Length);
+            return;
+        }
+
+        var devices = ListGamingDevices();
+
+        foreach (var path in configured)
+            ReconcileOneExcludedPad(path, MatchConfiguredPhysicalPad(path, devices), consoleSessionId);
+    }
+
+    private void ReconcileOneExcludedPad(string configuredPath, HidHideDevice? device, int consoleSessionId)
+    {
+        var state = _excludedPadStates.GetOrAdd(configuredPath, _ => new ExcludedPadState());
+        var lastSessionId = state.Rules.Count > 0 ? state.SessionId : (int?)null;
+        var plan = PlanExcludedPad(device, lastSessionId, consoleSessionId);
+
+        switch (plan)
+        {
+            case ExcludedPadPlan.DeviceNotPresent:
+                // ⚠️ Deliberately NOT pre-written, unlike PreWriteRules for a seat's own pad —
+                // even though HidHideConfigurator's own docs say "a rule for an absent device
+                // matches nothing, so writing one in advance is inert and free". That is true of
+                // the DEVICE's visibility, but it is not the only thing being committed to here,
+                // and the two situations are not actually the same:
+                //
+                // PreWriteRules pairs a path with a session id that is ALREADY FIXED and ALREADY
+                // CORRECT for as long as the pad can possibly take to appear — a seat's own
+                // session, settled at session-creation time — and it is written right before the
+                // one predictable event that creates the pad (Apollo starting). There is nothing
+                // for that session id to go stale against before the pad shows up.
+                //
+                // Here there is no equivalent predictable event — a physical controller can be
+                // plugged in at any moment, which is exactly why this method polls instead of
+                // reacting to one. And the value being paired with the path, the ACTIVE CONSOLE
+                // SESSION, is itself the thing that changes on its own over time (fast user
+                // switch, logon/logoff) — unlike a seat's fixed session id, it is not safe to
+                // treat as settled just because we have a reading for it right now.
+                //
+                // Writing today's console session against a controller that is not even here
+                // yet would commit to an answer this method cannot verify until the controller
+                // appears. Get it wrong and the choices are both bad: carry a stale, unverified
+                // session suffix in HidHide's PERSISTENT blacklist until the controller happens
+                // to reappear (if the console session moves on first, the real console user
+                // loses their own controller the moment it is plugged in), or re-write the guess
+                // on every single tick forever, paying this CLI's measured ~1s-per-invocation
+                // cost indefinitely for a controller that may never be plugged in at all.
+                // Waiting for presence costs at most one health-check interval of exposure the
+                // first time it is plugged in — the same race PreWriteRules closes for a seat's
+                // own pad — in exchange for never writing a guess this method cannot confirm.
+                if (state.Rules.Count > 0)
+                {
+                    _logger.LogInformation(
+                        "Configured physical pad '{Path}' is no longer present; its previous " +
+                        "jail rule(s) are left untouched in HidHide's blacklist [{Rules}] — inert " +
+                        "while the device is gone, and will be corrected if it reappears",
+                        configuredPath, string.Join(", ", state.Rules));
+                }
+                return;
+
+            case ExcludedPadPlan.AlreadyCurrent:
+                return; // nothing changed since the last tick — no CLI round-trip spent on it
+
+            case ExcludedPadPlan.WriteNew:
+                WriteExcludedPadRules(configuredPath, device!, consoleSessionId, state);
+                return;
+
+            case ExcludedPadPlan.RewriteForNewSession:
+                _logger.LogInformation(
+                    "Console session changed ({Old} -> {New}) while '{Pad}' stays plugged in — " +
+                    "re-confining it to the new console session",
+                    state.SessionId, consoleSessionId, device!.FriendlyName);
+                ReleaseExcludedPadRules(configuredPath, state);
+                WriteExcludedPadRules(configuredPath, device, consoleSessionId, state);
+                return;
+        }
+    }
+
+    private void WriteExcludedPadRules(
+        string configuredPath, HidHideDevice device, int consoleSessionId, ExcludedPadState state)
+    {
+        var rules = HidHideSessionJail.ConfineAll(device, consoleSessionId);
+        var result = _cli.Write(HidHideCli.Sequence(rules.Select(HideDeviceArgs).ToArray()));
+
+        if (!result.Succeeded)
+        {
+            _logger.LogWarning(
+                "Writing the console-confinement rule for '{Pad}' ({Path}) failed — it is NOT " +
+                "yet excluded from seats; will retry on the next health check",
+                device.FriendlyName, configuredPath);
+            return;
+        }
+
+        // Cloaking has to be on for any of it to take effect — same as CloakForSession.
+        _cli.Write("--cloak-on");
+
+        state.Rules.Clear();
+        foreach (var rule in rules) state.Rules.Add(rule);
+        state.SessionId = consoleSessionId;
+
+        _logger.LogInformation(
+            "Confined physical pad '{Pad}' ({Path}) to the console's session {Session} with " +
+            "{Count} rule(s) [{Rules}] — it is now invisible to every seat",
+            device.FriendlyName, configuredPath, consoleSessionId, rules.Count, string.Join(", ", rules));
+    }
+
+    private void ReleaseExcludedPadRules(string configuredPath, ExcludedPadState state)
+    {
+        if (state.Rules.Count == 0) return;
+
+        var stale = state.Rules.ToList();
+        var result = _cli.Write(HidHideCli.Sequence(stale.Select(UnhideDeviceArgs).ToArray()));
+
+        if (!result.Succeeded)
+        {
+            _logger.LogWarning(
+                "Releasing the stale console-confinement rule(s) for '{Path}' failed [{Rules}] — " +
+                "the device may now be confined to BOTH the old and the new console session",
+                configuredPath, string.Join(", ", stale));
+        }
+
+        state.Rules.Clear();
+    }
+
+    /// <summary>
+    /// Match a configured physical-pad path against a present device's identity — the exact same
+    /// pattern as the identity leg of <see cref="AttributePadTo"/> (either node, case-insensitive)
+    /// — but WITHOUT the emulated-pad filter. That filter exists only to stop a seat being
+    /// attributed a physical controller it has no business taking; it has no bearing here, where
+    /// the operator is naming a physical controller on purpose.
+    /// </summary>
+    internal static HidHideDevice? MatchConfiguredPhysicalPad(string configuredPath, IEnumerable<HidHideDevice> devices) =>
+        devices.FirstOrDefault(d =>
+            configuredPath.Equals(d.DeviceInstancePath, StringComparison.OrdinalIgnoreCase) ||
+            configuredPath.Equals(d.BaseContainerDeviceInstancePath, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>What a tick should do about one configured physical-pad path.</summary>
+    internal enum ExcludedPadPlan
+    {
+        /// <summary>No present device matches. Nothing is written — see the reasoning in
+        /// <see cref="ReconcileOneExcludedPad"/>.</summary>
+        DeviceNotPresent,
+
+        /// <summary>Already confined to the current console session; nothing to do.</summary>
+        AlreadyCurrent,
+
+        /// <summary>No rule tracked for this device yet; write one now.</summary>
+        WriteNew,
+
+        /// <summary>A rule is tracked, but for a console session that is no longer current;
+        /// release it and write the current one.</summary>
+        RewriteForNewSession,
+    }
+
+    /// <summary>
+    /// Pure decision for one configured path, kept free of the CLI so it can be unit-tested with
+    /// fakes — the same separation <see cref="SessionHealthCheck"/> uses for its own reconciliation
+    /// order (<c>RelaunchExitedAnchorAsync</c>, <c>RescueDisconnectedSessionAsync</c>).
+    /// </summary>
+    internal static ExcludedPadPlan PlanExcludedPad(HidHideDevice? device, int? lastConfinedSessionId, int consoleSessionId)
+    {
+        if (device is null) return ExcludedPadPlan.DeviceNotPresent;
+        if (lastConfinedSessionId is null) return ExcludedPadPlan.WriteNew;
+        return lastConfinedSessionId.Value == consoleSessionId
+            ? ExcludedPadPlan.AlreadyCurrent
+            : ExcludedPadPlan.RewriteForNewSession;
+    }
+
+    /// <summary>The jail rules written for one configured physical pad, so a session change can
+    /// release exactly those before writing the replacement.</summary>
+    private sealed class ExcludedPadState
+    {
+        public HashSet<string> Rules { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public int SessionId { get; set; }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  PROBE
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Check from session 0 that the rule actually took.
+    ///
+    /// The driver requires <c>sessionId != 0</c> for a jail to match, so this service — which
+    /// runs in session 0 and is therefore never the jailed session — must be refused a device
+    /// that is genuinely confined. That makes "can I still open it?" a live check on an
+    /// undocumented behaviour that a future HidHide release could drop silently.
+    ///
+    /// ⚠️ What it proves is one-directional: a refusal here means session 0 is being denied. It
+    /// does not prove the seat can still see the pad — a plain global hide, or a rule whose suffix
+    /// was stripped, would look exactly the same from here.
+    ///
+    /// ⚠️ And it is the KIND of failure that answers, not the fact of one. A jail refuses with
+    /// <c>ERROR_ACCESS_DENIED</c>; an absent device fails with <c>ERROR_FILE_NOT_FOUND</c>. Only
+    /// the first is evidence — see <see cref="HidHideSessionJail.Probe"/>.
+    /// </summary>
+    private void VerifyJail(SeatInfo seat, HidHideDevice pad)
+    {
+        if (!_options.VerifyHidHideJail) return;
+        if (string.IsNullOrWhiteSpace(pad.SymbolicLink)) return;
+
+        var probe = HidHideSessionJail.Probe(pad.SymbolicLink);
+
+        switch (probe.Verdict)
+        {
+            case HidHideSessionJail.JailProbe.Open:
+                _logger.LogWarning(
+                    "Seat {Id}: jail rules were written but session 0 can still open '{Pad}'. The " +
+                    "confinement is NOT in effect — either cloaking is off, an application whitelist " +
+                    "entry is defeating it, or this HidHide build no longer honours the '!<session>' " +
+                    "suffix (it is undocumented). Gamepad input is not isolated.",
+                    seat.Id, pad.FriendlyName);
+                break;
+
+            case HidHideSessionJail.JailProbe.Confined:
+                _logger.LogInformation(
+                    "Seat {Id}: verified — session 0 is refused '{Pad}', which is what a live jail " +
+                    "looks like from outside it.",
+                    seat.Id, pad.FriendlyName);
+                break;
+
+            default:
+                // NOT a success. Nobody can open a device that is not there, so this says nothing
+                // about the rule — and reporting it as a working jail is how a rule that matches
+                // nothing gets recorded as one being enforced.
+                _logger.LogWarning(
+                    "Seat {Id}: could not verify the jail on '{Pad}' — opening it failed with " +
+                    "Win32 error {Error}, which is not a refusal (a jail gives {Denied}). The " +
+                    "device is most likely gone, so the rules that were written may match nothing. " +
+                    "Nothing was proved either way.",
+                    seat.Id, pad.FriendlyName, probe.Error, HidHideSessionJail.ERROR_ACCESS_DENIED);
+                break;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  ATTRIBUTION — identity first, evidence second, elimination last
+    // ═══════════════════════════════════════════════════════════════════
+
+    private HidHideDevice? AttributePadTo(SeatInfo seat)
+    {
+        var devices = ListGamingDevices();
+        if (devices.Count == 0)
+        {
+            _logger.LogInformation(
+                "Seat {Id}: HidHide reports no present gaming devices, so there is nothing to " +
+                "confine yet. Apollo creates its pad when a Moonlight client connects, not at " +
+                "seat provision.",
+                seat.Id);
+            return null;
+        }
+
+        // 1. IDENTITY. A configured path for this account is the only non-guess we have; the
+        //    alternative is a patched Apollo that pins each seat's pad serial, which is deferred.
+        if (_options.SeatPadDevicePaths.TryGetValue(seat.AccountName, out var known) && known.Length > 0)
+        {
+            var byIdentity = devices.FirstOrDefault(d =>
+                known.Any(k => k.Equals(d.DeviceInstancePath, StringComparison.OrdinalIgnoreCase) ||
+                               k.Equals(d.BaseContainerDeviceInstancePath, StringComparison.OrdinalIgnoreCase)));
+
+            if (byIdentity is not null)
+            {
+                _logger.LogInformation("Seat {Id}: pad identified by configured path for {Account}", seat.Id, seat.AccountName);
+                return byIdentity;
+            }
+        }
+
+        // 2. Only emulated pads are ours to confine. A physical controller belongs to whoever is
+        //    holding it, and confining one to a seat takes it away from them.
+        var emulated = devices.Where(HidHideSessionJail.IsEmulatedPad).ToList();
+
+        if (emulated.Count == 0)
+        {
+            _logger.LogInformation(
+                "Seat {Id}: {Total} gaming device(s) present, none of them emulated. Physical " +
+                "controllers are left alone — confining one would take it from the person holding it.",
+                seat.Id, devices.Count);
+            return null;
+        }
+
+        // Anything already carrying a jail rule belongs to some session; don't steal it.
+        var claimed = ClaimedPaths();
+        if (claimed is null) return null;
+        var free = emulated.Where(d => !d.Nodes.Any(n => claimed.Contains(n))).ToList();
+
+        if (free.Count == 0)
+        {
+            _logger.LogWarning(
+                "Seat {Id}: every emulated pad is already confined to another session. Nothing " +
+                "was changed — taking one would leave that session without input.",
+                seat.Id);
+            return null;
+        }
+
+        // 3. ELIMINATION, and only when it is unambiguous.
+        if (free.Count > 1)
+        {
+            _logger.LogWarning(
+                "Seat {Id}: {Count} unconfined emulated pads and no way to tell which belongs to " +
+                "this seat [{Paths}]. Nothing was confined, deliberately. Guessing here is how a " +
+                "seat ends up holding the console player's controller while the dashboard reports " +
+                "a healthy jail. Set MultiSeat:SeatPadDevicePaths:{Account} to resolve it.",
+                seat.Id, free.Count, string.Join(", ", free.Select(d => d.BaseContainerDeviceInstancePath)), seat.AccountName);
+            return null;
+        }
+
+        var chosen = free[0];
+        _logger.LogWarning(
+            "Seat {Id}: pad '{Pad}' ({Path}) attributed to this seat BY ELIMINATION — it is the " +
+            "only unconfined emulated pad, not evidence that it is this seat's. If a console-side " +
+            "Apollo is running, its pad is indistinguishable from a seat's and may be the one " +
+            "taken. This decision is not remembered and is re-derived every time.",
+            seat.Id, chosen.FriendlyName, chosen.BaseContainerDeviceInstancePath);
+
+        return chosen;
+    }
+
+    private HashSet<string>? ClaimedPaths()
+    {
+        var claimed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var read = _cli.Read("--dev-list");
+        if (!read.Answered) return null;
+
+        foreach (var entry in HidHideDeviceParser.ParseHiddenDevices(read.Output))
+        {
+            var (path, session) = HidHideSessionJail.Split(entry);
+            if (session is not null) claimed.Add(path);
+        }
+
+        return claimed;
+    }
+
+    private void WarnAboutForeignWhitelistEntries(SeatInfo seat)
+    {
+        var foreign = ForeignWhitelistEntries();
+        if (foreign.Count == 0) return;
+
+        _logger.LogWarning(
+            "Seat {Id}: {Count} application(s) are whitelisted in HidHide and each of them can see " +
+            "EVERY confined pad, which defeats per-seat isolation entirely: {Apps}. The whitelist is " +
+            "global and cannot pair an application with a device. Note it protects the process that " +
+            "OPENS the device, which is often not the game — Steam titles frequently read pads " +
+            "through steam.exe.",
+            seat.Id, foreign.Count, string.Join(", ", foreign));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  WHITELIST (kept for explicit operator use)
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Whitelist an application. ⚠️ Under confinement this hands that application every confined
+    /// pad on the host, so it is logged loudly rather than quietly obeyed.
+    /// </summary>
+    public void WhitelistApplication(string exePath)
+    {
+        if (!_cli.IsAvailable) return;
+
+        _cli.Write(RegisterAppArgs(exePath));
+
+        if (_options.EnableHidHideCloaking)
+        {
+            _logger.LogWarning(
+                "Whitelisted {Path} in HidHide. While per-seat isolation is on this application can " +
+                "see every confined pad on the host, in every seat.",
+                exePath);
+        }
+        else
+        {
+            _logger.LogInformation("Whitelisted application: {Path}", exePath);
+        }
+    }
+
+    public void UnwhitelistApplication(string exePath)
+    {
+        if (!_cli.IsAvailable) return;
+
+        _cli.Write(UnregisterAppArgs(exePath));
+        _logger.LogInformation("Unwhitelisted application: {Path}", exePath);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  ARGUMENT CONSTRUCTION
+    // ═══════════════════════════════════════════════════════════════════
+    // Centralised because these were wrong at ELEVEN call sites and nothing noticed. Every switch
+    // takes its value directly, quoted; there is no --id and no --path form. Guarded by
+    // HidHideArgumentTests, which asserts those forms can never come back.
+
+    internal static string HideDeviceArgs(string deviceInstancePath) =>
+        $"--dev-hide \"{deviceInstancePath}\"";
+
+    internal static string UnhideDeviceArgs(string deviceInstancePath) =>
+        $"--dev-unhide \"{deviceInstancePath}\"";
+
+    internal static string RegisterAppArgs(string exePath) =>
+        $"--app-reg \"{exePath}\"";
+
+    internal static string UnregisterAppArgs(string exePath) =>
+        $"--app-unreg \"{exePath}\"";
+
+    internal const string ListGamingDevicesCommand = "--dev-gaming";
+
+    // Read-only queries must carry --cancel: HidHideCLI saves its configuration on exit even for a
+    // pure listing, so a bare --dev-gaming rewrites the config it was asked to report on. Reads go
+    // through HidHideCli.Read, which adds it (and --cloak-state) to every listing.
+    internal static string ListGamingDevicesArgs => HidHideCli.Sequence("--cloak-state", ListGamingDevicesCommand, "--cancel");
+    internal static string ListAppsArgs => HidHideCli.Sequence("--cloak-state", "--app-list", "--cancel");
+
+    /// <summary>
+    /// The jail rules written for one seat, so teardown releases exactly those.
+    /// </summary>
+    private sealed class SeatJailState
+    {
+        public HashSet<string> Rules { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public string SymbolicLink { get; set; } = "";
+        public string DevicePath { get; set; } = "";
+    }
+}

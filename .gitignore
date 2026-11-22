@@ -1,0 +1,83 @@
+# Build outputs
+bin/
+obj/
+publish/
+publish_tmp/
+publish_out/
+out/
+
+# Packet capture / diagnostic traces
+*.etl
+*.etx
+PktMon.*
+
+# C++ InputHook DLL build output
+src/MultiSeat.InputHook/build/
+
+# Steam isolation native build products
+src/MultiSeat.SteamIsolation/build-*/
+src/MultiSeat.SteamIsolation/artifacts/
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Node
+node_modules/
+dist/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Secrets
+appsettings.Development.json
+# Covers appsettings.local.json — host-local config overrides, loaded last by Program.cs so they
+# outrank the shipped appsettings.json. Deliberately never committed: they describe one machine.
+appsettings.*.json
+!appsettings.json
+*.pfx
+*.key
+api-key.txt
+
+# Logs
+*.log
+logs/
+
+# Prerequisites (large binaries - keep scripts and README)
+prerequisites/*.exe
+prerequisites/*.msi
+prerequisites/*.zip
+prerequisites/*.ini
+!prerequisites/*.ps1
+!prerequisites/*.txt
+# VirtualDisplayDriver folder contains pre-built third-party driver binaries;
+# the install script downloads the latest release from GitHub automatically.
+prerequisites/VirtualDisplayDriver/
+
+# Claude Code local data (contains machine-specific paths and worktrees)
+.claude/
+
+# Continue.dev local data
+.continue/
+
+# Scratch and probe output.
+# Diagnosing this project means writing one-off probes and staging copies of scripts to run
+# them; the output describes a single run on a single host and is worthless the next day, but
+# it sits in the tree looking plausible enough to commit by accident. Logs are covered by
+# *.log above. Keep real scratch work in the session scratchpad outside the repo.
+scratch/
+scratchpad/
+*.out
+*.tmp
+*.bak
+
+# Accidentally created scratch files - shell redirection mistakes, not deliberate output
+null
+queryex
