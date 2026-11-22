@@ -75,6 +75,23 @@ public sealed class SeatLighteningTests
         finally { Registry.CurrentUser.DeleteSubKeyTree(path, false); }
     }
 
+    [Fact]
+    public void ApplyPowerPolicyHidesShutdownForSeatAccount()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var path = @"Software\KinseatTest-" + Guid.NewGuid().ToString("N");
+        try
+        {
+            using var root = Registry.CurrentUser.CreateSubKey(path, true)!;
+            SeatLighteningService.ApplyPowerPolicy(root);
+            SeatLighteningService.ApplyPowerPolicy(root);
+            using var policy = root.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer")!;
+            Assert.Equal(1, policy.GetValue("NoClose"));
+            Assert.Equal(RegistryValueKind.DWord, policy.GetValueKind("NoClose"));
+        }
+        finally { Registry.CurrentUser.DeleteSubKeyTree(path, false); }
+    }
+
     [Theory]
     [InlineData("seat.lightening.set", "{}")]
     [InlineData("seat.lightening.set", "{\"emptyDesktop\":true,\"blockStartupApps\":true,\"blockVendorUtilities\":true,\"closeWindhawkTray\":0}")]

@@ -123,6 +123,16 @@ public sealed class SeatLighteningService(ILogger<SeatLighteningService> logger,
         }
     }
 
+    // Seat accounts must not be able to shut down or restart the host PC. This policy hides
+    // Shut down / Restart / Sleep / Hibernate from Start, Ctrl+Alt+Del and Alt+F4 for this account only.
+    // Always applied, independent of the lightening settings; only ever written to the hive of a seat
+    // account created by Kinseat, never to the host console.
+    internal static void ApplyPowerPolicy(RegistryKey root)
+    {
+        using var policy = root.CreateSubKey(Explorer, true)!;
+        policy.SetValue("NoClose", 1, RegistryValueKind.DWord);
+    }
+
     internal static readonly string[] DesktopIcons =
     [
         "{645FF040-5081-101B-9F08-00AA002F954E}", // Corbeille
@@ -205,6 +215,7 @@ public sealed class SeatLighteningService(ILogger<SeatLighteningService> logger,
             using var root = mounted ? Registry.Users.OpenSubKey(mount!, true) : Registry.Users.OpenSubKey(accountSid, true);
             if (root is null) throw new IOException("La ruche du compte ne peut être ouverte");
             ApplyDesktopIcons(root, settings.EmptyDesktop);
+            ApplyPowerPolicy(root);
             var entries = new Dictionary<string, string>(StartupEntries(), StringComparer.OrdinalIgnoreCase);
             foreach (var (key, value) in SeatRunEntries(root)) entries.TryAdd(key, value);
             ApplyApproved(root, entries, settings.BlockStartupApps);

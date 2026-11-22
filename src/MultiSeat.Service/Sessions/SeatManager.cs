@@ -402,7 +402,9 @@ public sealed class SeatManager
         {
             var sid = AccountManager.TryResolveSid(seat.AccountName, _logger)
                 ?? throw new InvalidOperationException("SID du compte introuvable");
-            var eligible = _accounts.PurgeEligibility(seat.AccountName, "S-1-0-0") is null;
+            // Per-account policies apply to managed seats even when nobody is logged on at the console;
+            // purge eligibility has stricter, unrelated console-session requirements.
+            var eligible = _accounts.IsManagedSeatAccount(seat.AccountName);
             if (eligible) _lightening.ApplyRegistry(sid, seat.Lightening);
             _publicDesktop.Apply(sid, seat.AccountName, seat.Lightening.EmptyDesktop, eligible);
             if (eligible && seat.Lightening.EmptyDesktop)
