@@ -41,12 +41,12 @@ PC hôte (Kinseat Hôte — Windows x64)
 
 ### 1. Le joueur trouve le PC et demande l'accès
 
-![Kinseat Client : trouver le PC](docs/images/client-trouver-pc.png)
+![Kinseat Client : trouver le PC](docs/images/client-trouver-pc-0.3.18.png)
 *Kinseat Client détecte automatiquement les PC Kinseat du réseau local. Le joueur clique sur « Demander l'accès ».*
 
 ### 2. L'hôte reçoit la demande
 
-![Demande d'accès côté hôte](docs/images/hote-demande-acces.png)
+![Demande d'accès côté hôte](docs/images/hote-demande-acces-0.3.18.png)
 *La demande apparaît sur le PC hôte avec choix immédiat de la place, du profil graphique et vérification du budget VRAM.*
 
 ### 3. L'hôte crée la place du joueur
@@ -56,7 +56,7 @@ PC hôte (Kinseat Hôte — Windows x64)
 
 ### 4. L'hôte choisit les jeux autorisés
 
-![Bibliothèque](docs/images/hote-bibliotheque.png)
+![Bibliothèque](docs/images/hote-bibliotheque-0.3.18.png)
 *La bibliothèque regroupe les jeux détectés ou ajoutés manuellement (panneau repliable `+ Ajouter un jeu`). Pour chaque jeu : joueurs autorisés et option « Partir de la sauvegarde de l'hôte ». (Capture avec jeux fictifs.)*
 
 Le joueur est ensuite appairé et lance sa session depuis le Client. Pendant le jeu, **Alt+K** ouvre un menu latéral harmonisé par-dessus le flux : statistiques en grille compacte, libérer la souris, plein écran ou fenêtré, coller le presse-papiers, réduire, quitter le flux.
