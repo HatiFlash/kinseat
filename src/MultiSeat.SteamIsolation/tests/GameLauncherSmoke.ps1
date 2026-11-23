@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$Artifacts = (Join-Path $PSScriptRoot '..\artifacts'),
     [string]$TestRoot = (Join-Path $PSScriptRoot '..\build-game-smoke')
 )
@@ -58,11 +58,11 @@ try {
     $taskLongshotArgs = '--game "' + $taskManifestFile + '" -- "' + (Join-Path $taskHostGame 'fakelongshot.exe') + '" "' + $taskLongshotReport + '" --relaunch-suspended'
     $taskLongshot = Start-Process -FilePath (Join-Path $taskRun 'MultiSeat.SteamLauncher.exe') -ArgumentList $taskLongshotArgs -WorkingDirectory $taskRun -WindowStyle Hidden -PassThru -Wait
     if ($taskLongshot.ExitCode -ne 0) { throw "Longshot suspendu : code de sortie $($taskLongshot.ExitCode)" }
-    if (-not (Test-Path -LiteralPath $taskLongshotReport)) { throw 'Longshot enfant n’a pas écrit son rapport.' }
+    if (-not (Test-Path -LiteralPath $taskLongshotReport)) { throw "Longshot enfant n'a pas écrit son rapport." }
     $taskReport = [IO.File]::ReadAllText($taskLongshotReport)
     if ($taskReport -match 'slot_01' -or $taskReport -notmatch 'user\\save absent' -or
-        $taskReport -notmatch 'cache hote') { throw 'Longshot enfant a vu les sauvegardes de l’hôte ou perdu le cache.' }
-    if (-not (Test-Path -LiteralPath (Join-Path $taskPlayer 'save\joueur\slot_00\progress.sav'))) { throw 'Longshot enfant n’a pas écrit chez le joueur.' }
+        $taskReport -notmatch 'cache hote') { throw "Longshot enfant a vu les sauvegardes de l'hôte ou perdu le cache." }
+    if (-not (Test-Path -LiteralPath (Join-Path $taskPlayer 'save\joueur\slot_00\progress.sav'))) { throw "Longshot enfant n'a pas écrit chez le joueur." }
     if ((Test-Path -LiteralPath (Join-Path $taskHostGame 'user\save\joueur')) -or
         [IO.File]::ReadAllText((Join-Path $taskHostSave 'progress.sav')) -cne 'sauvegarde hote') { throw 'Longshot a modifié les sauvegardes hôte.' }
     $taskLog = [IO.File]::ReadAllText($taskGameLog)
