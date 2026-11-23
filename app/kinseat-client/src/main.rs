@@ -254,11 +254,19 @@ fn radar(ui: &mut egui::Ui, col: f32, found: bool) {
         // Aiguille de balayage subtile.
         let angle = time * 1.1;
         let tip = c + vec2(angle.cos() * 130.0, angle.sin() * 130.0);
-        p.line_segment([c, tip], Stroke::new(1.5_f32, wave_color.gamma_multiply(0.35)));
+        p.line_segment(
+            [c, tip],
+            Stroke::new(1.5_f32, wave_color.gamma_multiply(0.35)),
+        );
         // Écran PC central.
         let screen = egui::Rect::from_center_size(c, vec2(74.0, 52.0));
         p.rect_filled(screen, 7, t::CANVAS);
-        p.rect_stroke(screen, 7, Stroke::new(2.5_f32, t::ACCENT), StrokeKind::Inside);
+        p.rect_stroke(
+            screen,
+            7,
+            Stroke::new(2.5_f32, t::ACCENT),
+            StrokeKind::Inside,
+        );
         p.line_segment(
             [pos2(c.x - 20.0, c.y + 33.0), pos2(c.x + 20.0, c.y + 33.0)],
             Stroke::new(2.5_f32, t::ACCENT),
@@ -293,11 +301,7 @@ fn header(ctx: &egui::Context, settings_open: bool, tag: Option<&str>) -> bool {
                         .color(t::PRIMARY)
                         .family(t::title_family()),
                 );
-                ui.label(
-                    RichText::new("Client")
-                        .size(12.0)
-                        .color(t::ACCENT),
-                );
+                ui.label(RichText::new("Client").size(12.0).color(t::ACCENT));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(32.0);
                     clicked = ui

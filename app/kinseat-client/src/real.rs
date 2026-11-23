@@ -405,10 +405,7 @@ impl Client {
                     p.circle_stroke(
                         right_dev.center(),
                         30.0 + pulse * 18.0,
-                        egui::Stroke::new(
-                            1.5_f32,
-                            sig_color.gamma_multiply((1.0 - pulse) * 0.55),
-                        ),
+                        egui::Stroke::new(1.5_f32, sig_color.gamma_multiply((1.0 - pulse) * 0.55)),
                     );
                 }
                 p.rect_filled(left_dev, 6, t::CANVAS);
@@ -496,43 +493,43 @@ impl Client {
             ui.add_space(left_pad);
             fixed_card(ui, card_w, |ui| {
                 ui.set_width((card_w - 50.0).max(240.0));
-            field(
-                ui,
-                "Pseudo (obligatoire)",
-                &mut self.form.pseudo,
-                "Ton pseudo",
-                false,
-                24,
-            );
-            text(
-                ui,
-                "Code PIN facultatif : demandé à chaque ouverture de Kinseat.",
-                13.0,
-                t::FAINT,
-            );
-            space(ui, 8.0);
-            field(
-                ui,
-                "Code PIN (4 à 8 chiffres)",
-                &mut self.form.pin,
-                "Laisser vide : aucun code",
-                true,
-                8,
-            );
-            let confirm = field(
-                ui,
-                "Confirmer le code PIN",
-                &mut self.form.confirm,
-                "Retape le code",
-                true,
-                8,
-            );
-            submit = entered(ui, &confirm);
-            feedback(ui, &self.form.message);
-            if action(ui, "Créer mon profil", true) {
-                submit = true;
-            }
-        });
+                field(
+                    ui,
+                    "Pseudo (obligatoire)",
+                    &mut self.form.pseudo,
+                    "Ton pseudo",
+                    false,
+                    24,
+                );
+                text(
+                    ui,
+                    "Code PIN facultatif : demandé à chaque ouverture de Kinseat.",
+                    13.0,
+                    t::FAINT,
+                );
+                space(ui, 8.0);
+                field(
+                    ui,
+                    "Code PIN (4 à 8 chiffres)",
+                    &mut self.form.pin,
+                    "Laisser vide : aucun code",
+                    true,
+                    8,
+                );
+                let confirm = field(
+                    ui,
+                    "Confirmer le code PIN",
+                    &mut self.form.confirm,
+                    "Retape le code",
+                    true,
+                    8,
+                );
+                submit = entered(ui, &confirm);
+                feedback(ui, &self.form.message);
+                if action(ui, "Créer mon profil", true) {
+                    submit = true;
+                }
+            });
         });
         if submit {
             self.submit_profile();
@@ -583,16 +580,16 @@ impl Client {
             ui.add_space(left_pad);
             fixed_card(ui, card_w, |ui| {
                 ui.set_width((card_w - 50.0).max(240.0));
-            let edit = field(ui, "Code PIN", &mut self.form.current, "••••", true, 8);
-            if !edit.has_focus() {
-                edit.request_focus();
-            }
-            submit = entered(ui, &edit);
-            feedback(ui, &self.form.message);
-            if action(ui, "Ouvrir", true) {
-                submit = true;
-            }
-        });
+                let edit = field(ui, "Code PIN", &mut self.form.current, "••••", true, 8);
+                if !edit.has_focus() {
+                    edit.request_focus();
+                }
+                submit = entered(ui, &edit);
+                feedback(ui, &self.form.message);
+                if action(ui, "Ouvrir", true) {
+                    submit = true;
+                }
+            });
         });
         if submit {
             if self.demo {

@@ -91,9 +91,13 @@ fn draw(
     if ui
         .add_sized(
             [324.0, 36.0],
-            egui::Button::new(RichText::new("Reprendre (Échap)").size(14.0).color(t::ON_ACCENT))
-                .fill(t::ACCENT)
-                .corner_radius(8),
+            egui::Button::new(
+                RichText::new("Reprendre (Échap)")
+                    .size(14.0)
+                    .color(t::ON_ACCENT),
+            )
+            .fill(t::ACCENT)
+            .corner_radius(8),
         )
         .clicked()
     {
@@ -348,11 +352,7 @@ impl Client {
         if self.demo {
             egui::SidePanel::right("stream-menu-demo")
                 .exact_width(360.0)
-                .frame(
-                    egui::Frame::new()
-                        .fill(t::RAIL)
-                        .inner_margin(12.0),
-                )
+                .frame(egui::Frame::new().fill(t::RAIL).inner_margin(12.0))
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| draw(ui, &snapshot, &tx));
                 });
@@ -384,11 +384,7 @@ impl Client {
                         let _ = tx.send(stream_menu::Action::Resume);
                     }
                     egui::CentralPanel::default()
-                        .frame(
-                            egui::Frame::new()
-                                .fill(t::RAIL)
-                                .inner_margin(12.0),
-                        )
+                        .frame(egui::Frame::new().fill(t::RAIL).inner_margin(12.0))
                         .show(child, |ui| {
                             egui::ScrollArea::vertical().show(ui, |ui| draw(ui, &snapshot, &tx));
                         });

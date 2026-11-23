@@ -307,55 +307,55 @@ impl Panel {
                         .desired_width(350.0)
                         .hint_text("ex. Stardew Valley"),
                 );
-            ui.label("Chemin de l’exécutable (.exe)");
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.exe_path)
-                        .desired_width(340.0)
-                        .hint_text(r"C:\Jeux\MonJeu\jeu.exe"),
-                );
-                if ui
-                    .add_enabled(self.picker.is_none(), egui::Button::new("Parcourir…"))
-                    .clicked()
-                {
-                    self.browse(false, ui.ctx().clone());
-                }
-                if ui
-                    .add_enabled(self.picker.is_none(), egui::Button::new("Dossier…"))
-                    .clicked()
-                {
-                    self.browse(true, ui.ctx().clone());
-                }
-            });
-            if !self.candidates.is_empty() {
-                ui.label("Choisir un exécutable du dossier :");
-                for path in self.candidates.clone() {
-                    if ui.button(path.display().to_string()).clicked() {
-                        self.choose(path);
+                ui.label("Chemin de l’exécutable (.exe)");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.exe_path)
+                            .desired_width(340.0)
+                            .hint_text(r"C:\Jeux\MonJeu\jeu.exe"),
+                    );
+                    if ui
+                        .add_enabled(self.picker.is_none(), egui::Button::new("Parcourir…"))
+                        .clicked()
+                    {
+                        self.browse(false, ui.ctx().clone());
+                    }
+                    if ui
+                        .add_enabled(self.picker.is_none(), egui::Button::new("Dossier…"))
+                        .clicked()
+                    {
+                        self.browse(true, ui.ctx().clone());
+                    }
+                });
+                if !self.candidates.is_empty() {
+                    ui.label("Choisir un exécutable du dossier :");
+                    for path in self.candidates.clone() {
+                        if ui.button(path.display().to_string()).clicked() {
+                            self.choose(path);
+                        }
                     }
                 }
-            }
-            if let Some(pending) = self.pending.get(ADD_KEY) {
-                progress(ui, pending);
-            } else if ui
-                .add_enabled(
-                    !self.loading && self.picker.is_none(),
-                    egui::Button::new(t::text("Ajouter à la bibliothèque", 13.0, t::ON_ACCENT))
-                        .fill(t::ACCENT),
-                )
-                .clicked()
-            {
-                if self.exe_path.trim().is_empty() {
-                    self.browse(false, ui.ctx().clone());
-                } else if !self.name.trim().is_empty()
-                    && self.pending.begin(ADD_KEY, PendingAction::Add)
+                if let Some(pending) = self.pending.get(ADD_KEY) {
+                    progress(ui, pending);
+                } else if ui
+                    .add_enabled(
+                        !self.loading && self.picker.is_none(),
+                        egui::Button::new(t::text("Ajouter à la bibliothèque", 13.0, t::ON_ACCENT))
+                            .fill(t::ACCENT),
+                    )
+                    .clicked()
                 {
-                    action = Some(Command::LibraryAdd {
-                        name: self.name.trim().into(),
-                        exe_path: self.exe_path.trim().into(),
-                    });
+                    if self.exe_path.trim().is_empty() {
+                        self.browse(false, ui.ctx().clone());
+                    } else if !self.name.trim().is_empty()
+                        && self.pending.begin(ADD_KEY, PendingAction::Add)
+                    {
+                        action = Some(Command::LibraryAdd {
+                            name: self.name.trim().into(),
+                            exe_path: self.exe_path.trim().into(),
+                        });
+                    }
                 }
-            }
             });
             ui.add_space(12.0);
         }

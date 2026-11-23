@@ -100,7 +100,11 @@ fn card(
             CornerRadius::same(12),
             if hovered { t::SURFACE } else { t::CANVAS },
         );
-        dashed(p, r.shrink(1.0), if hovered { t::ACCENT } else { t::BORDER });
+        dashed(
+            p,
+            r.shrink(1.0),
+            if hovered { t::ACCENT } else { t::BORDER },
+        );
         let circle_center = r.center() - vec2(0.0, 22.0);
         p.circle_filled(
             circle_center,
@@ -188,7 +192,12 @@ fn card(
 
     // Identité du joueur : avatar + nom + activité.
     let avatar_y = r.top() + if compact { 60.0 } else { 68.0 };
-    views::avatar(p, pos2(inner.left() + 20.0, avatar_y), 20.0, &seat.account_name);
+    views::avatar(
+        p,
+        pos2(inner.left() + 20.0, avatar_y),
+        20.0,
+        &seat.account_name,
+    );
     let display_name = seat
         .display_name
         .as_deref()
@@ -226,7 +235,10 @@ fn card(
     // Chip télémétrie compacte (résolution · ips).
     if !compact {
         let chip_text = format!("{} × {} · {} i/s", seat.width, seat.height, seat.fps);
-        let chip_rect = Rect::from_min_size(pos2(inner.left(), r.top() + 106.0), vec2(inner.width(), 24.0));
+        let chip_rect = Rect::from_min_size(
+            pos2(inner.left(), r.top() + 106.0),
+            vec2(inner.width(), 24.0),
+        );
         p.rect_filled(chip_rect, CornerRadius::same(6), t::CANVAS);
         p.rect_stroke(
             chip_rect,
@@ -259,7 +271,10 @@ fn card(
     let half_w = ((inner.width() - btn_gap) / 2.0).max(32.0);
     let btn_y = r.bottom() - 39.0;
     let left_rect = Rect::from_min_size(pos2(inner.left(), btn_y), vec2(half_w, 28.0));
-    let right_rect = Rect::from_min_size(pos2(inner.left() + half_w + btn_gap, btn_y), vec2(half_w, 28.0));
+    let right_rect = Rect::from_min_size(
+        pos2(inner.left() + half_w + btn_gap, btn_y),
+        vec2(half_w, 28.0),
+    );
 
     if let Some(n) = notice {
         if ui
@@ -388,7 +403,15 @@ fn meter_card(p: &egui::Painter, r: Rect, m: &Meter) {
         StrokeKind::Inside,
     );
     let inner = r.shrink2(vec2(10.0, 10.0));
-    label(p, inner.left(), inner.top(), &m.name, 11.5, t::SECONDARY, inner.width() * 0.65);
+    label(
+        p,
+        inner.left(),
+        inner.top(),
+        &m.name,
+        11.5,
+        t::SECONDARY,
+        inner.width() * 0.65,
+    );
     let accent = if m.ratio >= 0.9 { t::WARN } else { m.color };
     p.text(
         pos2(inner.right(), inner.top() + 7.0),
@@ -397,9 +420,13 @@ fn meter_card(p: &egui::Painter, r: Rect, m: &Meter) {
         t::title_font(12.5),
         if m.ratio >= 0.85 { t::WARN } else { t::PRIMARY },
     );
-    let bar = Rect::from_min_size(pos2(inner.left(), inner.bottom() - 8.0), vec2(inner.width(), 6.0));
+    let bar = Rect::from_min_size(
+        pos2(inner.left(), inner.bottom() - 8.0),
+        vec2(inner.width(), 6.0),
+    );
     p.rect_filled(bar, CornerRadius::same(3), t::HOVER);
-    let filled_w = (bar.width() * m.ratio.clamp(0.0, 1.0)).max(if m.ratio > 0.0 { 4.0 } else { 0.0 });
+    let filled_w =
+        (bar.width() * m.ratio.clamp(0.0, 1.0)).max(if m.ratio > 0.0 { 4.0 } else { 0.0 });
     if filled_w > 0.0 {
         p.rect_filled(
             Rect::from_min_size(bar.min, vec2(filled_w, bar.height())),

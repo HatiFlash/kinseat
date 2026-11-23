@@ -31,8 +31,14 @@ pub fn title_family() -> FontFamily {
 
 /// Emblème Kinseat à deux pilules ambrées (identique à Kinseat Hôte).
 pub fn draw_brand_mark(p: &egui::Painter, origin: egui::Pos2, scale: f32) {
-    let left = Rect::from_min_size(origin + vec2(0.0, 3.0 * scale), vec2(7.0 * scale, 13.0 * scale));
-    let right = Rect::from_min_size(origin + vec2(10.0 * scale, 0.0), vec2(7.0 * scale, 18.0 * scale));
+    let left = Rect::from_min_size(
+        origin + vec2(0.0, 3.0 * scale),
+        vec2(7.0 * scale, 13.0 * scale),
+    );
+    let right = Rect::from_min_size(
+        origin + vec2(10.0 * scale, 0.0),
+        vec2(7.0 * scale, 18.0 * scale),
+    );
     let r = CornerRadius::same((2.5 * scale).round() as u8);
     p.rect_filled(left, r, ACCENT);
     p.rect_filled(right, r, ACCENT.gamma_multiply(0.72));
@@ -45,10 +51,9 @@ pub fn install(ctx: &egui::Context) {
         let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
         let regular_path = format!(r"{windir}\Fonts\segoeui.ttf");
         let semibold_path = format!(r"{windir}\Fonts\seguisb.ttf");
-        if let (Ok(regular), Ok(semibold)) = (
-            std::fs::read(regular_path),
-            std::fs::read(semibold_path),
-        ) {
+        if let (Ok(regular), Ok(semibold)) =
+            (std::fs::read(regular_path), std::fs::read(semibold_path))
+        {
             let mut fonts = FontDefinitions::default();
             fonts.font_data.insert(
                 "segoe".into(),
