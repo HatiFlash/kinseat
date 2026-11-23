@@ -348,21 +348,99 @@ impl Client {
             }
         };
         title(ui, &heading);
-        space(ui, 20.0);
-        fixed_card(ui, 620.0, |ui| {
-            ui.set_width(570.0);
-            ui.horizontal(|ui| {
+        space(ui, 24.0);
+        let card_w = 580.0_f32.min(ui.available_width());
+        let left_pad = ((ui.available_width() - card_w) / 2.0).max(0.0);
+        ui.horizontal(|ui| {
+            ui.add_space(left_pad);
+            fixed_card(ui, card_w, |ui| {
+                ui.set_width((card_w - 50.0).max(240.0));
+                // Animation visuelle d'appairage (Client <-> PC hôte).
                 if phase.is_active() {
-                    ui.add(egui::Spinner::new().size(28.0).color(t::ACCENT));
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(33));
                 }
-                ui.vertical(|ui| {
+                let time = ui.ctx().input(|i| i.time) as f32;
+                let (anim_rect, _) = ui.allocate_exact_size(
+                    egui::vec2((card_w - 50.0).max(240.0), 108.0),
+                    egui::Sense::hover(),
+                );
+                let p = ui.painter();
+                let cy = anim_rect.center().y;
+                let left_dev = egui::Rect::from_center_size(
+                    egui::pos2(anim_rect.center().x - 110.0, cy),
+                    egui::vec2(54.0, 38.0),
+                );
+                let right_dev = egui::Rect::from_center_size(
+                    egui::pos2(anim_rect.center().x + 110.0, cy),
+                    egui::vec2(64.0, 44.0),
+                );
+                let sig_color = match &phase {
+                    Phase::Pairing | Phase::Ready(_) => t::OK,
+                    Phase::Sending | Phase::Waiting => t::ACCENT,
+                    _ => t::ERR,
+                };
+                // Piste de liaison entre les deux appareils.
+                let line_start = egui::pos2(left_dev.right() + 10.0, cy);
+                let line_end = egui::pos2(right_dev.left() - 10.0, cy);
+                p.line_segment(
+                    [line_start, line_end],
+                    egui::Stroke::new(2.0_f32, t::BORDER),
+                );
+                if phase.is_active() {
+                    // Trois impulsions lumineuses qui circulent sur la liaison.
+                    for k in 0..3 {
+                        let frac = (time * 0.75 + k as f32 / 3.0).fract();
+                        let x = line_start.x + (line_end.x - line_start.x) * frac;
+                        let glow = (1.0 - (frac - 0.5).abs() * 2.0).clamp(0.15, 1.0);
+                        p.circle_filled(
+                            egui::pos2(x, cy),
+                            6.5,
+                            sig_color.gamma_multiply(glow * 0.25),
+                        );
+                        p.circle_filled(egui::pos2(x, cy), 3.2, sig_color.gamma_multiply(glow));
+                    }
+                    // Halo pulsant autour du PC hôte.
+                    let pulse = (time * 1.4).fract();
+                    p.circle_stroke(
+                        right_dev.center(),
+                        30.0 + pulse * 18.0,
+                        egui::Stroke::new(
+                            1.5_f32,
+                            sig_color.gamma_multiply((1.0 - pulse) * 0.55),
+                        ),
+                    );
+                }
+                p.rect_filled(left_dev, 6, t::CANVAS);
+                p.rect_stroke(
+                    left_dev,
+                    6,
+                    egui::Stroke::new(2.0_f32, t::SECONDARY),
+                    egui::StrokeKind::Inside,
+                );
+                p.rect_filled(right_dev, 7, t::CANVAS);
+                p.rect_stroke(
+                    right_dev,
+                    7,
+                    egui::Stroke::new(2.5_f32, sig_color),
+                    egui::StrokeKind::Inside,
+                );
+                p.line_segment(
+                    [
+                        egui::pos2(right_dev.center().x - 16.0, right_dev.bottom() + 6.0),
+                        egui::pos2(right_dev.center().x + 16.0, right_dev.bottom() + 6.0),
+                    ],
+                    egui::Stroke::new(2.0_f32, sig_color),
+                );
+                space(ui, 8.0);
+                ui.vertical_centered(|ui| {
                     section(
                         ui,
                         match &phase {
                             Phase::Sending => "Envoi de la demande…",
                             Phase::Waiting => "En attente de l'accord…",
                             Phase::Pairing => "Association en cours…",
-                            Phase::Ready(_) => "Terminé",
+                            Phase::Ready(_) => "Appareil associé",
                             _ => "Demande terminée",
                         },
                     );
@@ -371,31 +449,31 @@ impl Client {
                         egui::Label::new(egui::RichText::new(detail).size(14.0).color(color))
                             .wrap(),
                     );
+                    space(ui, 8.0);
+                    text(
+                        ui,
+                        format!("PC : {}  ·  {}", host.name, host.address),
+                        12.5,
+                        t::FAINT,
+                    );
                 });
-            });
-            space(ui, 8.0);
-            text(
-                ui,
-                format!("PC : {}  ·  {}", host.name, host.address),
-                13.0,
-                t::FAINT,
-            );
-            space(ui, 20.0);
-            ui.horizontal(|ui| {
-                if phase.is_active() {
-                    if action(ui, "Annuler", false) {
-                        self.join.cancel();
-                        self.screen = Screen::Search;
+                space(ui, 20.0);
+                ui.horizontal(|ui| {
+                    if phase.is_active() {
+                        if action(ui, "Annuler", false) {
+                            self.join.cancel();
+                            self.screen = Screen::Search;
+                        }
+                    } else {
+                        if action(ui, "Réessayer", true) {
+                            self.request_access(host.clone());
+                        }
+                        if action(ui, "Retour", false) {
+                            self.join.cancel();
+                            self.screen = Screen::Search;
+                        }
                     }
-                } else {
-                    if action(ui, "Réessayer", true) {
-                        self.request_access(host.clone());
-                    }
-                    if action(ui, "Retour", false) {
-                        self.join.cancel();
-                        self.screen = Screen::Search;
-                    }
-                }
+                });
             });
         });
     }
@@ -412,8 +490,12 @@ impl Client {
         );
         space(ui, 20.0);
         let mut submit = false;
-        fixed_card(ui, 460.0, |ui| {
-            ui.set_width(410.0);
+        let card_w = 460.0_f32.min(ui.available_width());
+        let left_pad = ((ui.available_width() - card_w) / 2.0).max(0.0);
+        ui.horizontal(|ui| {
+            ui.add_space(left_pad);
+            fixed_card(ui, card_w, |ui| {
+                ui.set_width((card_w - 50.0).max(240.0));
             field(
                 ui,
                 "Pseudo (obligatoire)",
@@ -450,6 +532,7 @@ impl Client {
             if action(ui, "Créer mon profil", true) {
                 submit = true;
             }
+        });
         });
         if submit {
             self.submit_profile();
@@ -494,8 +577,12 @@ impl Client {
         );
         space(ui, 20.0);
         let mut submit = false;
-        fixed_card(ui, 460.0, |ui| {
-            ui.set_width(410.0);
+        let card_w = 460.0_f32.min(ui.available_width());
+        let left_pad = ((ui.available_width() - card_w) / 2.0).max(0.0);
+        ui.horizontal(|ui| {
+            ui.add_space(left_pad);
+            fixed_card(ui, card_w, |ui| {
+                ui.set_width((card_w - 50.0).max(240.0));
             let edit = field(ui, "Code PIN", &mut self.form.current, "••••", true, 8);
             if !edit.has_focus() {
                 edit.request_focus();
@@ -505,6 +592,7 @@ impl Client {
             if action(ui, "Ouvrir", true) {
                 submit = true;
             }
+        });
         });
         if submit {
             if self.demo {

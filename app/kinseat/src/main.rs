@@ -2951,6 +2951,7 @@ impl eframe::App for Kinseat {
                                                 self.confirm_close = Some(id)
                                             }
                                             overview::Intent::Seats => self.page = Page::Seats,
+                                            overview::Intent::AddSeat => self.open_add_seat(None),
                                             overview::Intent::Cancel(id) => {
                                                 self.dispatch(Command::Cancel(id))
                                             }

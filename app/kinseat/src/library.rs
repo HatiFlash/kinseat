@@ -167,6 +167,7 @@ pub struct Panel {
     pub error: Option<String>,
     pub search: String,
     pub source: String,
+    pub show_add_form: bool,
     pub name: String,
     pub exe_path: String,
     /// Confirmation d'un octroi : jeu, membre, dossier exact envoyé au service.
@@ -241,13 +242,26 @@ impl Panel {
                     .request_repaint_after(std::time::Duration::from_millis(100)),
             }
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(!self.loading, egui::Button::new("Analyser"))
                 .clicked()
             {
                 self.loading = true;
                 action = Some(Command::LibraryScan);
+            }
+            let add_label = if self.show_add_form {
+                "Masquer l'ajout manuel"
+            } else {
+                "+ Ajouter un jeu"
+            };
+            let add_btn = if self.show_add_form {
+                egui::Button::new(t::text(add_label, 13.0, t::PRIMARY)).fill(t::HOVER)
+            } else {
+                egui::Button::new(t::text(add_label, 13.0, t::ON_ACCENT)).fill(t::ACCENT)
+            };
+            if ui.add(add_btn).clicked() {
+                self.show_add_form = !self.show_add_form;
             }
             ui.label(t::text(
                 "Catalogue local : Steam, Epic, GOG, EA, Ubisoft et jeux ajoutés manuellement.",
@@ -275,11 +289,24 @@ impl Panel {
                 ui.add(egui::ProgressBar::new(progress).desired_width(280.0));
             });
         }
-        t::frame().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(t::title("Ajouter un jeu manuellement", 16.0));
-            ui.label("Nom du jeu");
-            ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(350.0));
+        if self.show_add_form {
+            t::frame().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(t::title("Ajouter un jeu manuellement", 16.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Fermer").clicked() {
+                            self.show_add_form = false;
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+                ui.label("Nom du jeu");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.name)
+                        .desired_width(350.0)
+                        .hint_text("ex. Stardew Valley"),
+                );
             ui.label("Chemin de l’exécutable (.exe)");
             ui.horizontal(|ui| {
                 ui.add(
@@ -313,7 +340,8 @@ impl Panel {
             } else if ui
                 .add_enabled(
                     !self.loading && self.picker.is_none(),
-                    egui::Button::new("Ajouter"),
+                    egui::Button::new(t::text("Ajouter à la bibliothèque", 13.0, t::ON_ACCENT))
+                        .fill(t::ACCENT),
                 )
                 .clicked()
             {
@@ -328,8 +356,9 @@ impl Panel {
                     });
                 }
             }
-        });
-        ui.add_space(12.0);
+            });
+            ui.add_space(12.0);
+        }
         ui.horizontal(|ui| {
             ui.label("Rechercher");
             ui.add(

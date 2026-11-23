@@ -1,13 +1,13 @@
 use egui::{Color32, CornerRadius, FontFamily, FontId, RichText, Stroke, Style, Visuals};
 
-pub const CANVAS: Color32 = Color32::from_rgb(0x15, 0x14, 0x13);
-pub const RAIL: Color32 = Color32::from_rgb(0x1c, 0x1a, 0x18);
-pub const SURFACE: Color32 = Color32::from_rgb(0x23, 0x21, 0x1e);
-pub const HOVER: Color32 = Color32::from_rgb(0x2e, 0x2a, 0x26);
-pub const BORDER: Color32 = Color32::from_rgb(0x3a, 0x36, 0x32);
-pub const PRIMARY: Color32 = Color32::from_rgb(0xed, 0xe8, 0xe1);
-pub const SECONDARY: Color32 = Color32::from_rgb(0xb3, 0xab, 0xa1);
-pub const FAINT: Color32 = Color32::from_rgb(0x94, 0x8c, 0x82);
+pub const CANVAS: Color32 = Color32::from_rgb(0x13, 0x12, 0x11);
+pub const RAIL: Color32 = Color32::from_rgb(0x19, 0x18, 0x16);
+pub const SURFACE: Color32 = Color32::from_rgb(0x1f, 0x1d, 0x1b);
+pub const HOVER: Color32 = Color32::from_rgb(0x2a, 0x26, 0x22);
+pub const BORDER: Color32 = Color32::from_rgb(0x33, 0x2f, 0x2b);
+pub const PRIMARY: Color32 = Color32::from_rgb(0xef, 0xea, 0xe4);
+pub const SECONDARY: Color32 = Color32::from_rgb(0xac, 0xa4, 0x9a);
+pub const FAINT: Color32 = Color32::from_rgb(0x83, 0x7b, 0x72);
 pub const ACCENT: Color32 = Color32::from_rgb(0xe8, 0xa3, 0x3d);
 pub const ON_ACCENT: Color32 = Color32::from_rgb(0x1a, 0x12, 0x06);
 pub const OK: Color32 = Color32::from_rgb(0x6c, 0xc7, 0x88);
@@ -91,7 +91,8 @@ pub fn card_hover(
 pub fn frame() -> egui::Frame {
     egui::Frame::new()
         .fill(SURFACE)
-        .corner_radius(10)
+        .stroke(Stroke::new(1.0_f32, BORDER))
+        .corner_radius(12)
         .inner_margin(16)
 }
 pub fn install(ctx: &egui::Context) {
@@ -110,7 +111,7 @@ pub fn install(ctx: &egui::Context) {
     visuals.override_text_color = None;
     visuals.widgets.inactive.weak_bg_fill = HOVER;
     visuals.widgets.hovered.weak_bg_fill = BORDER;
-    visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT);
     visuals.widgets.inactive.bg_fill = HOVER;
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, PRIMARY);
