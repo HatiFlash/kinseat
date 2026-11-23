@@ -539,7 +539,7 @@ public class InstallLibTests
         var install = FrameworkDependent(t.Sub("install"), "old");
         Put(install, "appsettings.json", "{ \"MultiSeat\": { \"MaxSeats\": 4 } }");
         var stage = FrameworkDependent(t.Sub("stage"), "new");
-        File.Copy(Path.Combine(RepoRoot, "src", "MultiSeat.Service", "appsettings.json"), Path.Combine(stage, "appsettings.json"), true);
+        File.Copy(Path.Combine(RepoRoot, "src", "Kinseat.Service", "appsettings.json"), Path.Combine(stage, "appsettings.json"), true);
 
         var res = Ps(engine, InstallCall(stage, install, t.Root) + "$r = 1");
         var text = res.Stdout + res.Stderr;

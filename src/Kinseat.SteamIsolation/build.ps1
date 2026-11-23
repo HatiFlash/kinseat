@@ -20,7 +20,7 @@ foreach ($architecture in @('x64', 'Win32')) {
     & $cmake --build $buildDirectory --config Release --parallel
     if ($LASTEXITCODE -ne 0) { throw "Build failed for $architecture" }
     $suffix = if ($architecture -eq 'Win32') { '32' } else { '' }
-    $outputs = @("MultiSeat.SteamLauncher$suffix.exe", "MultiSeat.SteamHook$suffix.dll", "MultiSeat.GameFiles$suffix.dll")
+    $outputs = @("Kinseat.SteamLauncher$suffix.exe", "Kinseat.SteamHook$suffix.dll", "Kinseat.GameFiles$suffix.dll")
     & $cmake --build $buildDirectory --config Release --target GameFilesPathsTests
     if ($LASTEXITCODE -ne 0) { throw "GameFiles test build failed for $architecture" }
     & (Join-Path $buildDirectory 'Release\GameFilesPathsTests.exe')
