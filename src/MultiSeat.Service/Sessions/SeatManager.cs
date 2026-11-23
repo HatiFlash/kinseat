@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using Microsoft.Extensions.Options;
 using MultiSeat.Service.Accounts;
@@ -344,7 +344,7 @@ public sealed class SeatManager
                 await BroadcastState(seat);
             }
         }
-        _pendingRestore.Clear();
+        lock (_restoreLock) { _pendingRestore.Clear(); }
     }
 
     internal void SaveDefinitions()

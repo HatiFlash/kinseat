@@ -184,7 +184,7 @@ public sealed class MultiSeatWorker : BackgroundService
 
         // ── Step 4: Start embedded API server ────────────────────────
         _apiApp = ApiServer.Build(_services, _options);
-        _ = _apiApp.RunAsync(stoppingToken);
+        await _apiApp.StartAsync(stoppingToken);
         _logger.LogInformation("API server listening on port {Port}", _options.ApiPort);
 
         // ── Step 5: Auto-provision seats ─────────────────────────────
