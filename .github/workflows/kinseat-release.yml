@@ -1,0 +1,347 @@
+name: Release — Kinseat Multi-Platform
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  steam-isolation:
+    name: Native SteamIsolation (x64 & x86)
+    runs-on: windows-2022
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build x64 and x86 native helpers
+        shell: pwsh
+        run: ./src/MultiSeat.SteamIsolation/build.ps1
+
+      - name: Upload native helpers
+        uses: actions/upload-artifact@v6
+        with:
+          name: steam-isolation-binaries
+          path: |
+            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamLauncher.exe
+            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamLauncher32.exe
+            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamHook.dll
+            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamHook32.dll
+            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamShim.exe
+            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.GameFiles.dll
+            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.GameFiles32.dll
+          if-no-files-found: error
+
+  host-windows-x64:
+    name: Kinseat Host Setup (Windows x64)
+    needs: steam-isolation
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: src/MultiSeat.Dashboard/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Get-Content installer/manifest.json -Raw | ConvertFrom-Json).version
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Publish MultiSeat.Service (win-x64 self-contained)
+        run: dotnet publish src/MultiSeat.Service -c Release -r win-x64 --self-contained -o publish/MultiSeat
+
+      - name: Build Dashboard (wwwroot)
+        working-directory: src/MultiSeat.Dashboard
+        run: |
+          npm ci
+          npm run build
+
+      - name: Stage Dashboard into wwwroot
+        shell: pwsh
+        run: Copy-Item src/MultiSeat.Dashboard/dist publish/MultiSeat/wwwroot -Recurse -Force
+
+      - name: Download SteamIsolation helpers
+        uses: actions/download-artifact@v6
+        with:
+          name: steam-isolation-binaries
+          path: publish/MultiSeat/SteamIsolation
+
+      - name: Build kinseat and kinseat-agent
+        working-directory: app
+        run: cargo build --release -p kinseat -p kinseat-agent
+
+      - name: Assemble Host payload zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/host | Out-Null
+          ./installer/build-release.ps1 `
+            -ServicePublishDir (Resolve-Path publish/MultiSeat).Path `
+            -HostExe (Resolve-Path app/target/release/kinseat.exe).Path `
+            -AgentExe (Resolve-Path app/target/release/kinseat-agent.exe).Path `
+            -OutDir (Resolve-Path dist/host).Path
+
+      - name: Build Kinseat-Host-Setup.exe
+        working-directory: app
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          $env:KINSEAT_HOST_PAYLOAD_ZIP = (Resolve-Path "../dist/host/host-payload-$v.zip").Path
+          cargo build --release -p kinseat-setup
+          New-Item -ItemType Directory -Force ../release-assets | Out-Null
+          Copy-Item target/release/kinseat-setup.exe "../release-assets/Kinseat-Host-Setup-$v.exe" -Force
+
+      - name: Upload Host Setup
+        uses: actions/upload-artifact@v6
+        with:
+          name: asset-host-win-x64
+          path: release-assets/Kinseat-Host-Setup-*.exe
+          if-no-files-found: error
+
+  client-windows-x64:
+    name: Kinseat Client Setup (Windows x64)
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Get-Content installer/manifest.json -Raw | ConvertFrom-Json).version
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Build kinseat-client (x64)
+        working-directory: app
+        run: cargo build --release -p kinseat-client
+
+      - name: Download Moonlight Portable (x64)
+        shell: pwsh
+        run: |
+          $headers = @{ 'User-Agent' = 'kinseat-release-ci' }
+          $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/moonlight-stream/moonlight-qt/releases/latest' -Headers $headers
+          $asset = $rel.assets | Where-Object { $_.name -match '^MoonlightPortable-x64-.*\.zip$' } | Select-Object -First 1
+          if ($asset) {
+            New-Item -ItemType Directory -Force thirdparty | Out-Null
+            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile thirdparty/MoonlightPortable-x64.zip -Headers $headers
+            Write-Host "Bundled Moonlight: $($asset.name)"
+          } else {
+            Write-Host "::warning::MoonlightPortable-x64 zip not found; building client setup without bundled Moonlight"
+          }
+
+      - name: Build Kinseat-Client-Setup.exe (x64)
+        working-directory: app
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          $env:KINSEAT_CLIENT_EXE = (Resolve-Path target/release/kinseat-client.exe).Path
+          if (Test-Path ../thirdparty/MoonlightPortable-x64.zip) {
+            $env:KINSEAT_MOONLIGHT_ZIP = (Resolve-Path ../thirdparty/MoonlightPortable-x64.zip).Path
+          }
+          cargo build --release -p kinseat-client-setup
+          New-Item -ItemType Directory -Force ../release-assets | Out-Null
+          Copy-Item target/release/kinseat-client-setup.exe "../release-assets/Kinseat-Client-Setup-$v.exe" -Force
+
+      - name: Upload Client Windows x64
+        uses: actions/upload-artifact@v6
+        with:
+          name: asset-client-win-x64
+          path: release-assets/Kinseat-Client-Setup-*.exe
+          if-no-files-found: error
+
+  client-windows-arm64:
+    name: Kinseat Client (Windows ARM64)
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Get-Content installer/manifest.json -Raw | ConvertFrom-Json).version
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Build kinseat-client (Windows ARM64)
+        working-directory: app
+        run: cargo build --release --target aarch64-pc-windows-msvc -p kinseat-client
+
+      - name: Build Kinseat-Client-Setup (Windows ARM64)
+        working-directory: app
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          $clientExe = (Resolve-Path target/aarch64-pc-windows-msvc/release/kinseat-client.exe).Path
+          $env:KINSEAT_CLIENT_EXE = $clientExe
+          cargo build --release --target aarch64-pc-windows-msvc -p kinseat-client-setup
+          New-Item -ItemType Directory -Force ../release-assets | Out-Null
+          Copy-Item target/aarch64-pc-windows-msvc/release/kinseat-client-setup.exe "../release-assets/Kinseat-Client-Setup-$v-arm64.exe" -Force
+          New-Item -ItemType Directory -Force ../dist/arm64-portable | Out-Null
+          Copy-Item $clientExe ../dist/arm64-portable/kinseat-client.exe -Force
+          Copy-Item ../LICENSE ../dist/arm64-portable/LICENSE -Force
+          Compress-Archive -Path ../dist/arm64-portable/* -DestinationPath "../release-assets/Kinseat-Client-$v-windows-arm64.zip" -Force
+
+      - name: Upload Client Windows ARM64
+        uses: actions/upload-artifact@v6
+        with:
+          name: asset-client-win-arm64
+          path: release-assets/*
+          if-no-files-found: error
+
+  client-linux-x64:
+    name: Kinseat Client (Linux x64 .deb & .tar.gz)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libwayland-dev libgl1-mesa-dev \
+            libx11-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libfontconfig1-dev
+
+      - name: Build .deb and portable .tar.gz
+        run: |
+          chmod +x packaging/client/build-linux.sh
+          OUT="$PWD/release-assets" ./packaging/client/build-linux.sh
+
+      - name: Upload Client Linux x64
+        uses: actions/upload-artifact@v6
+        with:
+          name: asset-client-linux-x64
+          path: release-assets/*
+          if-no-files-found: error
+
+  client-macos:
+    name: Kinseat Client (macOS Apple Silicon & Intel)
+    runs-on: macos-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Resolve version
+        id: ver
+        run: |
+          VERSION=$(python3 -c "import json; print(json.load(open('installer/manifest.json'))['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build macOS ARM64 & Intel .app bundles
+        working-directory: app
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          mkdir -p ../release-assets
+          for PAIR in "aarch64-apple-darwin:arm64" "x86_64-apple-darwin:x64"; do
+            TARGET="${PAIR%%:*}"
+            ARCH="${PAIR##*:}"
+            cargo build --release --target "$TARGET" -p kinseat-client
+            STAGE="$(mktemp -d)"
+            APP="$STAGE/Kinseat Client.app"
+            mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+            cp "target/$TARGET/release/kinseat-client" "$APP/Contents/MacOS/kinseat-client"
+            chmod +x "$APP/Contents/MacOS/kinseat-client"
+            cp "kinseat-client/assets/kinseat-256.png" "$APP/Contents/Resources/kinseat.png"
+            printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n  <key>CFBundleName</key><string>Kinseat Client</string>\n  <key>CFBundleDisplayName</key><string>Kinseat Client</string>\n  <key>CFBundleIdentifier</key><string>io.github.hatiflash.kinseat.client</string>\n  <key>CFBundleVersion</key><string>%s</string>\n  <key>CFBundleShortVersionString</key><string>%s</string>\n  <key>CFBundleExecutable</key><string>kinseat-client</string>\n  <key>CFBundlePackageType</key><string>APPL</string>\n  <key>NSHighResolutionCapable</key><true/>\n</dict>\n</plist>\n' "$VERSION" "$VERSION" > "$APP/Contents/Info.plist"
+            tar -C "$STAGE" -czf "../release-assets/Kinseat-Client-${VERSION}-macos-${ARCH}.tar.gz" "Kinseat Client.app"
+            rm -rf "$STAGE"
+          done
+
+      - name: Upload Client macOS
+        uses: actions/upload-artifact@v6
+        with:
+          name: asset-client-macos
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - host-windows-x64
+      - client-windows-x64
+      - client-windows-arm64
+      - client-linux-x64
+      - client-macos
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve version
+        id: ver
+        run: |
+          VERSION=$(python3 -c "import json; print(json.load(open('installer/manifest.json'))['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Download all release assets
+        uses: actions/download-artifact@v6
+        with:
+          pattern: asset-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        working-directory: release-assets
+        run: |
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Kinseat ${{ steps.ver.outputs.version }} — Refonte UI, Sécurité & Clients Multi-plateformes
+          files: release-assets/*
+          body: |
+            ## Kinseat ${{ steps.ver.outputs.version }}
+
+            ### Nouveautés & améliorations
+            - **Refonte visuelle Hôte & Client** : cartes de places compactes avec pills d'état/télémétrie, carte `Place libre` cliquable, panneau Ressources du PC unifié, formulaire « Ajouter un jeu » repliable dans la Bibliothèque, modales avec voile d'assombrissement et corps scrollable, écrans Client centrés avec **animations radar & appairage**, et overlay `Alt+K` harmonisé en grille 2×2.
+            - **Sécurité** : correction de la LPE `SYSTEM` (`SharedLibraryProvisioner`), suppression de la fuite de clé API dans `appsettings*.json`, comparaison en temps constant `FixedTimeEquals`, DPAPI `CurrentUser` (SYSTEM) pour `kinseat-web.secret`, blocage des symlinks dans les diagnostics, et fail-closed dans `ConsoleCallerCheck`.
+            - **Stabilité C++ (`GameFiles`) & .NET** : protection anti-UAF au teardown CRT, wildcards DOS (`*.sav`), visibilité des sauvegardes supprimées puis recréées, fast-path lock-free sur `NtClose`, blocage Windows 11 Famille (`Core`), et suppression des freezes UI.
+            - **Clients multi-plateformes** : Windows x64, Windows ARM64, Linux x64 (`.deb` & `.tar.gz`), et macOS (Apple Silicon & Intel `.app`).
+
+            ### Fichiers inclus
+            | Fichier | Plateforme |
+            |---|---|
+            | `Kinseat-Host-Setup-${{ steps.ver.outputs.version }}.exe` | PC hôte — Windows 10/11 x64 |
+            | `Kinseat-Client-Setup-${{ steps.ver.outputs.version }}.exe` | Client — Windows x64 (Moonlight inclus) |
+            | `Kinseat-Client-Setup-${{ steps.ver.outputs.version }}-arm64.exe` | Client — Windows ARM64 (installateur) |
+            | `Kinseat-Client-${{ steps.ver.outputs.version }}-windows-arm64.zip` | Client — Windows ARM64 (portable) |
+            | `kinseat-client_${{ steps.ver.outputs.version }}_amd64.deb` | Client — Linux Debian/Ubuntu x64 |
+            | `kinseat-client_${{ steps.ver.outputs.version }}_linux-x64.tar.gz` | Client — Linux x64 (portable) |
+            | `Kinseat-Client-${{ steps.ver.outputs.version }}-macos-arm64.tar.gz` | Client — macOS Apple Silicon (`.app`) |
+            | `Kinseat-Client-${{ steps.ver.outputs.version }}-macos-x64.tar.gz` | Client — macOS Intel (`.app`) |
+            | `SHA256SUMS` | Empreintes SHA-256 de tous les fichiers |

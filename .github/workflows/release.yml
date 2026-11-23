@@ -21,10 +21,7 @@ name: Release - MultiSeat Windows x64
 # this repo's own prerequisite script already depends on.
 
 on:
-  push:
-    tags:
-      - 'v*'
-  workflow_dispatch:      # builds and uploads an artifact, never publishes a release
+  workflow_dispatch:      # legacy MultiSeat zip build (Kinseat installers are built by kinseat-release.yml)
 
 permissions:
   contents: write         # required to create the release

@@ -7,7 +7,7 @@ mkdir -p "$OUT"
 cd "$ROOT/app"
 cargo build --release -p kinseat-client
 BIN="$CARGO_TARGET_DIR/release/kinseat-client"
-VERSION=0.3.4
+VERSION=0.3.18
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/kinseat-client-deb.XXXXXX")"
 PORTABLE="$(mktemp -d "${TMPDIR:-/tmp}/kinseat-client-portable.XXXXXX")"
 trap 'rm -rf "$STAGE" "$PORTABLE"' EXIT

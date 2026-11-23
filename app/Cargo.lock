@@ -1599,7 +1599,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "kinseat"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "eframe",
  "egui",
@@ -1616,7 +1616,7 @@ dependencies = [
 
 [[package]]
 name = "kinseat-agent"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "base64",
  "embed-manifest",
@@ -1628,7 +1628,7 @@ dependencies = [
 
 [[package]]
 name = "kinseat-client"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "eframe",
  "egui",
@@ -1646,7 +1646,7 @@ dependencies = [
 
 [[package]]
 name = "kinseat-client-setup"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "eframe",
  "egui",
@@ -1659,7 +1659,7 @@ dependencies = [
 
 [[package]]
 name = "kinseat-ipc"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "serde",
  "serde_json",
@@ -1667,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "kinseat-preflight"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "serde",
  "windows-sys 0.59.0",
@@ -1675,7 +1675,7 @@ dependencies = [
 
 [[package]]
 name = "kinseat-setup"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "eframe",
  "egui",
