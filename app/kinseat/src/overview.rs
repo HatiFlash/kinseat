@@ -169,10 +169,17 @@ fn card(
         80.0,
     );
     if let Some(n) = notice {
+        let short = n.label();
+        let compact_notice = short.split('·').next().unwrap_or(&short).trim();
+        let badge_text = if compact_notice.is_empty() {
+            "Préavis".to_owned()
+        } else {
+            format!("Fin {compact_notice}")
+        };
         pill(
             p,
             pos2(inner.right(), r.top() + 10.0),
-            &n.label(),
+            &badge_text,
             n.color(),
             n.color().gamma_multiply(0.16),
             Some(n.color()),

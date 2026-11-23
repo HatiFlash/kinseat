@@ -97,10 +97,10 @@ try {
         if (-not @($manifest.artifacts | Where-Object { $_.file -eq $relative -and $_.required }).Count) { throw "Fichier service non authentifié : $relative" }
     }
     foreach ($scriptName in @('Install-Kinseat.ps1','Uninstall-Kinseat.ps1','MultiSession-Kinseat.ps1','rdpwrap-offsets.ini',
-        'service/SteamIsolation/MultiSeat.GameFiles.dll','service/SteamIsolation/MultiSeat.GameFiles32.dll')) {
+        'service/SteamIsolation/Kinseat.GameFiles.dll','service/SteamIsolation/Kinseat.GameFiles32.dll')) {
         if (-not @($manifest.artifacts | Where-Object { $_.file -eq $scriptName -and $_.required }).Count) { throw "Script non signé par manifeste: $scriptName" }
     }
-    $runtime=Get-Content -LiteralPath (Join-Path $root 'service/MultiSeat.Service.runtimeconfig.json') -Raw | ConvertFrom-Json
+    $runtime=Get-Content -LiteralPath (Join-Path $root 'service/Kinseat.Service.runtimeconfig.json') -Raw | ConvertFrom-Json
     if (-not $runtime.runtimeOptions.includedFrameworks -or -not (Test-Path (Join-Path $root 'service/hostfxr.dll'))) { throw 'Publish autonome incohérent' }
     if (Test-Path -LiteralPath $stateFile) {
         $script:priorStateRaw=Get-Content -LiteralPath $stateFile -Raw
@@ -148,7 +148,7 @@ try {
             Copy-Item -LiteralPath (Join-Path (Split-Path $root -Parent) 'setup.exe') -Destination $stage -Force
             # Setup en un seul .exe : il contient déjà la charge utile, inutile de la recopier.
             if (-not $env:KINSEAT_PAYLOAD_EMBEDDED) { Copy-Item -LiteralPath $root -Destination (Join-Path $stage 'payload') -Recurse -Force }
-            if (-not (Test-Path (Join-Path $stage 'MultiSeat.Service.exe')) -or -not (Test-Path (Join-Path $stage 'wwwroot/index.html'))) { throw 'Stage incomplet' }
+            if (-not (Test-Path (Join-Path $stage 'Kinseat.Service.exe')) -or -not (Test-Path (Join-Path $stage 'wwwroot/index.html'))) { throw 'Stage incomplet' }
             if (Test-Path $install) {
                 $state.backup=Join-Path $data ('install-backup-'+[guid]::NewGuid().ToString('N'))
                 Save-State
@@ -160,7 +160,7 @@ try {
             }
             $state.filesReplaced=$true; Save-State
             Move-Item -LiteralPath $stage -Destination $install
-            if ((Get-FileHash (Join-Path $install 'MultiSeat.Service.exe') -Algorithm SHA256).Hash -ne ($manifest.artifacts | Where-Object id -eq 'service').sha256) { throw 'Copie service altérée' }
+            if ((Get-FileHash (Join-Path $install 'Kinseat.Service.exe') -Algorithm SHA256).Hash -ne ($manifest.artifacts | Where-Object id -eq 'service').sha256) { throw 'Copie service altérée' }
             foreach($id in @('gamefiles64','gamefiles32')) {
                 $item=$manifest.artifacts | Where-Object id -eq $id | Select-Object -First 1
                 if (-not $item -or (Get-FileHash (Join-Path $install ($item.file -replace '^service/','')) -Algorithm SHA256).Hash -ne $item.sha256) { throw "Copie $id altérée" }
@@ -205,7 +205,7 @@ try {
         Save-State
     }
     Step 'service' 65 {
-        $exe=Join-Path $install 'MultiSeat.Service.exe'
+        $exe=Join-Path $install 'Kinseat.Service.exe'
         if ($state.serviceExisted) { Run-Sc @('config','MultiSeatService','binPath=',('"'+$exe+'"'),'start=','auto') }
         else { Run-Sc @('create','MultiSeatService','binPath=',('"'+$exe+'"'),'start=','auto','DisplayName=','"MultiSeat Multi-Seat Streaming Service"') }
         Run-Sc @('description','MultiSeatService','Manages multi-seat headless game streaming sessions with isolated input, audio, and display.')

@@ -28,14 +28,14 @@ jobs:
           dotnet-version: '10.0.x'
 
       - name: Restore
-        run: dotnet restore src/MultiSeat.slnx
+        run: dotnet restore src/Kinseat.slnx
 
       - name: Build
-        run: dotnet build src/MultiSeat.slnx -c Release --no-restore
+        run: dotnet build src/Kinseat.slnx -c Release --no-restore
 
       - name: Test
         run: >
-          dotnet test src/MultiSeat.slnx -c Release --no-build
+          dotnet test src/Kinseat.slnx -c Release --no-build
           --logger "trx;LogFileName=test-results.trx"
           --results-directory ${{ github.workspace }}/test-results
 
@@ -58,7 +58,7 @@ jobs:
     # user's machine.
     defaults:
       run:
-        working-directory: src/MultiSeat.Dashboard
+        working-directory: src/Kinseat.Dashboard
 
     steps:
       - uses: actions/checkout@v5
@@ -67,7 +67,7 @@ jobs:
         with:
           node-version: '20'
           cache: npm
-          cache-dependency-path: src/MultiSeat.Dashboard/package-lock.json
+          cache-dependency-path: src/Kinseat.Dashboard/package-lock.json
 
       # npm ci, not npm install: it installs exactly what the lockfile pins and fails if the
       # lockfile and package.json disagree. install-service.ps1 runs npm install on the user's

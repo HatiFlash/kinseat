@@ -1,6 +1,6 @@
 # Part of MultiSeat's diagnostic set. See also: show-audio-defaults.ps1 (which device is the
 # default), audio-endpoint-volume.ps1 (how much gain it applies), and
-# MultiSeat.Service.exe --audio-peaks (what is being RENDERED).
+# Kinseat.Service.exe --audio-peaks (what is being RENDERED).
 #
 # This exists because --capture-loopback resolves RENDER endpoints only, so nothing we had
 # could answer "would an app opening this microphone actually hear anything?".

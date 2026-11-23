@@ -36,8 +36,8 @@ $DisplayName = "MultiSeat Multi-Seat Streaming Service"
 $Description = "Manages multi-seat headless game streaming sessions with isolated input, audio, and display."
 $InstallDir = "C:\Program Files\MultiSeat"
 $DataDir = "C:\ProgramData\MultiSeat"
-$ProjectDir = Join-Path $PSScriptRoot "..\src\MultiSeat.Service"
-$InputHookBuild = Join-Path $PSScriptRoot "..\src\MultiSeat.InputHook\build\Release\MultiSeatInputHook.dll"
+$ProjectDir = Join-Path $PSScriptRoot "..\src\Kinseat.Service"
+$InputHookBuild = Join-Path $PSScriptRoot "..\src\Kinseat.InputHook\build\Release\MultiSeatInputHook.dll"
 
 function Write-Step($msg) { Write-Host "[MultiSeat] $msg" -ForegroundColor Cyan }
 
@@ -49,7 +49,7 @@ function Write-Step($msg) { Write-Host "[MultiSeat] $msg" -ForegroundColor Cyan 
 if ($Uninstall) {
     # Put the Steam shortcuts, steam:// handler and Run entry back first. They point at the shim in
     # the install folder, and a shortcut left pointing at a removed shim stops Steam from starting.
-    $serviceExe = Join-Path $InstallDir "MultiSeat.Service.exe"
+    $serviceExe = Join-Path $InstallDir "Kinseat.Service.exe"
     if (Test-Path -LiteralPath $serviceExe) {
         Write-Step "Undoing the Steam shim's shortcut and registry edits..."
         try { & $serviceExe --steam-shim-undo } catch { Write-Warning "Could not undo the Steam shim edits: $($_.Exception.Message)" }
@@ -578,7 +578,7 @@ try {
         # MultiSeatOptions.EnableKeyboardMouseIsolation). A missing DLL changes nothing about how
         # MultiSeat runs, so these are informational notes, NOT warnings: emitting WARNING here made
         # a normal install look broken and got reported as a bug (issue #14).
-        $InputHookSrc = Join-Path $PSScriptRoot "..\src\MultiSeat.InputHook"
+        $InputHookSrc = Join-Path $PSScriptRoot "..\src\Kinseat.InputHook"
         $Bash = "C:\msys64\usr\bin\bash.exe"
         if (Test-Path $Bash) {
             Write-Step "Building MultiSeatInputHook.dll..."
@@ -627,7 +627,7 @@ try {
         # A failure here is fatal on purpose: the switch is an explicit request, and a quiet
         # skip would leave a host with SteamIsolationEnabled refusing every Steam launch.
         if ($BuildSteamIsolation) {
-            $steamSrc = Join-Path $PSScriptRoot "..\src\MultiSeat.SteamIsolation"
+            $steamSrc = Join-Path $PSScriptRoot "..\src\Kinseat.SteamIsolation"
             $steamOut = Join-Path $stage "SteamIsolation"
             Write-Step "Building the Steam isolation helpers (x64 and x86)..."
             & (Join-Path $steamSrc "build.ps1") -OutputDirectory $steamOut
@@ -639,7 +639,7 @@ try {
         }
 
         # -- Build the dashboard into the stage's wwwroot -------------------------
-        $DashboardDir = Join-Path $PSScriptRoot "..\src\MultiSeat.Dashboard"
+        $DashboardDir = Join-Path $PSScriptRoot "..\src\Kinseat.Dashboard"
         if (Test-Path (Join-Path $DashboardDir "package.json")) {
             Write-Step "Building dashboard..."
             Push-Location $DashboardDir
@@ -701,7 +701,7 @@ try {
     # while the service is still running: a host that lacks them must never be left with a
     # stopped service and a folder that cannot start.
     if ($payloadCheck.Mode -eq 'framework-dependent') {
-        $requirements = @(Get-RuntimeRequirements -RuntimeConfigPath (Join-Path $stage "MultiSeat.Service.runtimeconfig.json"))
+        $requirements = @(Get-RuntimeRequirements -RuntimeConfigPath (Join-Path $stage "Kinseat.Service.runtimeconfig.json"))
         $runtimeCheck = Test-HostHasRuntimes -Requirements $requirements -RuntimeLines @(Get-HostDotnetRuntimes)
         if (-not $runtimeCheck.Ok) {
             throw ("This build needs shared .NET runtimes this host does not have:`n  - " +
@@ -733,7 +733,7 @@ try {
 
         # Kill any surviving process running the service exe by path
         # (handles cases where the process outlives the SCM status change)
-        $serviceExe = Join-Path $InstallDir "MultiSeat.Service.exe"
+        $serviceExe = Join-Path $InstallDir "Kinseat.Service.exe"
         $lingering = Get-Process -ErrorAction SilentlyContinue |
             Where-Object { $_.Path -eq $serviceExe }
         foreach ($proc in $lingering) {
@@ -774,7 +774,7 @@ try {
 
     $ver = "unknown"
     try {
-        $ver = (& "$InstallDir\MultiSeat.Service.exe" --config 2>&1 |
+        $ver = (& "$InstallDir\Kinseat.Service.exe" --config 2>&1 |
                 Select-String "version\s*:" | Select-Object -First 1) -replace ".*:\s*", ""
     } catch { }
     if ($FromZip) {
@@ -801,7 +801,7 @@ finally {
 }
 
 # -- Register Windows service ----------------------------------------
-$exePath = Join-Path $InstallDir "MultiSeat.Service.exe"
+$exePath = Join-Path $InstallDir "Kinseat.Service.exe"
 
 $existing = Get-Service $ServiceName -ErrorAction SilentlyContinue
 if ($existing) {

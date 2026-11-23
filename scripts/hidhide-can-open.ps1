@@ -34,7 +34,7 @@
     .\hidhide-can-open.ps1 -LinksFile C:\ProgramData\MultiSeat\pads.txt -LogPath C:\ProgramData\MultiSeat\open-console.log
 
 .NOTES
-    GitHub issue #19. Companion to `MultiSeat.Service.exe --hidhide`, which reports the rules;
+    GitHub issue #19. Companion to `Kinseat.Service.exe --hidhide`, which reports the rules;
     this reports what they actually do.
 #>
 [CmdletBinding()]

@@ -64,7 +64,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$exe = 'C:\Program Files\MultiSeat\MultiSeat.Service.exe'
+$exe = 'C:\Program Files\MultiSeat\Kinseat.Service.exe'
 
 # ---------------------------------------------------------------- interop
 if (-not ('Diag18' -as [type])) {

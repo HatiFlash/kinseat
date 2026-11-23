@@ -1,0 +1,1217 @@
+using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using Xunit;
+
+namespace MultiSeat.Tests.Scripts;
+
+/// <summary>
+/// scripts\lib\install-lib.ps1 holds the logic behind install-service.ps1's stage-verify-replace
+/// deploy. These tests run it in a real PowerShell process (Windows PowerShell 5.1, which is the
+/// shell users get by typing "powershell", and PowerShell 7 when present) against REAL temporary
+/// folders. Nothing here touches a real install folder, a service or the registry.
+///
+/// The failure they guard against (measured 2026-10-08): `dotnet publish` into a live install
+/// folder that was self-contained left a framework-dependent runtimeconfig.json beside a leftover
+/// hostfxr.dll, and the service would not start ("No frameworks were found").
+/// </summary>
+public class InstallLibTests
+{
+    // -- Process plumbing ------------------------------------------------------------
+
+    private static readonly string RepoRoot = FindRepoRoot();
+    private static readonly string Lib = Path.Combine(RepoRoot, "scripts", "lib", "install-lib.ps1");
+
+    private static string FindRepoRoot()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir != null && !File.Exists(Path.Combine(dir.FullName, "scripts", "install-service.ps1")))
+            dir = dir.Parent;
+        return dir?.FullName ?? throw new InvalidOperationException("repo root with scripts\\install-service.ps1 not found");
+    }
+
+    /// <summary>Windows PowerShell 5.1 always; PowerShell 7 too when it is installed.</summary>
+    public static IEnumerable<object[]> Engines()
+    {
+        yield return new object[] { "powershell.exe" };
+        var pwsh = FindOnPath("pwsh.exe");
+        if (pwsh != null) yield return new object[] { pwsh };
+    }
+
+    private static string? FindOnPath(string exe)
+    {
+        foreach (var p in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator))
+        {
+            try
+            {
+                var f = Path.Combine(p.Trim('"'), exe);
+                if (File.Exists(f)) return f;
+            }
+            catch (ArgumentException) { }
+        }
+        return null;
+    }
+
+    private sealed record PsResult(int ExitCode, string Stdout, string Stderr, JsonElement? Json);
+
+    /// <summary>Dot-source the library, run <paramref name="body"/>, which must set $r.</summary>
+    private static PsResult Ps(string engine, string body)
+    {
+        var script = "$ErrorActionPreference = 'Stop'\n. " + Q(Lib) + "\n" + body +
+                     "\nWrite-Output ('@@JSON@@' + (ConvertTo-Json -InputObject $r -Compress -Depth 6))\n";
+        var psi = new ProcessStartInfo(engine)
+        {
+            Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " +
+                        Convert.ToBase64String(Encoding.Unicode.GetBytes(script)),
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        using var p = Process.Start(psi)!;
+        var err = p.StandardError.ReadToEndAsync();
+        var outp = p.StandardOutput.ReadToEndAsync();
+        Assert.True(p.WaitForExit(120_000), "PowerShell did not finish in 120 s");
+        var stdout = outp.Result;
+        var line = stdout.Split('\n').Select(l => l.TrimEnd('\r')).LastOrDefault(l => l.StartsWith("@@JSON@@"));
+        JsonElement? json = line == null ? null : JsonDocument.Parse(line.Substring("@@JSON@@".Length)).RootElement.Clone();
+        return new PsResult(p.ExitCode, stdout, err.Result, json);
+    }
+
+    private static JsonElement J(PsResult r)
+    {
+        Assert.True(r.Json.HasValue, $"no JSON result. exit={r.ExitCode}\nstdout:\n{r.Stdout}\nstderr:\n{r.Stderr}");
+        return r.Json!.Value;
+    }
+
+    /// <summary>A PowerShell single-quoted literal.</summary>
+    private static string Q(string s) => "'" + s.Replace("'", "''") + "'";
+
+    private static string[] Strings(JsonElement e) =>
+        e.ValueKind == JsonValueKind.Array ? e.EnumerateArray().Select(x => x.GetString()!).ToArray()
+        : e.ValueKind == JsonValueKind.String ? new[] { e.GetString()! }
+        : Array.Empty<string>();
+
+    // -- Fixtures: real folders ------------------------------------------------------
+
+    private const string FrameworkDependentConfig = @"{
+  ""runtimeOptions"": {
+    ""tfm"": ""net9.0"",
+    ""frameworks"": [
+      { ""name"": ""Microsoft.NETCore.App"", ""version"": ""9.0.0"" },
+      { ""name"": ""Microsoft.AspNetCore.App"", ""version"": ""9.0.0"" }
+    ],
+    ""configProperties"": { ""System.GC.Server"": true }
+  }
+}";
+
+    private const string SelfContainedConfig = @"{
+  ""runtimeOptions"": {
+    ""tfm"": ""net9.0"",
+    ""includedFrameworks"": [
+      { ""name"": ""Microsoft.NETCore.App"", ""version"": ""9.0.20"" },
+      { ""name"": ""Microsoft.AspNetCore.App"", ""version"": ""9.0.20"" }
+    ],
+    ""configProperties"": { ""System.GC.Server"": true }
+  }
+}";
+
+    private sealed class Temp : IDisposable
+    {
+        public string Root { get; } = Directory.CreateTempSubdirectory("ms-installlib-").FullName;
+        public string Sub(string name) => Path.Combine(Root, name);
+        public void Dispose()
+        {
+            try { Directory.Delete(Root, true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    private static void Put(string dir, string rel, byte[] bytes)
+    {
+        var f = Path.Combine(dir, rel);
+        Directory.CreateDirectory(Path.GetDirectoryName(f)!);
+        File.WriteAllBytes(f, bytes);
+    }
+
+    private static void Put(string dir, string rel, string text) => Put(dir, rel, Encoding.UTF8.GetBytes(text));
+
+    private static void CommonFiles(string dir, string tag)
+    {
+        Put(dir, "Kinseat.Service.exe", "exe-" + tag);
+        Put(dir, "MultiSeat.Service.dll", "dll-" + tag);
+        Put(dir, "appsettings.json", "{\"MultiSeat\":{\"A\":1,\"NewSetting\":2}}");
+        Put(dir, "wwwroot/index.html", "<html>" + tag + "</html>");
+        Put(dir, "wwwroot/assets/app.js", "js-" + tag);
+    }
+
+    private static string FrameworkDependent(string dir, string tag = "fd")
+    {
+        Directory.CreateDirectory(dir);
+        CommonFiles(dir, tag);
+        Put(dir, "Kinseat.Service.runtimeconfig.json", FrameworkDependentConfig);
+        return dir;
+    }
+
+    private static string SelfContained(string dir, string tag = "sc")
+    {
+        Directory.CreateDirectory(dir);
+        CommonFiles(dir, tag);
+        Put(dir, "Kinseat.Service.runtimeconfig.json", SelfContainedConfig);
+        foreach (var f in new[] { "hostfxr.dll", "hostpolicy.dll", "coreclr.dll" }) Put(dir, f, "bundled-" + f);
+        return dir;
+    }
+
+    /// <summary>name -> sha256 for every file under a folder.</summary>
+    private static Dictionary<string, string> Hashes(string dir) =>
+        Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories).ToDictionary(
+            f => Path.GetRelativePath(dir, f),
+            f => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(f))));
+
+    // -- Consistency check -----------------------------------------------------------
+
+    private static (bool Ok, string Mode, string[] Problems) Check(string engine, string dir)
+    {
+        var j = J(Ps(engine, "$r = Test-PayloadConsistency -Dir " + Q(dir)));
+        return (j.GetProperty("Ok").GetBoolean(), j.GetProperty("Mode").GetString()!, Strings(j.GetProperty("Problems")));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Accepts_a_clean_framework_dependent_payload(string engine)
+    {
+        using var t = new Temp();
+        var (ok, mode, problems) = Check(engine, FrameworkDependent(t.Sub("p")));
+        Assert.True(ok, string.Join(" | ", problems));
+        Assert.Equal("framework-dependent", mode);
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Accepts_a_clean_self_contained_payload(string engine)
+    {
+        using var t = new Temp();
+        var (ok, mode, problems) = Check(engine, SelfContained(t.Sub("p")));
+        Assert.True(ok, string.Join(" | ", problems));
+        Assert.Equal("self-contained", mode);
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Rejects_the_hybrid_that_failed_on_2026_10_08(string engine)
+    {
+        // Framework-dependent runtimeconfig.json beside a leftover bundled hostfxr.dll.
+        using var t = new Temp();
+        var dir = FrameworkDependent(t.Sub("p"));
+        Put(dir, "hostfxr.dll", "leftover");
+        var (ok, _, problems) = Check(engine, dir);
+        Assert.False(ok);
+        var all = string.Join(" ", problems);
+        Assert.Contains("hostfxr.dll", all);
+        Assert.Contains("No frameworks were found", all);
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Rejects_the_inverse_hybrid_self_contained_config_with_no_hostfxr(string engine)
+    {
+        using var t = new Temp();
+        var dir = SelfContained(t.Sub("p"));
+        File.Delete(Path.Combine(dir, "hostfxr.dll"));
+        var (ok, _, problems) = Check(engine, dir);
+        Assert.False(ok);
+        Assert.Contains("includedFrameworks", string.Join(" ", problems));
+        Assert.Contains("hostfxr.dll is absent", string.Join(" ", problems));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Rejects_a_missing_runtimeconfig(string engine)
+    {
+        using var t = new Temp();
+        var dir = FrameworkDependent(t.Sub("p"));
+        File.Delete(Path.Combine(dir, "Kinseat.Service.runtimeconfig.json"));
+        var (ok, _, problems) = Check(engine, dir);
+        Assert.False(ok);
+        Assert.Contains("runtimeconfig.json is missing", string.Join(" ", problems));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Rejects_a_framework_dependent_payload_with_any_bundled_runtime_file(string engine)
+    {
+        // No hostfxr.dll, but a stray coreclr.dll: still not a clean framework-dependent folder.
+        using var t = new Temp();
+        var dir = FrameworkDependent(t.Sub("p"));
+        Put(dir, "coreclr.dll", "stray");
+        var (ok, _, problems) = Check(engine, dir);
+        Assert.False(ok);
+        Assert.Contains("coreclr.dll", string.Join(" ", problems));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Rejects_a_self_contained_payload_with_an_incomplete_bundled_runtime(string engine)
+    {
+        using var t = new Temp();
+        var dir = SelfContained(t.Sub("p"));
+        File.Delete(Path.Combine(dir, "coreclr.dll"));
+        var (ok, _, problems) = Check(engine, dir);
+        Assert.False(ok);
+        Assert.Contains("incomplete", string.Join(" ", problems));
+        Assert.Contains("coreclr.dll", string.Join(" ", problems));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Rejects_a_runtimeconfig_that_cannot_be_parsed(string engine)
+    {
+        using var t = new Temp();
+        var dir = FrameworkDependent(t.Sub("p"));
+        Put(dir, "Kinseat.Service.runtimeconfig.json", "{ this is not json");
+        var (ok, _, problems) = Check(engine, dir);
+        Assert.False(ok);
+        Assert.Contains("cannot be read", string.Join(" ", problems));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Rejects_a_runtimeconfig_that_declares_no_runtime_at_all(string engine)
+    {
+        using var t = new Temp();
+        var dir = FrameworkDependent(t.Sub("p"));
+        Put(dir, "Kinseat.Service.runtimeconfig.json", "{ \"runtimeOptions\": { \"tfm\": \"net9.0\" } }");
+        var (ok, _, problems) = Check(engine, dir);
+        Assert.False(ok);
+        Assert.Contains("neither includedFrameworks nor frameworks", string.Join(" ", problems));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Names_every_required_file_a_payload_lacks(string engine)
+    {
+        using var t = new Temp();
+        var dir = FrameworkDependent(t.Sub("p"));
+        File.Delete(Path.Combine(dir, "wwwroot", "index.html"));
+        File.Delete(Path.Combine(dir, "appsettings.json"));
+        var j = J(Ps(engine, "$r = @(Get-MissingPayloadFiles -Dir " + Q(dir) + ")"));
+        Assert.Equal(new[] { "appsettings.json", "wwwroot\\index.html" }, Strings(j).OrderBy(x => x).ToArray());
+    }
+
+    // -- Shared runtime requirements -------------------------------------------------
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Reads_the_required_frameworks_from_a_runtimeconfig(string engine)
+    {
+        using var t = new Temp();
+        var dir = FrameworkDependent(t.Sub("p"));
+        var j = J(Ps(engine, "$r = @(Get-RuntimeRequirements -RuntimeConfigPath " +
+                             Q(Path.Combine(dir, "Kinseat.Service.runtimeconfig.json")) + ")"));
+        var rows = j.EnumerateArray().Select(x => x.GetProperty("Name").GetString() + " " +
+                                                  x.GetProperty("Version").GetString() + " " +
+                                                  x.GetProperty("RollForward").GetString()).ToArray();
+        Assert.Equal(new[] { "Microsoft.NETCore.App 9.0.0 Minor", "Microsoft.AspNetCore.App 9.0.0 Minor" }, rows);
+    }
+
+    // required, installed, rollForward, expected
+    public static IEnumerable<object[]> RollForwardCases()
+    {
+        yield return new object[] { "9.0.0", "9.0.20", "Minor", true };    // newer patch
+        yield return new object[] { "9.0.5", "9.0.3", "Minor", false };    // older patch
+        yield return new object[] { "9.0.0", "9.3.1", "Minor", true };     // newer minor, same major
+        yield return new object[] { "9.0.0", "10.0.12", "Minor", false };  // major does not roll by default
+        yield return new object[] { "9.0.0", "8.0.31", "Minor", false };   // older major
+        yield return new object[] { "9.0.0", "10.0.12", "Major", true };
+        yield return new object[] { "9.0.0", "10.0.12", "LatestMajor", true };
+        yield return new object[] { "9.0.0", "9.1.0", "LatestPatch", false };
+        yield return new object[] { "9.0.0", "9.0.4", "LatestPatch", true };
+        yield return new object[] { "9.0.0", "9.0.4", "Disable", false };
+        yield return new object[] { "9.0.4", "9.0.4", "Disable", true };
+        yield return new object[] { "9.0.0", "9.0.20-rtm.1", "Minor", true }; // suffix ignored
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Follows_the_dotnet_roll_forward_policy(string engine)
+    {
+        var cases = RollForwardCases().Select(c => new { r = (string)c[0], i = (string)c[1], p = (string)c[2], e = (bool)c[3] }).ToArray();
+        var json = JsonSerializer.Serialize(cases);
+        var j = J(Ps(engine,
+            "$rows = " + Q(json) + " | ConvertFrom-Json\n" +
+            "$r = @($rows | ForEach-Object { [bool](Test-RuntimeVersionSatisfies -Required $_.r -Installed $_.i -RollForward $_.p) })"));
+        var actual = j.EnumerateArray().Select(x => x.GetBoolean()).ToArray();
+        for (var n = 0; n < cases.Length; n++)
+            Assert.True(cases[n].e == actual[n],
+                $"required {cases[n].r}, installed {cases[n].i}, {cases[n].p}: expected {cases[n].e}, got {actual[n]}");
+    }
+
+    private static (bool Ok, string[] Missing) Preflight(string engine, string runtimeConfigDir, params string[] hostLines)
+    {
+        var lines = "@(" + string.Join(",", hostLines.Select(Q)) + ")";
+        var j = J(Ps(engine,
+            "$req = @(Get-RuntimeRequirements -RuntimeConfigPath " + Q(Path.Combine(runtimeConfigDir, "Kinseat.Service.runtimeconfig.json")) + ")\n" +
+            "$r = Test-HostHasRuntimes -Requirements $req -RuntimeLines " + lines));
+        return (j.GetProperty("Ok").GetBoolean(), Strings(j.GetProperty("Missing")));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Preflight_passes_when_the_host_has_both_shared_runtimes(string engine)
+    {
+        using var t = new Temp();
+        var dir = FrameworkDependent(t.Sub("p"));
+        var (ok, missing) = Preflight(engine, dir,
+            @"Microsoft.AspNetCore.App 9.0.20 [C:\Program Files\dotnet\shared\Microsoft.AspNetCore.App]",
+            @"Microsoft.NETCore.App 9.0.20 [C:\Program Files\dotnet\shared\Microsoft.NETCore.App]");
+        Assert.True(ok, string.Join(" | ", missing));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Preflight_names_the_runtime_a_host_lacks(string engine)
+    {
+        using var t = new Temp();
+        var dir = FrameworkDependent(t.Sub("p"));
+        var (ok, missing) = Preflight(engine, dir,
+            @"Microsoft.NETCore.App 9.0.20 [C:\Program Files\dotnet\shared\Microsoft.NETCore.App]");
+        Assert.False(ok);
+        var one = Assert.Single(missing);
+        Assert.Contains("Microsoft.AspNetCore.App", one);
+        Assert.Contains("none installed", one);
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Preflight_rejects_a_host_with_only_an_older_major(string engine)
+    {
+        using var t = new Temp();
+        var dir = FrameworkDependent(t.Sub("p"));
+        var (ok, missing) = Preflight(engine, dir,
+            @"Microsoft.AspNetCore.App 8.0.31 [x]", @"Microsoft.NETCore.App 8.0.31 [x]",
+            @"Microsoft.AspNetCore.App 10.0.12 [x]", @"Microsoft.NETCore.App 10.0.12 [x]");
+        Assert.False(ok);
+        Assert.Equal(2, missing.Length);
+        Assert.Contains("installed: 8.0.31, 10.0.12", missing[0]);
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Preflight_fails_a_host_with_no_dotnet_at_all(string engine)
+    {
+        using var t = new Temp();
+        var dir = FrameworkDependent(t.Sub("p"));
+        var (ok, missing) = Preflight(engine, dir);
+        Assert.False(ok);
+        Assert.Equal(2, missing.Length);
+    }
+
+    // -- Replacing the install folder ------------------------------------------------
+
+    private static string InstallCall(string stage, string install, string root, string stamp = "20261009-120000", string extra = "") =>
+        "$info = Install-Payload -Stage " + Q(stage) + " -InstallDir " + Q(install) +
+        " -ConfigBackupRoot " + Q(Path.Combine(root, "config-backups")) +
+        " -FolderBackupRoot " + Q(Path.Combine(root, "install-backups")) + " -Stamp " + Q(stamp) + extra + "\n";
+
+    // appsettings bytes a host really has: a BOM, CRLF, no trailing newline. A text round trip would change them.
+    private static readonly byte[] HostSettingsBytes = new byte[] { 0xEF, 0xBB, 0xBF }
+        .Concat(Encoding.UTF8.GetBytes("{\r\n  \"MultiSeat\": { \"A\": 7 }\r\n}")).ToArray();
+    private static readonly byte[] HostLocalBytes = new byte[] { 0xEF, 0xBB, 0xBF }
+        .Concat(Encoding.UTF8.GetBytes("{ \"MultiSeat\": { \"ApiKey\": \"k\" } }")).ToArray();
+
+    private static string PopulatedSelfContainedInstall(Temp t)
+    {
+        var install = SelfContained(t.Sub("install"), "old");
+        Put(install, "appsettings.json", HostSettingsBytes);
+        Put(install, "appsettings.local.json", HostLocalBytes);
+        return install;
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Replaces_a_self_contained_folder_with_a_framework_dependent_build_cleanly(string engine)
+    {
+        using var t = new Temp();
+        var install = PopulatedSelfContainedInstall(t);
+        var before = Hashes(install);
+        var stage = FrameworkDependent(t.Sub("stage"), "new");
+
+        var j = J(Ps(engine, InstallCall(stage, install, t.Root) +
+                             "$r = [pscustomobject]@{ Check = (Test-PayloadConsistency -Dir " + Q(install) + "); Info = $info }"));
+
+        var check = j.GetProperty("Check");
+        Assert.True(check.GetProperty("Ok").GetBoolean(), string.Join(" | ", Strings(check.GetProperty("Problems"))));
+        Assert.Equal("framework-dependent", check.GetProperty("Mode").GetString());
+        foreach (var gone in new[] { "hostfxr.dll", "hostpolicy.dll", "coreclr.dll" })
+            Assert.False(File.Exists(Path.Combine(install, gone)), gone + " survived the replace");
+
+        // New payload is in, the host's own files are untouched, byte for byte.
+        Assert.Equal("exe-new", File.ReadAllText(Path.Combine(install, "Kinseat.Service.exe")));
+        Assert.Equal(HostSettingsBytes, File.ReadAllBytes(Path.Combine(install, "appsettings.json")));
+        Assert.Equal(HostLocalBytes, File.ReadAllBytes(Path.Combine(install, "appsettings.local.json")));
+
+        // Backups exist and hold the OLD folder, including its bundled runtime.
+        var folderBackup = Path.Combine(t.Root, "install-backups", "20261009-120000");
+        Assert.Equal(before, Hashes(folderBackup));
+        Assert.Equal(HostLocalBytes, File.ReadAllBytes(Path.Combine(t.Root, "config-backups", "20261009-120000", "appsettings.local.json")));
+        Assert.Equal(HostSettingsBytes, File.ReadAllBytes(Path.Combine(t.Root, "config-backups", "20261009-120000", "appsettings.json")));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Repairs_the_exact_hybrid_folder_left_by_an_earlier_publish(string engine)
+    {
+        using var t = new Temp();
+        var install = FrameworkDependent(t.Sub("install"), "old");
+        Put(install, "hostfxr.dll", "leftover");                  // the 2026-10-08 hybrid
+        Put(install, "appsettings.local.json", HostLocalBytes);
+        Assert.False(Check(engine, install).Ok);
+
+        var stage = FrameworkDependent(t.Sub("stage"), "new");
+        var j = J(Ps(engine, InstallCall(stage, install, t.Root) + "$r = Test-PayloadConsistency -Dir " + Q(install)));
+        Assert.True(j.GetProperty("Ok").GetBoolean(), string.Join(" | ", Strings(j.GetProperty("Problems"))));
+        Assert.False(File.Exists(Path.Combine(install, "hostfxr.dll")));
+        Assert.Equal(HostLocalBytes, File.ReadAllBytes(Path.Combine(install, "appsettings.local.json")));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Replaces_a_framework_dependent_folder_with_a_self_contained_release(string engine)
+    {
+        using var t = new Temp();
+        var install = FrameworkDependent(t.Sub("install"), "old");
+        var stage = SelfContained(t.Sub("stage"), "new");
+        // The release asset also carries installer files, which must not land in the install folder.
+        Put(stage, "scripts/install-service.ps1", "x");
+        Put(stage, "prerequisites/p.ps1", "x");
+        Put(stage, "README.md", "x");
+
+        var j = J(Ps(engine, InstallCall(stage, install, t.Root) + "$r = Test-PayloadConsistency -Dir " + Q(install)));
+        Assert.True(j.GetProperty("Ok").GetBoolean(), string.Join(" | ", Strings(j.GetProperty("Problems"))));
+        Assert.Equal("self-contained", j.GetProperty("Mode").GetString());
+        Assert.False(Directory.Exists(Path.Combine(install, "scripts")));
+        Assert.False(Directory.Exists(Path.Combine(install, "prerequisites")));
+        Assert.False(File.Exists(Path.Combine(install, "README.md")));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Installs_into_a_folder_that_does_not_exist_yet(string engine)
+    {
+        using var t = new Temp();
+        var stage = FrameworkDependent(t.Sub("stage"), "new");
+        var install = t.Sub("install");
+        var j = J(Ps(engine, InstallCall(stage, install, t.Root) + "$r = Test-PayloadConsistency -Dir " + Q(install)));
+        Assert.True(j.GetProperty("Ok").GetBoolean());
+        Assert.False(Directory.Exists(Path.Combine(t.Root, "install-backups")), "nothing existed to back up");
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void A_failure_midway_puts_the_previous_folder_back(string engine)
+    {
+        using var t = new Temp();
+        var install = PopulatedSelfContainedInstall(t);
+        var before = Hashes(install);
+        var stage = FrameworkDependent(t.Sub("stage"), "new");
+        // Copied last (alphabetical), so the wipe and most of the copy have already happened.
+        Put(stage, "zzz-late.dll", "locked");
+
+        PsResult res;
+        using (new FileStream(Path.Combine(stage, "zzz-late.dll"), FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            res = Ps(engine, InstallCall(stage, install, t.Root, extra: "") + "$r = 'unreachable'");
+        }
+
+        Assert.NotEqual(0, res.ExitCode);
+        Assert.Contains("Install failed", res.Stdout + res.Stderr);
+        Assert.Contains("was restored from", res.Stdout + res.Stderr);
+        // Byte-identical to the folder before the attempt: old runtime, old config, host files.
+        Assert.Equal(before, Hashes(install));
+        Assert.False(File.Exists(Path.Combine(install, "zzz-late.dll")));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void A_failed_install_reports_that_it_restored_the_folder(string engine)
+    {
+        // The caller starts the service again only when Data['Restored'] is not $false.
+        using var t = new Temp();
+        var install = PopulatedSelfContainedInstall(t);
+        var stage = FrameworkDependent(t.Sub("stage"), "new");
+        Put(stage, "zzz-late.dll", "locked");
+        PsResult res;
+        using (new FileStream(Path.Combine(stage, "zzz-late.dll"), FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            res = Ps(engine,
+                "try { " + InstallCall(stage, install, t.Root) + " $r = 'no error' } " +
+                "catch { $r = [pscustomobject]@{ Restored = $_.Exception.Data['Restored']; Message = $_.Exception.Message } }");
+        }
+        var j = J(res);
+        Assert.True(j.GetProperty("Restored").GetBoolean());
+        Assert.Contains("Install failed", j.GetProperty("Message").GetString());
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Names_settings_a_new_build_adds_even_though_the_shipped_file_has_comments(string engine)
+    {
+        // The real shipped appsettings.json has // comment lines; Windows PowerShell 5.1 cannot
+        // parse those with ConvertFrom-Json, which used to hide this report entirely.
+        using var t = new Temp();
+        var install = FrameworkDependent(t.Sub("install"), "old");
+        Put(install, "appsettings.json", "{ \"MultiSeat\": { \"MaxSeats\": 4 } }");
+        var stage = FrameworkDependent(t.Sub("stage"), "new");
+        File.Copy(Path.Combine(RepoRoot, "src", "MultiSeat.Service", "appsettings.json"), Path.Combine(stage, "appsettings.json"), true);
+
+        var res = Ps(engine, InstallCall(stage, install, t.Root) + "$r = 1");
+        var text = res.Stdout + res.Stderr;
+        Assert.Contains("setting(s) your appsettings.json does not have", text);
+        Assert.DoesNotContain("could not compare settings", text);
+        Assert.Equal("{ \"MultiSeat\": { \"MaxSeats\": 4 } }", File.ReadAllText(Path.Combine(install, "appsettings.json")));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Backups_are_not_readable_by_ordinary_users(string engine)
+    {
+        // appsettings.local.json can hold the API key; ProgramData lets every user read by default.
+        using var t = new Temp();
+        var install = PopulatedSelfContainedInstall(t);
+        var stage = FrameworkDependent(t.Sub("stage"), "new");
+        Ps(engine, InstallCall(stage, install, t.Root) + "$r = 1");
+        foreach (var d in new[] { "config-backups", "install-backups" })
+        {
+            // Read the ACL in-process: Get-Acl needs a module that is not always loadable in a child shell.
+            var sec = new DirectoryInfo(Path.Combine(t.Root, d)).GetAccessControl();
+            Assert.True(sec.AreAccessRulesProtected, d + " still inherits its ACL");
+            var ids = sec.GetAccessRules(true, true, typeof(System.Security.Principal.NTAccount))
+                         .Cast<System.Security.AccessControl.FileSystemAccessRule>()
+                         .Select(r => r.IdentityReference.Value).ToArray();
+            Assert.DoesNotContain("BUILTIN\\Users", ids);
+            Assert.DoesNotContain("Everyone", ids);
+            Assert.Contains("NT AUTHORITY\\SYSTEM", ids);
+        }
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void A_file_the_service_still_holds_aborts_the_install_and_restores_the_folder(string engine)
+    {
+        // The realistic failure: the wipe cannot delete a locked DLL after others are already gone.
+        using var t = new Temp();
+        var install = PopulatedSelfContainedInstall(t);
+        var before = Hashes(install);
+        var stage = FrameworkDependent(t.Sub("stage"), "new");
+
+        PsResult res;
+        // Readers allowed (the backup copy must work), deleters and writers refused.
+        using (new FileStream(Path.Combine(install, "MultiSeat.Service.dll"), FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            res = Ps(engine,
+                "try { " + InstallCall(stage, install, t.Root) + " $r = 'no error' } " +
+                "catch { $r = [pscustomobject]@{ Restored = $_.Exception.Data['Restored']; Message = $_.Exception.Message } }");
+        }
+        var j = J(res);
+        Assert.True(j.GetProperty("Restored").GetBoolean(), j.GetProperty("Message").GetString());
+        Assert.Equal(before, Hashes(install));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void A_post_copy_inconsistency_is_caught_and_rolled_back(string engine)
+    {
+        // Skipping the runtimeconfig leaves an installed folder that contradicts itself even
+        // though the stage was fine: the check on the INSTALLED folder must catch it.
+        using var t = new Temp();
+        var install = PopulatedSelfContainedInstall(t);
+        var before = Hashes(install);
+        var stage = FrameworkDependent(t.Sub("stage"), "new");
+
+        var res = Ps(engine, InstallCall(stage, install, t.Root, extra: " -SkipNames @('Kinseat.Service.runtimeconfig.json')") + "$r = 'unreachable'");
+        Assert.NotEqual(0, res.ExitCode);
+        Assert.Contains("inconsistent after copying", res.Stdout + res.Stderr);
+        Assert.Equal(before, Hashes(install));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void An_inconsistent_stage_is_refused_before_anything_is_touched(string engine)
+    {
+        using var t = new Temp();
+        var install = PopulatedSelfContainedInstall(t);
+        var before = Hashes(install);
+        var stage = FrameworkDependent(t.Sub("stage"), "new");
+        Put(stage, "hostfxr.dll", "leftover");                    // hybrid stage
+
+        var res = Ps(engine, InstallCall(stage, install, t.Root) + "$r = 'unreachable'");
+        Assert.NotEqual(0, res.ExitCode);
+        Assert.Contains("staged payload is inconsistent", res.Stdout + res.Stderr);
+        Assert.Equal(before, Hashes(install));
+        Assert.False(Directory.Exists(Path.Combine(t.Root, "install-backups")), "no backup should be made for a refused stage");
+        Assert.False(Directory.Exists(Path.Combine(t.Root, "config-backups")));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void A_stage_missing_a_required_file_is_refused_before_anything_is_touched(string engine)
+    {
+        using var t = new Temp();
+        var install = PopulatedSelfContainedInstall(t);
+        var before = Hashes(install);
+        var stage = FrameworkDependent(t.Sub("stage"), "new");
+        File.Delete(Path.Combine(stage, "wwwroot", "index.html"));
+
+        var res = Ps(engine, InstallCall(stage, install, t.Root) + "$r = 'unreachable'");
+        Assert.NotEqual(0, res.ExitCode);
+        Assert.Contains("wwwroot\\index.html", res.Stdout + res.Stderr);
+        Assert.Equal(before, Hashes(install));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Keeps_only_the_newest_full_folder_backups(string engine)
+    {
+        using var t = new Temp();
+        var install = FrameworkDependent(t.Sub("install"), "old");
+        var backups = Path.Combine(t.Root, "install-backups");
+        foreach (var s in new[] { "20260101-000000", "20260102-000000", "20260103-000000", "20260104-000000" })
+            Put(Path.Combine(backups, s), "marker.txt", s);
+        var stage = FrameworkDependent(t.Sub("stage"), "new");
+
+        Ps(engine, InstallCall(stage, install, t.Root, "20261009-120000") + "$r = 1");
+
+        var left = Directory.GetDirectories(backups).Select(Path.GetFileName).OrderBy(x => x).ToArray();
+        Assert.Equal(new[] { "20260103-000000", "20260104-000000", "20261009-120000" }, left);
+    }
+
+    // -- Steam isolation helpers (PR #110) --------------------------------------------
+    //
+    // The installer wipes the install folder on every deploy. SteamIsolation\ holds native
+    // helpers the service needs when MultiSeat:SteamIsolationEnabled is on, so an upgrade has to
+    // either bring a new set with it or leave the old one alone. Deleting it silently is the bug.
+
+    private static readonly string[] SteamFiles =
+    {
+        "Kinseat.SteamLauncher.exe", "Kinseat.SteamLauncher32.exe",
+        "Kinseat.SteamHook.dll", "Kinseat.SteamHook32.dll",
+        "Kinseat.SteamShim.exe",
+    };
+
+    private static void PutSteamIsolation(string root, string tag)
+    {
+        foreach (var f in SteamFiles) Put(root, "SteamIsolation/" + f, tag + ":" + f);
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Names_every_steam_isolation_file_a_folder_lacks(string engine)
+    {
+        using var t = new Temp();
+        var dir = t.Sub("steam");
+        Put(dir, "Kinseat.SteamLauncher.exe", "x");
+        var j = J(Ps(engine, "$r = @(Get-MissingSteamIsolationFiles -Dir " + Q(dir) + ")"));
+        Assert.Equal(SteamFiles.Skip(1).OrderBy(x => x), Strings(j).OrderBy(x => x));
+
+        // A folder holding all four, and one that does not exist, are told apart.
+        var full = t.Sub("full");
+        foreach (var f in SteamFiles) Put(full, f, "x");
+        Assert.Empty(Strings(J(Ps(engine, "$r = @(Get-MissingSteamIsolationFiles -Dir " + Q(full) + ")"))));
+        Assert.Equal(SteamFiles.Length,
+            Strings(J(Ps(engine, "$r = @(Get-MissingSteamIsolationFiles -Dir " + Q(Path.Combine(t.Root, "nope")) + ")"))).Length);
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Keeps_an_existing_steam_isolation_folder_when_the_new_payload_ships_none(string engine)
+    {
+        using var t = new Temp();
+        var install = PopulatedSelfContainedInstall(t);
+        PutSteamIsolation(install, "old");
+        Put(install, "SteamIsolation/extra-note.txt", "placed by hand");
+        var stage = SelfContained(t.Sub("stage"), "new");
+
+        var res = Ps(engine, InstallCall(stage, install, t.Root) + "$r = 1");
+        Assert.Equal(0, res.ExitCode);
+        foreach (var f in SteamFiles)
+            Assert.Equal("old:" + f, File.ReadAllText(Path.Combine(install, "SteamIsolation", f)));
+        Assert.Equal("placed by hand", File.ReadAllText(Path.Combine(install, "SteamIsolation", "extra-note.txt")));
+        Assert.Contains("Kept the existing SteamIsolation folder", res.Stdout);
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void A_payload_that_ships_steam_isolation_replaces_the_old_copy(string engine)
+    {
+        using var t = new Temp();
+        var install = PopulatedSelfContainedInstall(t);
+        PutSteamIsolation(install, "old");
+        Put(install, "SteamIsolation/old-only.dll", "gone after the upgrade");
+        var stage = SelfContained(t.Sub("stage"), "new");
+        PutSteamIsolation(stage, "new");
+
+        var res = Ps(engine, InstallCall(stage, install, t.Root) + "$r = 1");
+        Assert.Equal(0, res.ExitCode);
+        foreach (var f in SteamFiles)
+            Assert.Equal("new:" + f, File.ReadAllText(Path.Combine(install, "SteamIsolation", f)));
+        Assert.False(File.Exists(Path.Combine(install, "SteamIsolation", "old-only.dll")));
+        Assert.DoesNotContain("Kept the existing SteamIsolation folder", res.Stdout);
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void A_payload_without_steam_isolation_does_not_invent_a_folder(string engine)
+    {
+        using var t = new Temp();
+        var install = PopulatedSelfContainedInstall(t);
+        var stage = SelfContained(t.Sub("stage"), "new");
+
+        Assert.Equal(0, Ps(engine, InstallCall(stage, install, t.Root) + "$r = 1").ExitCode);
+        Assert.False(Directory.Exists(Path.Combine(install, "SteamIsolation")));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void A_partial_steam_isolation_set_in_the_stage_is_refused_before_anything_is_touched(string engine)
+    {
+        using var t = new Temp();
+        var install = PopulatedSelfContainedInstall(t);
+        PutSteamIsolation(install, "old");
+        var before = Hashes(install);
+        var stage = SelfContained(t.Sub("stage"), "new");
+        PutSteamIsolation(stage, "new");
+        File.Delete(Path.Combine(stage, "SteamIsolation", "Kinseat.SteamHook32.dll"));
+
+        var res = Ps(engine, InstallCall(stage, install, t.Root) + "$r = 'unreachable'");
+        Assert.NotEqual(0, res.ExitCode);
+        Assert.Contains("staged SteamIsolation folder is missing", res.Stdout + res.Stderr);
+        Assert.Contains("Kinseat.SteamHook32.dll", res.Stdout + res.Stderr);
+        Assert.Equal(before, Hashes(install));
+        Assert.False(Directory.Exists(Path.Combine(t.Root, "install-backups")), "no backup should be made for a refused stage");
+    }
+
+    // -- Wiring: where the helpers come from -------------------------------------------
+
+    [Fact]
+    public void The_source_build_builds_the_helpers_only_when_asked_and_never_reuses_old_output()
+    {
+        var text = string.Join("\n", InstallerLines());
+        Assert.Contains("[switch]$BuildSteamIsolation", text);
+        var iGate = text.IndexOf("if ($BuildSteamIsolation)", StringComparison.Ordinal);
+        Assert.True(iGate > 0, "the build must sit behind the switch");
+        var iBuild = text.IndexOf("build.ps1", iGate, StringComparison.Ordinal);
+        var iStaged = text.IndexOf("Get-MissingSteamIsolationFiles", iGate, StringComparison.Ordinal);
+        Assert.True(iBuild > iGate && iStaged > iBuild, "build first, then check all four files arrived");
+        // Built straight into the stage: no artifacts\ folder that an earlier run could have left.
+        Assert.DoesNotContain("artifacts", text);
+    }
+
+    [Fact]
+    public void The_release_workflow_ships_all_four_helpers_in_the_asset()
+    {
+        var yml = File.ReadAllText(Path.Combine(RepoRoot, ".github", "workflows", "release.yml"));
+        Assert.Contains("needs: steam-isolation", yml);
+        // Uploaded by one job and downloaded by the next, under one name.
+        Assert.Equal(2, System.Text.RegularExpressions.Regex.Matches(yml, "name: steam-isolation-binaries").Count);
+        Assert.Contains("path: publish/MultiSeat/SteamIsolation", yml);
+        // The payload check is what stops a release that would delete the helpers on upgrade.
+        foreach (var f in SteamFiles) Assert.Contains(f, yml);
+        Assert.Contains("an upgrade would remove the Steam isolation helpers", yml);
+    }
+
+    // -- Pre-flight: an isolated Steam holding the helper files (measured 2026-10-20) --------
+    //
+    // Windows will not overwrite a loaded DLL. The upgrade used to stop the service first and
+    // discover that only when the replace failed. These tests hold REAL files open (and run a
+    // REAL process from SteamIsolation\) and check the answer, not just that a function exists.
+
+    private static string HookDll(string root) => Path.Combine(root, "SteamIsolation", "Kinseat.SteamHook.dll");
+
+    private static string CheckCall(string install) =>
+        "$r = Test-SteamIsolationBlocksUpgrade -InstallDir " + Q(install) + "\n";
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Preflight_is_clear_when_there_is_no_steam_isolation_folder(string engine)
+    {
+        using var t = new Temp();   // a first install: nothing there at all
+        var j = J(Ps(engine, CheckCall(t.Sub("ProgramFiles-MultiSeat"))));
+        Assert.False(j.GetProperty("Blocked").GetBoolean());
+        Assert.Empty(Strings(j.GetProperty("LockedFiles")));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Preflight_is_clear_when_nothing_holds_the_helper_files(string engine)
+    {
+        using var t = new Temp();
+        PutSteamIsolation(t.Root, "old");
+        var j = J(Ps(engine, CheckCall(t.Root)));
+        Assert.False(j.GetProperty("Blocked").GetBoolean());
+        Assert.Empty(Strings(j.GetProperty("LockedFiles")));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Preflight_reports_a_held_file_by_name_and_clears_when_it_is_released(string engine)
+    {
+        using var t = new Temp();
+        PutSteamIsolation(t.Root, "old");
+        JsonElement held;
+        using (new FileStream(HookDll(t.Root), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            held = J(Ps(engine, CheckCall(t.Root)));
+        }
+        Assert.True(held.GetProperty("Blocked").GetBoolean());
+        var locked = Strings(held.GetProperty("LockedFiles"));
+        Assert.Single(locked);
+        Assert.Equal(HookDll(t.Root), locked[0], ignoreCase: true);
+
+        var released = J(Ps(engine, CheckCall(t.Root)));
+        Assert.False(released.GetProperty("Blocked").GetBoolean());
+        Assert.Empty(Strings(released.GetProperty("LockedFiles")));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Preflight_names_a_running_process_whose_image_lives_in_steam_isolation(string engine)
+    {
+        // A real process started from SteamIsolation\, standing in for Kinseat.SteamLauncher.exe.
+        using var t = new Temp();
+        PutSteamIsolation(t.Root, "old");
+        var launcher = Path.Combine(t.Root, "SteamIsolation", "Kinseat.SteamLauncher.exe");
+        File.Copy(Path.Combine(Environment.SystemDirectory, "ping.exe"), launcher, overwrite: true);
+        using var proc = Process.Start(new ProcessStartInfo(launcher, "-n 120 127.0.0.1")
+        {
+            UseShellExecute = false, CreateNoWindow = true,
+            RedirectStandardOutput = true, RedirectStandardError = true,
+        })!;
+        try
+        {
+            Thread.Sleep(500);
+            var j = J(Ps(engine, CheckCall(t.Root)));
+            Assert.True(j.GetProperty("Blocked").GetBoolean());
+            var procs = j.GetProperty("Processes").EnumerateArray().ToArray();
+            var mine = procs.Single(x => x.GetProperty("Id").GetInt32() == proc.Id);
+            Assert.Equal("holder", mine.GetProperty("Role").GetString());
+            Assert.Equal(proc.SessionId, mine.GetProperty("SessionId").GetInt32());
+            Assert.Equal(launcher, mine.GetProperty("Path").GetString(), ignoreCase: true);
+            // Its image is a locked file too, so the two measurements agree.
+            Assert.Contains(Strings(j.GetProperty("LockedFiles")), f => string.Equals(f, launcher, StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            try { proc.Kill(); proc.WaitForExit(10_000); } catch (InvalidOperationException) { }
+        }
+        var after = J(Ps(engine, CheckCall(t.Root)));
+        Assert.False(after.GetProperty("Blocked").GetBoolean());
+        Assert.Empty(after.GetProperty("Processes").EnumerateArray());
+    }
+
+    // -- The close-Steam command must name steam.exe, never the hook DLL (#126) ---------------
+
+    private static string MessageFor(string engine, string processesLiteral, string folder)
+    {
+        var j = J(Ps(engine,
+            "$check = [pscustomobject]@{ Blocked = $true; Folder = " + Q(folder) + "; LockedFiles = @(); Processes = @(" + processesLiteral + ") }\n" +
+            "$r = [pscustomobject]@{ Message = (Format-SteamInUseMessage -Check $check) }\n"));
+        return j.GetProperty("Message").GetString()!;
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void The_close_steam_command_names_steam_exe_when_the_holder_path_is_the_hook_dll(string engine)
+    {
+        const string steamExe = @"C:\Program Files (x86)\Steam\steam.exe";
+        const string dir = @"C:\Program Files\MultiSeat\SteamIsolation";
+        var msg = MessageFor(engine,
+            "[pscustomobject]@{ Name = 'steam'; Id = 10; SessionId = 2; Owner = 'PC\\gamer'; Role = 'holder'; " +
+            "Path = " + Q(dir + @"\Kinseat.SteamHook.dll") + "; ImagePath = " + Q(steamExe) + " }", dir);
+        Assert.Contains("--steam \"" + steamExe + "\" --forward -- -shutdown", msg);
+        Assert.DoesNotContain("--steam \"" + dir + @"\Kinseat.SteamHook.dll", msg);
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void The_close_steam_command_keeps_the_placeholder_when_no_steam_image_is_known(string engine)
+    {
+        const string dir = @"C:\Program Files\MultiSeat\SteamIsolation";
+        var msg = MessageFor(engine,
+            "[pscustomobject]@{ Name = 'steam'; Id = 10; SessionId = 2; Owner = $null; Role = 'holder'; " +
+            "Path = " + Q(dir + @"\Kinseat.SteamHook.dll") + "; ImagePath = $null }", dir);
+        Assert.Contains("--steam \"<path to steam.exe>\"", msg);
+        Assert.DoesNotContain("SteamHook.dll\" --forward", msg);
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void The_close_steam_command_skips_a_steam_entry_whose_image_is_not_steam_exe(string engine)
+    {
+        // A first entry with only a DLL image must not win over a later entry with the real exe.
+        const string steamExe = @"D:\Games\Steam\steam.exe";
+        const string dir = @"C:\Program Files\MultiSeat\SteamIsolation";
+        var msg = MessageFor(engine,
+            "[pscustomobject]@{ Name = 'steam'; Id = 10; SessionId = 2; Owner = $null; Role = 'holder'; Path = 'x.dll'; ImagePath = " + Q(dir + @"\Kinseat.SteamHook.dll") + " }, " +
+            "[pscustomobject]@{ Name = 'steam'; Id = 11; SessionId = 2; Owner = $null; Role = 'steam'; Path = " + Q(steamExe) + "; ImagePath = " + Q(steamExe) + " }", dir);
+        Assert.Contains("--steam \"" + steamExe + "\"", msg);
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Preflight_fills_ImagePath_with_the_real_exe_and_the_message_uses_it(string engine)
+    {
+        // A real process whose image is SteamIsolation\steam.exe. Path (the matching file) and
+        // ImagePath must both be that exe here, and the printed command must carry it.
+        using var t = new Temp();
+        PutSteamIsolation(t.Root, "old");
+        var fakeSteam = Path.Combine(t.Root, "SteamIsolation", "steam.exe");
+        File.Copy(Path.Combine(Environment.SystemDirectory, "ping.exe"), fakeSteam, overwrite: true);
+        using var proc = Process.Start(new ProcessStartInfo(fakeSteam, "-n 120 127.0.0.1")
+        {
+            UseShellExecute = false, CreateNoWindow = true,
+            RedirectStandardOutput = true, RedirectStandardError = true,
+        })!;
+        try
+        {
+            Thread.Sleep(500);
+            var j = J(Ps(engine, CheckCall(t.Root) +
+                "$r | Add-Member -NotePropertyName Message -NotePropertyValue (Format-SteamInUseMessage -Check $r)\n"));
+            var mine = j.GetProperty("Processes").EnumerateArray().Single(x => x.GetProperty("Id").GetInt32() == proc.Id);
+            Assert.Equal(fakeSteam, mine.GetProperty("ImagePath").GetString(), ignoreCase: true);
+            Assert.Contains("--steam \"" + fakeSteam + "\"", j.GetProperty("Message").GetString(), StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            try { proc.Kill(); proc.WaitForExit(10_000); } catch (InvalidOperationException) { }
+        }
+    }
+
+    private static string GateCall(string install, string marker) =>
+        "$r = Invoke-StopWhenNotBlocked -InstallDir " + Q(install) +
+        " -Stop { Set-Content -LiteralPath " + Q(marker) + " -Value stopped }\n";
+
+    [Theory, MemberData(nameof(Engines))]
+    public void A_blocked_preflight_never_runs_the_stop_step_and_says_how_to_close_steam(string engine)
+    {
+        using var t = new Temp();
+        PutSteamIsolation(t.Root, "old");
+        var marker = t.Sub("stop-was-called.txt");
+        JsonElement j;
+        using (new FileStream(HookDll(t.Root), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            j = J(Ps(engine, GateCall(t.Root, marker)));
+        }
+        Assert.True(j.GetProperty("Blocked").GetBoolean());
+        Assert.False(j.GetProperty("Stopped").GetBoolean());
+        Assert.False(File.Exists(marker), "the stop step ran although the pre-flight reported a block");
+        var msg = j.GetProperty("Message").GetString()!;
+        Assert.Contains("Kinseat.SteamHook.dll", msg);
+        Assert.Contains("has NOT been stopped", msg);
+        Assert.Contains("--forward -- -shutdown", msg);
+        Assert.Contains("Kinseat.SteamLauncher.exe", msg);
+        Assert.Contains("does not reach an isolated Steam", msg);
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void A_clear_preflight_runs_the_stop_step_once(string engine)
+    {
+        using var t = new Temp();
+        PutSteamIsolation(t.Root, "old");   // present but not held
+        var marker = t.Sub("stop-was-called.txt");
+        var j = J(Ps(engine, GateCall(t.Root, marker)));
+        Assert.False(j.GetProperty("Blocked").GetBoolean());
+        Assert.True(j.GetProperty("Stopped").GetBoolean());
+        Assert.True(File.Exists(marker));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void A_first_install_runs_the_stop_step_unchanged(string engine)
+    {
+        using var t = new Temp();
+        var marker = t.Sub("stop-was-called.txt");
+        var j = J(Ps(engine, GateCall(t.Sub("none-yet"), marker)));
+        Assert.False(j.GetProperty("Blocked").GetBoolean());
+        Assert.True(File.Exists(marker));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Instrument_check_a_check_stubbed_to_always_clear_lets_the_stop_run_while_a_file_is_held(string engine)
+    {
+        // Proves the blocked-case assertions above can fail: with the check replaced by a stub that
+        // always says clear, the same held file no longer blocks and the marker IS written.
+        using var t = new Temp();
+        PutSteamIsolation(t.Root, "old");
+        var marker = t.Sub("stop-was-called.txt");
+        JsonElement j;
+        using (new FileStream(HookDll(t.Root), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            j = J(Ps(engine,
+                "function Test-SteamIsolationBlocksUpgrade { param($InstallDir) " +
+                "[pscustomobject]@{ Blocked = $false; Folder = ''; LockedFiles = @(); Processes = @() } }\n" +
+                GateCall(t.Root, marker)));
+        }
+        Assert.False(j.GetProperty("Blocked").GetBoolean());
+        Assert.True(File.Exists(marker));
+    }
+
+    // -- AudioMode decision: does this install need VoiceMeeter? (#122) ----------------
+
+    private static (string Mode, bool Needed) AudioModeOf(string engine, params string[] paths)
+    {
+        var j = J(Ps(engine,
+            "$mode = Get-EffectiveAudioMode -ConfigPaths @(" + string.Join(",", paths.Select(Q)) + ")\n" +
+            "$r = [pscustomobject]@{ Mode = $mode; Needed = [bool](Test-VoiceMeeterNeeded -AudioMode $mode) }\n"));
+        return (j.GetProperty("Mode").GetString()!, j.GetProperty("Needed").GetBoolean());
+    }
+
+    private static string Cfg(string audioMode) => "{\n  \"MultiSeat\": {\n    \"AudioMode\": \"" + audioMode + "\"\n  }\n}\n";
+
+    [Theory, MemberData(nameof(Engines))]
+    public void No_config_files_means_PerSession_and_no_VoiceMeeter(string engine)
+    {
+        using var t = new Temp();
+        Assert.Equal(("PerSession", false), AudioModeOf(engine, t.Sub("appsettings.local.json"), t.Sub("appsettings.json")));
+        var empty = J(Ps(engine, "$mode = Get-EffectiveAudioMode\n$r = [pscustomobject]@{ Mode = $mode }\n"));
+        Assert.Equal("PerSession", empty.GetProperty("Mode").GetString());
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Base_file_PerSession_is_PerSession(string engine)
+    {
+        using var t = new Temp();
+        Put(t.Root, "appsettings.json", Cfg("PerSession"));
+        Assert.Equal(("PerSession", false), AudioModeOf(engine, t.Sub("appsettings.local.json"), t.Sub("appsettings.json")));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Base_file_SharedHost_is_SharedHost_and_needs_VoiceMeeter(string engine)
+    {
+        using var t = new Temp();
+        Put(t.Root, "appsettings.json", Cfg("SharedHost"));
+        Assert.Equal(("SharedHost", true), AudioModeOf(engine, t.Sub("appsettings.local.json"), t.Sub("appsettings.json")));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Local_file_overrides_the_base_file_both_ways(string engine)
+    {
+        using var t = new Temp();
+        Put(t.Root, "appsettings.json", Cfg("SharedHost"));
+        Put(t.Root, "appsettings.local.json", Cfg("PerSession"));
+        Assert.Equal(("PerSession", false), AudioModeOf(engine, t.Sub("appsettings.local.json"), t.Sub("appsettings.json")));
+        Put(t.Root, "appsettings.local.json", Cfg("SharedHost"));
+        Assert.Equal(("SharedHost", true), AudioModeOf(engine, t.Sub("appsettings.local.json"), t.Sub("appsettings.json")));
+        Put(t.Root, "appsettings.json", Cfg("PerSession"));
+        Assert.Equal(("SharedHost", true), AudioModeOf(engine, t.Sub("appsettings.local.json"), t.Sub("appsettings.json")));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void A_local_file_without_the_key_leaves_the_base_file_in_charge(string engine)
+    {
+        using var t = new Temp();
+        Put(t.Root, "appsettings.json", Cfg("SharedHost"));
+        Put(t.Root, "appsettings.local.json", "{ \"MultiSeat\": { \"ApiKey\": \"x\" } }");
+        Assert.Equal(("SharedHost", true), AudioModeOf(engine, t.Sub("appsettings.local.json"), t.Sub("appsettings.json")));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Comments_and_a_byte_order_mark_do_not_break_the_read(string engine)
+    {
+        using var t = new Temp();
+        // Full-line and trailing // comments (Windows PowerShell 5.1's ConvertFrom-Json rejects both),
+        // a commented-out AudioMode line that must NOT win, and a UTF-8 BOM.
+        var text = "// header comment\n{\n  \"MultiSeat\": {\n    // \"AudioMode\": \"PerSession\",\n" +
+                   "    \"AudioMode\": \"SharedHost\", // trailing note\n    \"Url\": \"http://localhost\" // another\n  }\n}\n";
+        Put(t.Root, "appsettings.json", new byte[] { 0xEF, 0xBB, 0xBF }.Concat(Encoding.UTF8.GetBytes(text)).ToArray());
+        Assert.Equal(("SharedHost", true), AudioModeOf(engine, t.Sub("appsettings.json")));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void A_commented_out_AudioMode_line_alone_means_PerSession(string engine)
+    {
+        using var t = new Temp();
+        Put(t.Root, "appsettings.json", "{\n  // \"AudioMode\": \"SharedHost\"\n}\n");
+        Assert.Equal(("PerSession", false), AudioModeOf(engine, t.Sub("appsettings.json")));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void Garbage_and_unreadable_files_mean_PerSession(string engine)
+    {
+        using var t = new Temp();
+        Put(t.Root, "appsettings.json", "\u0001\u0002 not json at all {{{ \"AudioMode");
+        Assert.Equal(("PerSession", false), AudioModeOf(engine, t.Sub("appsettings.json")));
+
+        Put(t.Root, "locked.json", Cfg("SharedHost"));
+        using (new FileStream(t.Sub("locked.json"), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            Assert.Equal(("PerSession", false), AudioModeOf(engine, t.Sub("locked.json")));
+        }
+        // A directory where a file should be.
+        Directory.CreateDirectory(t.Sub("dir.json"));
+        Assert.Equal(("PerSession", false), AudioModeOf(engine, t.Sub("dir.json")));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void An_unrecognised_value_means_PerSession(string engine)
+    {
+        using var t = new Temp();
+        Put(t.Root, "appsettings.json", Cfg("Banana"));
+        Assert.Equal(("PerSession", false), AudioModeOf(engine, t.Sub("appsettings.json")));
+        Put(t.Root, "appsettings.json", Cfg(""));
+        Assert.Equal(("PerSession", false), AudioModeOf(engine, t.Sub("appsettings.json")));
+    }
+
+    [Theory, MemberData(nameof(Engines))]
+    public void VoiceMeeter_is_needed_only_for_SharedHost(string engine)
+    {
+        var j = J(Ps(engine,
+            "$r = [pscustomobject]@{ Shared = [bool](Test-VoiceMeeterNeeded -AudioMode 'SharedHost');" +
+            " Per = [bool](Test-VoiceMeeterNeeded -AudioMode 'PerSession');" +
+            " Empty = [bool](Test-VoiceMeeterNeeded -AudioMode '');" +
+            " Other = [bool](Test-VoiceMeeterNeeded -AudioMode 'Banana') }\n"));
+        Assert.True(j.GetProperty("Shared").GetBoolean());
+        Assert.False(j.GetProperty("Per").GetBoolean());
+        Assert.False(j.GetProperty("Empty").GetBoolean());
+        Assert.False(j.GetProperty("Other").GetBoolean());
+    }
+
+    // -- Wiring of install-service.ps1 itself ----------------------------------------
+
+    private static string[] InstallerLines() => File.ReadAllLines(Path.Combine(RepoRoot, "scripts", "install-service.ps1"));
+
+    [Fact]
+    public void The_source_build_never_publishes_into_the_install_folder()
+    {
+        var publishes = InstallerLines().Where(l => l.TrimStart().StartsWith("dotnet publish")).ToArray();
+        Assert.NotEmpty(publishes);
+        foreach (var l in publishes)
+        {
+            Assert.DoesNotContain("InstallDir", l);
+            Assert.Contains("$stage", l);
+        }
+    }
+
+    [Fact]
+    public void The_installer_loads_the_library_and_both_paths_use_the_shared_replace()
+    {
+        var text = string.Join("\n", InstallerLines());
+        // An actual dot-source statement, not a mention in a comment.
+        Assert.Matches(new System.Text.RegularExpressions.Regex(
+            @"^\.\s+\(Join-Path \$PSScriptRoot ""lib\\install-lib\.ps1""\)\s*$",
+            System.Text.RegularExpressions.RegexOptions.Multiline), text);
+        Assert.True(File.Exists(Lib));
+        // One replace routine, called once, after the verification and the runtime preflight.
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(text, @"Install-Payload -Stage"));
+        var iVerify = text.IndexOf("Test-PayloadConsistency -Dir $stage", StringComparison.Ordinal);
+        var iPre = text.IndexOf("Test-HostHasRuntimes", StringComparison.Ordinal);
+        // First stop AFTER the staging section begins (the -Uninstall block stops the service too).
+        var iStop = text.IndexOf("Stop-Service $ServiceName", text.IndexOf("$stamp = Get-Date", StringComparison.Ordinal), StringComparison.Ordinal);
+        var iInstall = text.IndexOf("Install-Payload -Stage", StringComparison.Ordinal);
+        Assert.True(iVerify > 0 && iVerify < iPre && iPre < iStop && iStop < iInstall,
+            "order must be: verify stage, runtime preflight, stop service, replace folder");
+        // The old in-place wipe must not come back as a second, unshared copy.
+        Assert.DoesNotContain("Get-ChildItem $InstallDir -Force | Remove-Item", text);
+    }
+
+    [Fact]
+    public void The_installer_runs_the_steam_preflight_before_it_can_stop_the_service()
+    {
+        var text = string.Join("\n", InstallerLines());
+        var iStaging = text.IndexOf("$stamp = Get-Date", StringComparison.Ordinal);
+        var iGate = text.IndexOf("Invoke-StopWhenNotBlocked -InstallDir", iStaging, StringComparison.Ordinal);
+        var iStop = text.IndexOf("Stop-Service $ServiceName", iStaging, StringComparison.Ordinal);
+        var iBlocked = text.IndexOf("if ($stopGate.Blocked)", StringComparison.Ordinal);
+        var iExit = text.IndexOf("exit 1", iBlocked, StringComparison.Ordinal);
+        var iInstall = text.IndexOf("Install-Payload -Stage", StringComparison.Ordinal);
+        Assert.True(iGate > 0 && iGate < iStop, "the stop must sit inside the pre-flight gate, after it");
+        Assert.True(iBlocked > iStop && iExit > iBlocked && iExit < iInstall,
+            "a block must exit non-zero before the install folder is replaced");
+    }
+
+    [Fact]
+    public void The_VoiceMeeter_step_runs_only_when_the_AudioMode_decision_says_so()
+    {
+        var lines = InstallerLines();
+        var iGuard = Array.FindIndex(lines, l => l.TrimStart().StartsWith("if (-not (Test-VoiceMeeterNeeded"));
+        Assert.True(iGuard > 0, "the VoiceMeeter block must be guarded by Test-VoiceMeeterNeeded");
+        var iElse = Array.FindIndex(lines, iGuard, l => l.TrimStart().StartsWith("} elseif ($vmExe) {"));
+        var iEnd = Array.FindIndex(lines, iGuard, l => l.Contains("-- Standalone Apollo coexistence"));
+        Assert.True(iElse > iGuard && iEnd > iElse, "expected: guard, then the SharedHost branch, then the next section");
+
+        // The guard's own branch (PerSession) must neither start VoiceMeeter nor print the NOTE.
+        var skipBranch = string.Join("\n", lines.Skip(iGuard + 1).Take(iElse - iGuard - 1));
+        Assert.DoesNotContain("Start-Process", skipBranch);
+        Assert.DoesNotContain("not found", skipBranch);
+        Assert.Contains("VoiceMeeter not needed", skipBranch);
+
+        // Both the start and the NOTE live in the SharedHost branches, after the guard.
+        var iStart = Array.FindIndex(lines, l => l.Contains("Start-Process $vmExe"));
+        var iNote = Array.FindIndex(lines, l => l.Contains("VoiceMeeter not found under VB"));
+        Assert.True(iStart > iElse && iStart < iEnd, "Start-Process of VoiceMeeter must sit inside the guarded branch");
+        Assert.True(iNote > iElse && iNote < iEnd, "the 'VoiceMeeter not found' NOTE must sit inside the guarded branch");
+
+        // The config is read from the deployed folder BEFORE Install-Payload replaces it.
+        var iRead = Array.FindIndex(lines, l => l.Contains("Get-EffectiveAudioMode -ConfigPaths"));
+        var iInstall = Array.FindIndex(lines, l => l.Contains("Install-Payload -Stage"));
+        Assert.True(iRead > 0 && iRead < iGuard && iGuard < iInstall, "AudioMode must be read before the guard and before Install-Payload");
+        Assert.Contains("appsettings.local.json", lines[iRead + 1]);
+        Assert.Contains("appsettings.json", lines[iRead + 2]);
+    }
+}

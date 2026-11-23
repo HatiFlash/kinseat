@@ -64,7 +64,7 @@ if (-not $events) {
     if ($appEvents -and -not ($appEvents | Where-Object { $_.LevelDisplayName -eq 'Information' })) {
         Write-Host "`n  NOTE: no Information-level entries from MultiSeat.Service in this window." -ForegroundColor Yellow
         Write-Host "  That usually means they are being filtered out, not that nothing happened." -ForegroundColor DarkGray
-        Write-Host "  Check with:  & '$env:ProgramFiles\MultiSeat\MultiSeat.Service.exe' --log-filters" -ForegroundColor DarkGray
+        Write-Host "  Check with:  & '$env:ProgramFiles\MultiSeat\Kinseat.Service.exe' --log-filters" -ForegroundColor DarkGray
     }
 }
 

@@ -20,11 +20,11 @@
 
 # Files a self-contained publish puts beside the exe. A framework-dependent payload has none.
 $script:BundledRuntimeFiles = @('hostfxr.dll', 'hostpolicy.dll', 'coreclr.dll')
-$script:RuntimeConfigName = 'MultiSeat.Service.runtimeconfig.json'
+$script:RuntimeConfigName = 'Kinseat.Service.runtimeconfig.json'
 
 function Get-PayloadRequiredFiles {
     # What every payload, from a zip or from a build, must contain to be a MultiSeat install.
-    return @('MultiSeat.Service.exe', 'appsettings.json', 'wwwroot\index.html')
+    return @('Kinseat.Service.exe', 'appsettings.json', 'wwwroot\index.html')
 }
 
 function Get-MissingPayloadFiles {
@@ -37,9 +37,9 @@ function Get-MissingPayloadFiles {
 # the service picks the launcher and the hook by the architecture of the Steam it is about to
 # start, so a folder holding only some of them works for one Steam and fails for the other.
 function Get-SteamIsolationFiles {
-    return @('MultiSeat.SteamLauncher.exe', 'MultiSeat.SteamLauncher32.exe',
-             'MultiSeat.SteamHook.dll', 'MultiSeat.SteamHook32.dll',
-             'MultiSeat.SteamShim.exe')
+    return @('Kinseat.SteamLauncher.exe', 'Kinseat.SteamLauncher32.exe',
+             'Kinseat.SteamHook.dll', 'Kinseat.SteamHook32.dll',
+             'Kinseat.SteamShim.exe')
 }
 
 function Get-MissingSteamIsolationFiles {
@@ -533,7 +533,7 @@ function Install-Payload {
 # -- Pre-flight: is an isolated Steam holding the helper files? ---------------------------------
 #
 # Measured 2026-10-20: an isolated Steam (steam.exe, its steamwebhelper children and
-# MultiSeat.SteamLauncher.exe) had MultiSeat.SteamHook.dll loaded. Windows will not overwrite or
+# Kinseat.SteamLauncher.exe) had Kinseat.SteamHook.dll loaded. Windows will not overwrite or
 # delete a loaded DLL, so Install-Payload failed with "Access ... is denied" and rolled back. The
 # rollback worked, but the installer had already stopped the service, which dropped every seat,
 # and the error never said "close Steam". These functions find that case BEFORE the service is
@@ -674,7 +674,7 @@ function Format-SteamInUseMessage {
     param(
         [Parameter(Mandatory = $true)]$Check
     )
-    $launcher = Join-Path $Check.Folder 'MultiSeat.SteamLauncher.exe'
+    $launcher = Join-Path $Check.Folder 'Kinseat.SteamLauncher.exe'
     $steamExe = $null
     foreach ($p in @($Check.Processes)) {
         # ImagePath, not Path: for a holder, Path is the module that matched (the hook DLL).

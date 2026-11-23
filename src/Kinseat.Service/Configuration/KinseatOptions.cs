@@ -1,0 +1,640 @@
+namespace MultiSeat.Service.Configuration;
+
+public sealed class MultiSeatOptions
+{
+    public const string SectionName = "MultiSeat";
+
+    // ── Seats ────────────────────────────────────────────────────────
+    public int MaxSeats { get; set; } = 4;
+    public int PortBase { get; set; } = Shared.Constants.PortBase;
+
+    /// <summary>Optional absolute path; by default the agent is beside the service executable.</summary>
+    public string? KinseatAgentExePath { get; set; }
+
+    // ── Apollo / Sunshine ────────────────────────────────────────────
+    public string ApolloExePath { get; set; } = Shared.Constants.DefaultApolloPath;
+    public string ApolloConfigDir { get; set; } = Shared.Constants.DefaultApolloConfigDir;
+
+    // NVENC quality preset: 1 (P1, lowest latency) → 7 (P7, highest quality).
+    // P4 is balanced — good quality without perceptible encode latency.
+    // Apollo default is 1; we raise it because the NVENC hardware handles P4 at full framerate.
+    public int NvencPreset { get; set; } = 4;
+
+    /// <summary>
+    /// Apollo encoder used for every seat. Left at "nvenc" nothing changes:
+    /// Apollo falls back on its own where NVENC is absent. Set it explicitly on
+    /// hosts where that fallback misbehaves — on AMD the AMF probe runs at
+    /// startup against the RDP surface a seat provides, and can hang there
+    /// before Apollo ever opens its ports. Apollo's own values: nvenc,
+    /// quicksync, amdvce, software.
+    /// </summary>
+    public string Encoder { get; set; } = "nvenc";
+
+    /// <summary>
+    /// Replace a seat's TLS identity when it is still the one MultiSeat seeded from the console
+    /// Apollo. Off by default because it BREAKS THAT SEAT'S EXISTING PAIRINGS.
+    ///
+    /// Seats used to be seeded with a copy of the console Apollo's cakey.pem, so every seat and
+    /// the console shared one private key - and the source copy is world-readable, which no
+    /// permission fix on our side can change. New seats now generate their own; this switch is
+    /// for the ones already carrying the shared key.
+    ///
+    /// A client pairs against the server certificate (Apollo hands it over as root.plaincert
+    /// during pairing), so replacing it means every client paired to that seat must pair again.
+    /// That is why this is opt-in rather than automatic.
+    /// </summary>
+    /// <summary>
+    /// Run the keepalive mstsc on a desktop of its own instead of the console's interactive one.
+    ///
+    /// Fixes issue #18: an RDP client repositions its local cursor from the server's
+    /// pointer-position message, so the keepalive mirrors the seat's pointer onto the console
+    /// user's desktop while a client is streaming. A process on another desktop cannot move the
+    /// console pointer - measured, SetCursorPos there fails outright.
+    ///
+    /// ON by default since 2026-08-31. The risk that kept it off was throttling: mstsc is placed on
+    /// a non-primary monitor because Windows throttles a hidden or minimized RDP client, which
+    /// freezes the stream, and whether a non-interactive desktop counts as hidden could not be
+    /// reasoned out. Measured instead - a real Moonlight client streaming a seat for several
+    /// minutes with this on: no stutter, no stall, and the console cursor read 0 changes in 152
+    /// samples while the client's mouse was moving (the same measurement that reads 55 in 64 on an
+    /// affected host).
+    ///
+    /// Set false to go back to the console desktop. The launcher also falls back on its own if the
+    /// desktop cannot be created, so a seat still works even where this path fails.
+    /// </summary>
+    public bool KeepaliveOnSeparateDesktop { get; set; } = true;
+
+    /// <summary>
+    /// Issue #96 diagnostic. When true, every provision launches a background probe inside the
+    /// new seat session (parallel to Apollo's own startup, never blocking it) that samples
+    /// <c>OpenInputDesktop</c> and the active display identity every 250ms for
+    /// <see cref="InputDesktopReadinessProbeSeconds"/>, writing a timestamped JSONL timeline to
+    /// <c>C:\ProgramData\MultiSeat\ms_inputdesktop_readiness_{seatId}.jsonl</c>.
+    ///
+    /// Off by default — it is a diagnostic for one open question (does a fresh seat session's
+    /// input desktop ever become accessible on its own, and how does the RDP display identity
+    /// change when it does), not something every host needs running on every provision.
+    /// See scripts\diagnose-issue96.ps1, which drives repeated trials under both values of
+    /// <see cref="KeepaliveOnSeparateDesktop"/> and aggregates the result.
+    /// </summary>
+    public bool DiagnoseInputDesktopReadiness { get; set; } = false;
+
+    /// <summary>
+    /// How long the issue #96 probe (<see cref="DiagnoseInputDesktopReadiness"/>) samples for.
+    /// The reporter's own fixed-delay testing (0/1/3/5/10s) never resolved the failure, so this
+    /// defaults well past that to answer whether it is a slow race or a true deadlock.
+    /// </summary>
+    public int InputDesktopReadinessProbeSeconds { get; set; } = 90;
+
+    public bool RotateSharedSeatTls { get; set; }
+
+    /// <summary>
+    /// Apollo's own log level for every seat. "info" is what a seat needs day
+    /// to day; "debug" is the only way to see why a seat's Apollo refuses a
+    /// pairing or a client, since its log is the sole window into a session
+    /// nobody can watch. Apollo's values: verbose, debug, info, warning, error.
+    /// </summary>
+    public string ApolloLogLevel { get; set; } = "info";
+
+    /// <summary>
+    /// Let ApolloVibe offer a second video stream in every seat: a client such as MoonlightVibe can
+    /// then show one window of the seat in a second client window, over the same connection. Written
+    /// into each seat's Apollo config as <c>second_video_stream</c>, and the config is rewritten on
+    /// every provision, so a change reaches a seat the next time it is provisioned.
+    ///
+    /// Off by default, like ApolloVibe's own setting. A seat can offer a WINDOW only. A whole display
+    /// needs the console session: a seat is an RDP session, the RDP display driver owns its display
+    /// list, and Windows will not let a new display join it, so ApolloVibe does not offer one there
+    /// and a client that asks for a display gets one stream. The second stream is one more NVENC
+    /// session and one more encode per seat.
+    /// </summary>
+    public bool SecondVideoStream { get; set; }
+
+    // ── API ──────────────────────────────────────────────────────────
+    public int ApiPort { get; set; } = Shared.Constants.DefaultApiPort;
+    public string ApiKey { get; set; } = string.Empty;  // set in appsettings or env
+
+    // NOTE: there is deliberately no RequireHttps option. One existed, defaulted to true, and was
+    // never read by anything — so the config asserted that the API required HTTPS while it was
+    // served as plaintext HTTP on every interface, with the API key crossing the network in
+    // clear. A setting that claims a security property it does not implement is worse than no
+    // setting: it answers the question an operator would otherwise go and check.
+    //
+    // The API is HTTP only. ApiServer warns at startup when it is bound beyond loopback so the
+    // exposure is stated rather than implied. Restrict access with a firewall rule, or set
+    // ApiBindLoopbackOnly.
+    public string[] CorsOrigins { get; set; } = [];
+
+    /// <summary>
+    /// Bind the API to loopback only, so the dashboard is reachable on the host itself and
+    /// nowhere else. Default false, which preserves the historical behaviour of listening on
+    /// every interface — turning it on is the right choice for any host whose dashboard is only
+    /// ever opened locally or over a remote-desktop tool.
+    /// </summary>
+    public bool ApiBindLoopbackOnly { get; set; } = false;
+
+    // ── Seat account privileges ──────────────────────────────────────
+    /// <summary>
+    /// Put seat accounts in the local Administrators group. Default false.
+    ///
+    /// MultiSeat used to do this unconditionally, justified by a comment saying SudoVDA IPC
+    /// requires admin. That is not true, and both halves were checked before changing it:
+    ///
+    ///   - Apollo's SudoVDA client (third-party/sudovda/sudovda.h) opens the device with a plain
+    ///     CreateFileA for GENERIC_READ | GENERIC_WRITE. There is no admin or elevation check
+    ///     anywhere in it.
+    ///   - The driver's own INF ships the device SDDL
+    ///     D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD) — Everyone is granted exactly the
+    ///     GENERIC_READ | GENERIC_WRITE the client asks for.
+    ///
+    /// Confirmed by experiment rather than by reading: a throwaway account in Users only, not in
+    /// Administrators, opened the SudoVDA interface successfully (last error 0).
+    ///
+    /// Seats therefore get Users + Remote Desktop Users instead. The Remote Desktop Users part is
+    /// not optional — administrators are implicitly allowed to log on over RDP, so an account that
+    /// loses admin without gaining that membership cannot start a session at all.
+    ///
+    /// Turn this on only if something in a specific setup genuinely needs it (an installer or a
+    /// game that demands elevation inside the seat). It hands every seat full control of the host,
+    /// including the ability to reach the credential store, which is the point of keeping it off.
+    /// </summary>
+    public bool GrantSeatAdministrator { get; set; } = false;
+
+    // ── Audio ────────────────────────────────────────────────────────
+    // How seat game audio reaches Moonlight. See AudioMode for the trade-off.
+    //
+    // Default flipped to PerSession on 2026-08-19. SharedHost was the historical behaviour, but it
+    // WEDGES THE HOST'S AUDIO on every seat provision — measured: the host's SWD\MMDEVAPI endpoint
+    // nodes collapse from 27 to 1, host playback goes silent, and it stays that way after the seat
+    // is gone until AudioEndpointBuilder is restarted. That is a fault every user hits every time
+    // they start a seat, and it is what the "no audio after sleep, only a reboot fixes it" reports
+    // were. PerSession does not do it (same test, nodes stayed at 27), and it also closes #10/#12.
+    //
+    // The cost is real and one-way: PerSession has NO microphone path. Set SharedHost explicitly if
+    // the mic matters more than the host's audio, and see scripts\fix-host-audio.ps1 for the repair.
+    public AudioMode AudioMode { get; set; } = AudioMode.PerSession;
+
+    // ── Virtual Audio Cable ──────────────────────────────────────────
+    // Only used when AudioMode = SharedHost. PerSession needs no virtual cables at all.
+    public int VacCableCount { get; set; } = 4;  // number of VAC cables installed
+
+    // ── HidHide ──────────────────────────────────────────────────────
+    public string HidHideCliPath { get; set; } = @"C:\Program Files\Nefarius Software Solutions\HidHide\x64\HidHideCLI.exe";
+
+    // Per-seat gamepad isolation, via HidHide's undocumented session jail: a blacklist entry
+    // suffixed with !<sessionId> is visible only inside that session (HidHide >= 1.4.181.0,
+    // Logic.c:817, documented nowhere). See HidHideSessionJail and GitHub issue #19.
+    //
+    // Kinseat 0.3.3: ON by default. Without it the console session receives every seat pad,
+    // and a seat player's Guide button opens the Game Bar on the host's screen (measured).
+    // Rules are attributed by evidence only (a pad that appeared after that seat's client
+    // connected, unambiguously), released on disconnect, and stale suffixed rules are cleared at
+    // startup — so a console-side pad is never taken. Inert when HidHide is not installed.
+    //
+    // Turning it on REPLACES the old global-hide-plus-whitelist approach, which could not isolate
+    // seats from each other even in principle: the whitelist is global, cannot pair an app with a
+    // device, and every seat runs the same Apollo binary.
+    public bool EnableHidHideCloaking { get; set; } = true;
+
+    // Write a seat's jail rules BEFORE its Apollo creates a pad.
+    //
+    // Correctness, not optimisation. HidHide filters at open time, so a rule written afterwards is
+    // late by definition - measured, a pad appeared at 13:27:33 and its rule landed at 13:27:39.9.
+    // Inside that window dwm, explorer and GameInputSvc of EVERY session open the new pad and keep
+    // handles that never expire, and releasing the rule later does not hand the pad back.
+    //
+    // A rule for an absent device matches nothing, so pre-writing is inert and free. It only does
+    // anything for a seat whose pad path is known by evidence - see SeatPadDevicePaths.
+    public bool EnablePadRulePreWrite { get; set; } = false;
+
+    // After writing a jail rule, check from session 0 that it took effect.
+    //
+    // The driver requires sessionId != 0 for a jail to match, so this service can never be the
+    // jailed session and must be refused a device that is genuinely confined. That makes it a live
+    // probe of an undocumented behaviour a future HidHide release could drop without a word. Cheap
+    // (one CreateFile), on by default, and it only reports.
+    public bool VerifyHidHideJail { get; set; } = true;
+
+    // Known pad device instance paths per seat account, e.g.
+    //   "SeatPadDevicePaths": { "MultiSeat01": [ "USB\\VID_045E&PID_028E\\01" ] }
+    //
+    // This is the "identity" leg of attribution. Without it a seat's pad can only be picked out by
+    // elimination, which is refused whenever more than one unconfined emulated pad exists - and
+    // which is never remembered when it is used, because a placement made by elimination that gets
+    // written down outlives the situation that produced it.
+    //
+    // These paths are not stable by nature: the last section of a ViGEm XUSB path is a serial that
+    // ViGEmClient picks in USER MODE by sweeping free slots from 1, so where a seat's pad is born
+    // is decided by whoever connects first. Pinning it properly needs a patched Apollo
+    // (gamepad_serial_no / gamepad_vid / gamepad_pid), which is a fork of a fork and deliberately
+    // not taken on yet.
+    public Dictionary<string, string[]> SeatPadDevicePaths { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Device instance paths of PHYSICAL controller(s) to confine to the CONSOLE's own session,
+    /// so they are invisible to every seat — the opposite problem from <see cref="SeatPadDevicePaths"/>.
+    ///
+    /// Fixes issue #92: a real gamepad plugged into the main/console PC "bleeds" into a seat —
+    /// someone playing on the console is detected inside a seat's game too — because nothing
+    /// previously stopped a seat session's own dwm/explorer/GameInputSvc from opening it. There
+    /// is no equivalent of <see cref="SeatPadDevicePaths"/>' identity-by-evidence problem here:
+    /// the operator names the exact controller(s) to keep for themselves, by device instance
+    /// path, found the same way as a seat's pad — run <c>Kinseat.Service.exe --hidhide</c> and
+    /// copy either the HID node or the XUSB node path it prints for that controller. Both nodes
+    /// get a rule regardless of which one is configured, same as everywhere else in this feature.
+    ///
+    /// Default empty, which makes the feature a complete no-op: not even the console session is
+    /// resolved. This uses the SAME <c>!&lt;sessionId&gt;</c> session jail as <see cref="SeatPadDevicePaths"/>
+    /// (see <see cref="Input.HidHideSessionJail"/>) just pointed the other way — confine the named
+    /// pad(s) to WTSGetActiveConsoleSessionId() instead of to a seat. It is independent of
+    /// <see cref="EnableHidHideCloaking"/>: an operator may want the console's own controller
+    /// protected without ever turning on per-seat isolation.
+    ///
+    /// Unlike <see cref="SeatPadDevicePaths"/>, this is NOT restricted to emulated pads — a
+    /// physical controller is exactly what this option exists to confine. The emulated-only
+    /// filter in <see cref="Input.HidHideConfigurator"/>'s seat attribution protects a physical
+    /// controller from being taken BY a seat; it has no bearing on the operator deliberately
+    /// naming one here on purpose.
+    ///
+    /// Reconciled on every health-check tick (<see cref="MultiSeatOptions.HealthCheckIntervalMs"/>),
+    /// not just once at startup — the active console session can change on its own (fast user
+    /// switch, logon/logoff) and the controller may not be plugged in yet when the service starts.
+    /// A configured path that matches nothing yet is deliberately NOT pre-written the way a
+    /// seat's known pad is; see the reasoning in <see cref="Input.HidHideConfigurator.ReconcileExcludedPhysicalPads"/>.
+    /// </summary>
+    public string[] ExcludedPhysicalPadDevicePaths { get; set; } = [];
+
+    // ── Input Isolation ──────────────────────────────────────────────
+    public string InputHookDllPath { get; set; } = @"MultiSeatInputHook.dll";
+
+    // Keyboard/mouse session isolation via the InputHook DLL.
+    // Default OFF — it is a no-op as architected: the low-level WH_KEYBOARD_LL/WH_MOUSE_LL
+    // hooks are installed from the service process (Session 0), where GetForegroundWindow()
+    // returns NULL, so ShouldPassThrough() always passes the event. There is also no
+    // cross-session K/M bleed to prevent (physical input goes to the console session; Moonlight
+    // input is SendInput'd inside the seat session). Re-enabling is only meaningful if the hook
+    // is re-architected to run inside the seat session. See the known constraints of the seat agent.
+    public bool EnableKeyboardMouseIsolation { get; set; } = false;
+    public bool AutoAssignControllers { get; set; } = true;
+
+    // ── Display ──────────────────────────────────────────────────────
+    // DWM composition interval, in milliseconds, for every RDP session on this host. Written to
+    // HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations at service startup; DWM
+    // reads it when a session's compositor starts, so it takes effect on the NEXT session, not on
+    // sessions already running.
+    //
+    // A seat streams its RDP session surface (issue #15), so this interval is the ceiling on how
+    // often a seat can produce a NEW frame. At the Windows default a 60fps stream is sending
+    // roughly every second frame twice.
+    //
+    // ⭐ This also sets the refresh rate the seat's display ADVERTISES, not just how often frames
+    // are delivered. Measured on the reference host (Win11 26100.9444), one fresh RDP session per
+    // value. GDI (EnumDisplaySettings), CCD (QueryDisplayConfig targetInfo.refreshRate and the
+    // target mode's vSyncFreq) and the measured composition rate all agree:
+    //
+    //     value     display advertises     composition measured
+    //     absent    32 Hz                  32.0 fps    <- Windows default
+    //     1         32 Hz                  31.9 fps    <- ignored; same as absent
+    //     2         500 Hz                 464.7 fps
+    //     4         250 Hz                 246.1 fps
+    //     8         125 Hz                 125.2 fps   <- the default below (issue #74)
+    //     16        62 Hz                  62.1 fps    <- the default before issue #74
+    //     33        30 Hz                  30.0 fps
+    //
+    // So the advertised rate is 1000/interval, truncated to a whole number. Exact 60 Hz is not
+    // reachable (1000/60 is not an integer); 16 gives 62 Hz, which is the closest above it.
+    //
+    // ⛔ Values below 2 are rejected, and this is the reason the setting needs a floor at all.
+    // MultiSeat shipped 1 from the initial release, which is where the seat's well-documented
+    // 1000 Hz display came from — 1000/1. That was real and it worked. On this Windows build 1 is
+    // out of range and Windows silently falls back to its own default, so seats dropped from
+    // 1000 Hz to 32 Hz with nothing logged and nothing failing. Writing a value below 2 reports
+    // success and changes nothing, so it is refused instead.
+    //
+    // ⚠️ The June 2026 RdpIdd research concluded the seat display was locked to a single
+    // 1920x1080@1000 mode and that a GDI refresh change was hollow because DXGI kept reporting
+    // 1000 Hz. That held on termsrv 8521. It does not hold here: GDI and CCD now agree, and both
+    // follow this interval. Re-measure before relying on either account.
+    //
+    // ⛔ This key is machine-wide (HKLM, all WinStations), so every seat on a host shares one
+    // value. A per-seat refresh rate is not reachable through it.
+    //
+    // Pick the interval for the fastest client the host serves, since every seat shares it:
+    //
+    //     30fps -> 33    60fps -> 16    120fps -> 8    144fps -> 6
+    //
+    // Exact 60 and 144 are not reachable: 1000/60 and 1000/144 are not whole milliseconds. 7 would
+    // advertise 142 Hz, just under a 144 Hz client, so 6 is the one that covers it.
+    //
+    // ⭐ The default is 8 (125 Hz) since issue #74, which measured the cost this comment used to
+    // call unmeasured. On the reference host, one seat under a real D3D11 game-like load, CPU
+    // summed over TermService, the keepalive mstsc and dwm:
+    //
+    //     interval   composed and delivered   CPU (one core)
+    //     16         62 Hz                    87.7%   (32.8 TermService + 31.1 mstsc + 23.8 dwm)
+    //     8          125 Hz                   101.3%  (+15% over 16)
+    //     6          166 Hz                   118.1%  (+35% over 16)
+    //
+    // So 8 gives a 120fps client its full rate for about 15% of one core per busy seat, roughly
+    // 0.6% of a 24-core host. RDP really delivers the higher rate; frames are not composed and then
+    // dropped. 16 (62 Hz) was the default before, and it capped every 120fps client at 62. It still
+    // looks like an ordinary monitor — unlike 1000 Hz, which is what broke old titles.
+    //
+    // ⛔ 4 and 2 compose fine idle but were never measured under load, so the dashboard does not
+    // offer them (DwmFrameIntervalSetting.AllowedIntervalsMs). Set them here by hand only with a
+    // measurement in hand: scripts\probe-dwm-rate.ps1 takes one.
+    //
+    // The dashboard's System page changes this at runtime (POST /api/system/refresh-rate): it
+    // writes the registry at once and persists the choice to appsettings.local.json. Either way the
+    // value applies to each seat's NEXT session only.
+    public int DwmFrameIntervalMs { get; set; } = 8;
+
+    /// <summary>
+    /// Smallest interval Windows actually honours. Below this it ignores the value and composes at
+    /// its own default, without reporting anything — measured, not inferred: 1 and "value absent"
+    /// produced the same 32fps, while 2 produced 465fps.
+    /// </summary>
+    public const int MinimumHonouredDwmFrameIntervalMs = 2;
+
+    // Resize a seat to whatever resolution its Moonlight client asks for.
+    //
+    // Apollo's own dd_resolution_option = auto cannot do this: a seat streams its RDP session
+    // surface, nothing inside the session can resize it (issue #15), and Apollo logs
+    // "[1610] failed to set display mode!". Only mstsc sets that size, so following the client
+    // means reconnecting the session — which preserves the Windows session and everything
+    // running in it, but does briefly interrupt an active stream.
+    //
+    // Off by default for that reason, and because the trigger (a client connecting) could not
+    // be exercised on the reference host, which is headless and has never had a Moonlight
+    // client attached. The resize path itself IS verified: 1280x720 -> 1920x1080 on a live
+    // seat, session id preserved.
+    public bool FollowClientResolution { get; set; } = false;
+
+    // DPI scale, in percent, for every seat that does not set its own (issue #70). Unset (null)
+    // keeps the width heuristic in RdpGeometry.DeriveScaleFactor: up to 1920 wide -> 100, up to
+    // 2560 -> 125, up to 3200 -> 150, wider -> 200.
+    //
+    // The heuristic is tuned for monitors. It knows the desktop's width in pixels and nothing
+    // about the client's screen, which Moonlight never reports. A tablet renders its own UI at
+    // about 200%, so a 1920-wide seat derived at 100% is tiny there. A seat's own override
+    // (POST /api/seats/{id}/scale, or scaleFactor when creating it) wins over this value.
+    //
+    // Must be one of 100, 125, 150, 175, 200, 250, 300, 400, 500 — the values mstsc accepts for
+    // desktopscalefactor. Anything else is refused with a warning at startup and NOT used; it is
+    // never rounded to a neighbour, because that would hand every seat a size nobody asked for.
+    //
+    // The scale reaches the session through Default.rdp as desktopscalefactor plus
+    // devicescalefactor:i:100. Before 0.6.19 the second key was missing, and mstsc then sends the
+    // CONSOLE monitor's scale instead, so this setting and every seat override did nothing
+    // (issue #93).
+    //
+    // A scale change on a live seat (and a resize that moves the scale, such as a client-triggered
+    // one with FollowClientResolution) reconnects the seat's session, then reads the scale the
+    // session is actually running at. A mismatch is reported, never acted on: the session is not
+    // logged off, because that closes the programs running in it. GET
+    // /api/seats/{id}/diagnostics/applied-scale returns the reading beside the scale that was
+    // asked for; the seat's appliedScaleFactor, scaleMismatch and scaleNote carry the last one.
+    public int? DefaultScaleFactor { get; set; }
+
+    /// <summary>
+    /// <see cref="DefaultScaleFactor"/> when it is usable, otherwise null. A value mstsc would
+    /// ignore is treated as unset here, so seats keep provisioning; the startup check is what
+    /// reports it.
+    /// </summary>
+    public int? UsableDefaultScaleFactor =>
+        DefaultScaleFactor is { } scale && Sessions.RdpGeometry.IsAllowedScaleFactor(scale)
+            ? scale
+            : null;
+
+    // Enable Windows Advanced Color (HDR) on virtual displays at seat creation.
+    // Requires SudoVDA driver v0.5+ with HDR EDID support.
+    // When enabled, Apollo will stream in HDR if the Moonlight client also supports it.
+    //
+    // ⚠️ Currently a NO-OP for a seat — nothing reads this to enable advanced colour, and no
+    // seat has ever streamed HDR.
+    //
+    // An earlier version of this comment said HDR was impossible for a seat because the RDP
+    // surface has no EDID. That was wrong, and measuring it is what showed so: inside a live seat
+    // the active RDP target reports advancedColorSupported = TRUE with advancedColorEnabled =
+    // false at 8 bits per channel. The capability is advertised; what does not follow is the
+    // VidPN SOURCE mode, which stays SDR.
+    //
+    // Nonary (Vibepollo/Vibeshine) demonstrated HDR working inside a terminal session by forcing
+    // Windows to rebuild that source mode — an FP16 shared-displayable primary, then
+    // D3DKMTSetVidPnSourceOwner and D3DKMTSetDisplayMode with PreserveVidPn=FALSE — all user
+    // mode. See issue #15. MultiSeat does not implement that yet, which is why this flag does
+    // nothing rather than why HDR is impossible.
+    //
+    // To check a host: GET /api/seats/{id}/diagnostics/advanced-color, or run
+    // Kinseat.Service.exe --advanced-color <file> inside the session.
+    public bool EnableHdr { get; set; } = false;
+
+    // ── Controller emulation ─────────────────────────────────────────
+    // When true, MultiSeat creates a ViGEm virtual Xbox 360 controller per seat
+    // and routes a host-side physical XInput controller into the session.
+    // When false (default), Apollo handles controller forwarding natively
+    // from the Moonlight client (e.g. ROG Ally). Enabling this alongside
+    // Apollo's built-in controller forwarding causes duplicate controllers.
+    public bool EnableViGEmController { get; set; } = false;
+
+    // ── Launch-on-connect apps ───────────────────────────────────────
+    // Apps launched into a seat's session when a Moonlight client connects.
+    // Empty by default (feature off). Use this INSTEAD of Windows autostart for
+    // game launchers (Steam Big Picture, EmulationStation, RetroBat, …): launching
+    // them after the client connects guarantees Apollo's virtual controller already
+    // exists, so the launcher's startup controller scan detects it. Apps autostarted
+    // at login run before any stream and never see the per-stream virtual pad.
+    public LaunchOnConnectApp[] LaunchOnConnect { get; set; } = [];
+
+    /// <summary>Opt in to wrapping explicit steam.exe seat launches with the native isolation helper.</summary>
+    public bool SteamIsolationEnabled { get; set; } = false;
+
+    /// <summary>Absolute path to the supervising x64 launcher; matching hooks live beside it.</summary>
+    public string SteamIsolationLauncherPath { get; set; } =
+        @"C:\Program Files\MultiSeat\SteamIsolation\Kinseat.SteamLauncher.exe";
+
+    /// <summary>Game-file launcher shipped beside the service in the SteamIsolation publication folder.</summary>
+    public string GameFilesLauncherPath { get; set; } =
+        Path.Combine(AppContext.BaseDirectory, "SteamIsolation", "Kinseat.SteamLauncher.exe");
+
+    /// <summary>
+    /// With <see cref="SteamIsolationEnabled"/>, send every ordinary way of starting Steam through the
+    /// isolation shim: the Steam shortcuts, the <c>steam://</c> handler and the Run entry of each
+    /// seat account, and of the console user when <see cref="SteamShimIncludeConsole"/> is set.
+    /// Without this, only the launches MultiSeat starts itself are isolated, and a click on a plain
+    /// Steam shortcut still starts a Steam that takes over the machine. Every change is recorded in
+    /// steam-shim-backup.json and can be undone. See docs/design/steam-shim.md.
+    /// </summary>
+    public bool SteamShimEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Also route the console user's Steam through the shim. A plain Steam on the console makes a
+    /// seat's Steam step aside, or is itself ended by it, so isolation that leaves the console out
+    /// does not isolate anything. The shared Steam shortcuts are edited either way, because they are
+    /// shared with the console.
+    /// </summary>
+    public bool SteamShimIncludeConsole { get; set; } = true;
+
+    /// <summary>
+    /// How long a supervised Steam launch may take to report that its hook is in place, in
+    /// seconds. The wait holds the seat's lifecycle gate, so other operations on that seat queue
+    /// behind it; a shorter value fails a stuck launch sooner, a longer one suits a slow host.
+    /// Read through <see cref="UsableSteamIsolationReadyTimeout"/>, which keeps it in range.
+    /// </summary>
+    public int SteamIsolationReadyTimeoutSeconds { get; set; } = 180;
+
+    /// <summary><see cref="SteamIsolationReadyTimeoutSeconds"/> limited to 10 s .. 15 min, so a
+    /// typo cannot make every isolated launch fail at once or hold a seat for hours.</summary>
+    public TimeSpan UsableSteamIsolationReadyTimeout =>
+        TimeSpan.FromSeconds(Math.Clamp(SteamIsolationReadyTimeoutSeconds, 10, 900));
+
+    // Delay after the client-connect event before launching the apps, giving Apollo
+    // a moment to create the virtual controller so the apps enumerate it at startup.
+    public int LaunchOnConnectDelayMs { get; set; } = 4_000;
+
+    // Kill the launched apps when the Moonlight client disconnects. When false,
+    // the apps stay running and are reused on the next connect (no relaunch while
+    // still alive). Single-instance launchers like Steam tolerate either setting.
+    public bool KillLaunchOnConnectAppsOnDisconnect { get; set; } = false;
+
+    // ── Timeouts ─────────────────────────────────────────────────────
+    public int SessionConnectTimeoutMs { get; set; } = 15_000;
+    public int ProcessLaunchTimeoutMs { get; set; } = 10_000;
+    public int HealthCheckIntervalMs { get; set; } = 5_000;
+
+    /// <summary>
+    /// How long <c>ApolloReadiness.WaitAsync</c> polls a freshly-started seat's Apollo for its
+    /// serverinfo API before giving up. Default 90 since 0.3.9 (was 30, the value of
+    /// <see cref="Streaming.ApolloReadiness.StartupTimeout"/>).
+    ///
+    /// Issue #96: a provisioning failure anywhere in <c>SeatManager.ProvisionSeatAsync</c> tears
+    /// the seat down immediately (<c>TeardownSeatInternalAsync</c> in the catch block), including
+    /// the Windows session itself - so this is the ONE thing standing between "Apollo never came
+    /// up" and a long, undisturbed observation window for whatever kept it from coming up.
+    /// Widening this alongside <see cref="DiagnoseInputDesktopReadiness"/> and a matching
+    /// <see cref="InputDesktopReadinessProbeSeconds"/> is how to find out whether a given failure
+    /// is a slow race (resolves given enough patience) or a true deadlock (does not, no matter how
+    /// long provisioning is willing to wait) - the real provisioning flow gets to run that long
+    /// instead of being cut off at 30s regardless of what the probe itself observes.
+    /// </summary>
+    /// 0.3.9: raised to 90 s. When several seats are restored at boot, Apollo's encoder probe
+    /// (NVENC/AV1/10-bit tests) measured 39 s on the lab Quadro M4000 and the seat was torn down
+    /// just before Apollo answered. A healthy Apollo still answers within seconds.
+    public int ApolloReadinessTimeoutSeconds { get; set; } = 90;
+
+    /// <summary>
+    /// Issue #96. Before starting a seat's Apollo, wait up to this many seconds for the seat
+    /// session's input desktop to be openable and stay openable (<see cref="InputDesktopStableMs"/>).
+    /// Apollo's capture setup fails once if the desktop is denied and never retries, while the
+    /// seat would still report Ready. A third-party logon task (reported: ASUS Armoury Crate) can
+    /// hold the desktop for about two minutes. On timeout Apollo is started anyway, as before,
+    /// with a warning. 0 disables the wait.
+    /// </summary>
+    public int WaitForInputDesktopSeconds { get; set; } = 180;
+
+    /// <summary>How long the input desktop must stay openable before Apollo is started.</summary>
+    public int InputDesktopStableMs { get; set; } = 3000;
+
+    // ── Shared game library ──────────────────────────────────────────
+    // Create a shared games/ROMs location all seat accounts can read/write, so a Steam game
+    // installed by one seat's account is not re-downloaded by another owning account, and ROMs
+    // live in one place. Creates {SharedGameLibraryDir}\SteamLibrary and \ROMs at startup and
+    // grants BUILTIN\Users Modify. Point each seat's Steam at the SteamLibrary folder manually.
+    public bool EnableSharedGameLibrary { get; set; } = true;
+    public string SharedGameLibraryDir { get; set; } = @"C:\MultiSeatGames";
+
+    // ── Emulator netplay ─────────────────────────────────────────────
+    // Assign each seat a deterministic, collision-free netplay port from its own port block
+    // (seat.PortBase + Constants.OffsetRetroArchNetplay) and open it in the firewall. Seats
+    // netplay each other over loopback (127.0.0.1:<host-seat-port>).
+    public bool EnableEmulatorNetplay { get; set; } = true;
+
+    // Opt-in: seed each seat user's retroarch.cfg with its netplay port + the shared ROM dir.
+    // Off by default because it writes into a user-profile / emulator config file.
+    public bool SeedRetroArchNetplayConfig { get; set; } = false;
+
+    // Override for the seat's RetroArch config path. Empty → auto-detect
+    // C:\Users\{AccountName}\AppData\Roaming\RetroArch\retroarch.cfg.
+    public string RetroArchConfigPath { get; set; } = string.Empty;
+
+    // ── Update notifications ─────────────────────────────────────────
+    /// <summary>
+    /// Ask GitHub's public releases API whether newer MultiSeat, ApolloVibe and MoonlightVibe
+    /// releases exist, and show the answer in the dashboard. Default false: this is the only
+    /// internet connection the service would make, so it is opt-in.
+    /// It sends an unauthenticated GET to api.github.com with a generic User-Agent and nothing
+    /// else - no version, host name, user name or seat data. It never downloads or installs
+    /// anything. Set in appsettings.local.json, or turn it on from the dashboard System page.
+    /// </summary>
+    public bool UpdateCheckEnabled { get; set; } = false;
+
+    /// <summary>Hours between checks. Clamped to 1..168. Ignored while UpdateCheckEnabled is false.</summary>
+    public int UpdateCheckIntervalHours { get; set; } = Shared.Constants.DefaultUpdateCheckIntervalHours;
+
+    // ── Rebuild ───────────────────────────────────────────────────────
+    // Absolute path to the repo root. Required for the dashboard Rebuild button.
+    // Example: C:\MultiSeat-Development
+    public string SourceDir { get; set; } = string.Empty;
+}
+
+/// <summary>
+/// Where a seat's game audio is rendered, and therefore what Apollo captures.
+/// </summary>
+public enum AudioMode
+{
+    /// <summary>
+    /// Seats render onto the HOST's audio subsystem (RDP audiomode:i:1) and each seat gets a
+    /// dedicated host-side virtual cable (VB-CABLE / VoiceMeeter) that Apollo names as its
+    /// virtual_sink. Requires those cables installed — one per seat, which caps seats at 4.
+    ///
+    /// Known limitation, and the reason PerSession exists: every seat shares the host's single
+    /// audio subsystem, so an active seat suspends the console session's own playback and its
+    /// audio leaks onto the console's physical output (issues #10, #12). No amount of
+    /// default-device juggling fixes that — there is one global default and one shared endpoint.
+    ///
+    /// Supports the Moonlight → game microphone path (stream_mic).
+    /// </summary>
+    SharedHost,
+
+    /// <summary>
+    /// Each seat keeps its audio INSIDE its own RDP session (audiomode:i:0). Windows gives every
+    /// session a private "Remote Audio" render endpoint and makes it that session's default, so
+    /// games play to it automatically and Apollo loopback-captures it from within the session.
+    /// The host's physical devices are never a render target for any seat, which is what makes
+    /// this isolation real rather than negotiated.
+    ///
+    /// Needs NO virtual audio cables — no VB-CABLE, no VoiceMeeter — and therefore has no
+    /// 4-seat audio ceiling. The redirected stream still reaches the console-side mstsc, so
+    /// SessionLauncher.MuteMstscAudio becomes load-bearing here: it is what stops seat audio
+    /// playing out of the host's speakers.
+    ///
+    /// Two hard-won rules, both verified in the field before we shipped this:
+    ///   - Do NOT name the endpoint. Writing it to audio_sink makes Apollo re-role it; writing
+    ///     it to virtual_sink makes Apollo rewrite its wave format, which breaks the endpoint
+    ///     for every loopback client including Apollo itself. Leave both keys unset and Apollo
+    ///     simply takes the session default, which is already the endpoint we want.
+    ///   - Client-side "Play audio on host PC" must be ON (the opposite of SharedHost). That is
+    ///     safe here because the "host" of a redirected session IS the seat's own session.
+    ///
+    /// COST: no microphone. A session that keeps its own audio cannot see the host's Steam
+    /// Streaming Microphone, so stream_mic is written disabled. Game audio out works; the
+    /// Moonlight → game mic path does not. Installs that need the mic should stay on SharedHost.
+    /// </summary>
+    PerSession,
+}
+
+/// <summary>
+/// One app to launch into a seat session when a Moonlight client connects.
+/// Configured under MultiSeat:LaunchOnConnect in appsettings.json.
+/// </summary>
+public sealed class LaunchOnConnectApp
+{
+    /// <summary>Absolute path to the executable (e.g. Steam.exe).</summary>
+    public string Path { get; set; } = string.Empty;
+
+    /// <summary>Optional command-line arguments (e.g. "-bigpicture").</summary>
+    public string? Arguments { get; set; }
+
+    /// <summary>Optional working directory; null inherits the launcher default.</summary>
+    public string? WorkingDirectory { get; set; }
+}

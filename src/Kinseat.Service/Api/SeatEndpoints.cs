@@ -1,0 +1,552 @@
+using System.Text.Json;
+using Microsoft.AspNetCore.Mvc;
+using MultiSeat.Service.Configuration;
+using MultiSeat.Service.Sessions;
+using MultiSeat.Shared.Models;
+
+namespace MultiSeat.Service.Api;
+
+public sealed record PairingRequest(string? Pin, string? Name);
+
+public static class SeatEndpoints
+{
+    public static void Map(WebApplication app)
+    {
+        var group = app.MapGroup("/api/seats").WithTags("Seats");
+
+        group.MapGet("/", (SeatManager mgr) =>
+            Results.Ok(mgr.GetAllSeats()));
+
+        group.MapGet("/{id:guid}", (Guid id, SeatManager mgr) =>
+        {
+            var seat = mgr.GetSeat(id);
+            return seat is null ? Results.NotFound() : Results.Ok(seat);
+        });
+
+        group.MapPost("/", CreateSeatAsync);
+
+        group.MapPost("/{id:guid}/launch",
+            async (Guid id, LaunchAppRequest request, SeatManager mgr, CancellationToken ct) =>
+            {
+                var seat = mgr.GetSeat(id);
+                if (seat is null)
+                    return Results.NotFound();
+
+                try
+                {
+                    await mgr.LaunchAppInSeatAsync(id, request, ct);
+                    return Results.Ok(new { status = "launched" });
+                }
+                catch (InvalidOperationException ex)
+                {
+                    return ApiErrors.ToResult(ex);
+                }
+            });
+
+        group.MapDelete("/{id:guid}", async (Guid id, SeatManager mgr, CancellationToken ct) =>
+        {
+            if (mgr.GetSeat(id) is null)
+                return Results.NotFound();
+
+            await DeleteSeatAsync(id, mgr, ct);
+            return Results.NoContent();
+        });
+
+        // ── Per-seat service management ────────────────────────────────
+
+        group.MapGet("/{id:guid}/services", async (Guid id, SeatManager mgr, CancellationToken ct) =>
+        {
+            if (mgr.GetSeat(id) is null)
+                return Results.NotFound();
+            return Results.Ok(await mgr.GetSeatServicesAsync(id, ct));
+        });
+
+        group.MapPost("/{id:guid}/apollo/stop", async (Guid id, SeatManager mgr) =>
+        {
+            if (mgr.GetSeat(id) is null)
+                return Results.NotFound();
+            try
+            {
+                await mgr.StopApollo(id);
+                return Results.Ok(new { status = "stopped" });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return ApiErrors.ToResult(ex);
+            }
+        });
+
+        group.MapPost("/{id:guid}/apollo/start",
+            async (Guid id, SeatManager mgr, CancellationToken ct) =>
+            {
+                if (mgr.GetSeat(id) is null)
+                    return Results.NotFound();
+                try
+                {
+                    await mgr.StartApolloAsync(id, ct);
+                    return Results.Ok(new { status = "started" });
+                }
+                catch (InvalidOperationException ex)
+                {
+                    return ApiErrors.ToResult(ex);
+                }
+            });
+
+        group.MapPost("/{id:guid}/apollo/restart",
+            async (Guid id, SeatManager mgr, CancellationToken ct) =>
+            {
+                if (mgr.GetSeat(id) is null)
+                    return Results.NotFound();
+                try
+                {
+                    await mgr.RestartApolloAsync(id, ct);
+                    return Results.Ok(new { status = "restarted" });
+                }
+                catch (InvalidOperationException ex)
+                {
+                    return ApiErrors.ToResult(ex);
+                }
+            });
+
+        group.MapPost("/{id:guid}/audio/reset", async (Guid id, SeatManager mgr) =>
+        {
+            if (mgr.GetSeat(id) is null)
+                return Results.NotFound();
+            try
+            {
+                await mgr.ResetAudioAsync(id);
+                return Results.Ok(new { status = "reset" });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return ApiErrors.ToResult(ex);
+            }
+        });
+
+        group.MapPost("/{id:guid}/display/reset",
+            async (Guid id, SeatManager mgr, CancellationToken ct) =>
+            {
+                if (mgr.GetSeat(id) is null)
+                    return Results.NotFound();
+                try
+                {
+                    await mgr.ResetDisplayAsync(id, ct);
+                    return Results.Ok(new { status = "reset" });
+                }
+                catch (InvalidOperationException ex)
+                {
+                    return ApiErrors.ToResult(ex);
+                }
+            });
+
+        group.MapPost("/{id:guid}/controller/reset", async (Guid id, SeatManager mgr) =>
+        {
+            if (mgr.GetSeat(id) is null)
+                return Results.NotFound();
+            try
+            {
+                await mgr.ResetControllerAsync(id);
+                return Results.Ok(new { status = "reset" });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return ApiErrors.ToResult(ex);
+            }
+        });
+
+        // ── Presets ────────────────────────────────────────────────────
+
+        group.MapGet("/presets", (SeatPresetStore presets) =>
+            Results.Ok(presets.GetAll()));
+
+        group.MapPut("/{id:guid}/autostart",
+            (Guid id, AutoStartRequest req, SeatManager mgr, SeatPresetStore presets) =>
+            {
+                var seat = mgr.GetSeat(id);
+                if (seat is null) return Results.NotFound();
+
+                SetAutoStart(seat, req.Enabled, presets);
+
+                return Results.Ok(new { autoStart = seat.AutoStart });
+            });
+
+        group.MapPost("/{id:guid}/session-reconnect",
+            async (Guid id, SeatManager mgr, SessionLauncher sessionLauncher,
+                   Sessions.SeatLifecycleGate lifecycleGate,
+                   ILoggerFactory loggerFactory, CancellationToken ct) =>
+            {
+                var seat = mgr.GetSeat(id);
+                if (seat is null)
+                    return Results.NotFound();
+
+                // Pass the seat's geometry: if the session has to be recreated rather than
+                // reattached, it must come back at the seat's own size, not inherit the
+                // console desktop's.
+                //
+                // And keep the id it answers with. A recreated session is a NEW session,
+                // and everything that acts on this seat afterwards reads SessionId:
+                // ProcessInjector, the health check, display isolation. Dropped, they all
+                // keep aiming at the session that just went away — apollo/start fails with
+                // 500 and the seat can never come back.
+                seat.SessionId = await sessionLauncher.LaunchSessionAsync(
+                    seat.AccountName, ct, mgr.GeometryFor(seat));
+
+                // The health check parks a seat in Error when its session dies, and nothing
+                // ever takes it out again. Leave it there and the checks that would restart
+                // Apollo are skipped, so the seat stays broken although it now has a live
+                // session. Hand it back to the health check in the state it is actually in.
+                if (seat.Status == SeatStatus.Error)
+                {
+                    seat.TransitionTo(SeatStatus.Ready,
+                        loggerFactory.CreateLogger("MultiSeat.Service.Api.SeatEndpoints"));
+                    seat.ErrorMessage = null;
+                }
+
+                return Results.Ok(new { sessionId = seat.SessionId, message = "Session reconnected" });
+            });
+
+        // Change a live seat's resolution. The seat streams its RDP session surface, whose size
+        // only mstsc can set, so this takes the session down and brings it back at the new size.
+        group.MapPost("/{id:guid}/resolution",
+            async (Guid id, ResolutionRequest req, SeatManager mgr,
+                   SeatPresetStore presets, CancellationToken ct) =>
+            {
+                if (mgr.GetSeat(id) is null)
+                    return Results.NotFound();
+                try
+                {
+                    await mgr.SetResolutionAsync(id, req.Width, req.Height, presets, ct);
+                    var seat = mgr.GetSeat(id);
+                    return Results.Ok(new
+                    {
+                        width = seat?.Width,
+                        height = seat?.Height,
+                        scaleFactor = seat?.ScaleFactor,
+                        appliedScaleFactor = seat?.AppliedScaleFactor,
+                        scaleMismatch = seat?.ScaleMismatch,
+                        scaleNote = seat?.ScaleNote,
+                        sessionId = seat?.SessionId,
+                    });
+                }
+                catch (ArgumentException ex)
+                {
+                    // An unusable resolution genuinely IS a malformed request, so 400 is right
+                    // here and this one deliberately does not go through ApiErrors.
+                    return Results.BadRequest(new { error = ex.Message });
+                }
+                catch (InvalidOperationException ex)
+                {
+                    return ApiErrors.ToResult(ex);
+                }
+            });
+
+        // Set or clear a live seat's DPI scale override (issue #70). The scale is baked into the
+        // same Default.rdp as the desktop size, so this reconnects the session the way a
+        // resolution change does. Body: { "scaleFactor": 200 }, or { "scaleFactor": null } to go
+        // back to the host default or the width heuristic.
+        group.MapPost("/{id:guid}/scale", SetScaleAsync);
+
+        // Diagnostic: what advanced colour (HDR) does this seat's session advertise, and what is
+        // actually active? Answers whether the RdpIdd target inside a seat is HDR-capable at all
+        // — the premise the terminal-session HDR work in issue #15 rests on. Runs the probe
+        // inside the seat's own session, because display APIs see nothing from Session 0.
+        group.MapGet("/{id:guid}/diagnostics/advanced-color",
+            async (Guid id, bool? enable, SeatManager mgr, SessionLauncher launcher, CancellationToken ct) =>
+            {
+                var seat = mgr.GetSeat(id);
+                if (seat is null) return Results.NotFound();
+                if (seat.SessionId < 0)
+                    return Results.BadRequest(new { error = "Seat has no session." });
+
+                // ProgramData rather than %TEMP%: the helper runs as the seat user and the
+                // service reads the result back as SYSTEM.
+                var outFile = Path.Combine(
+                    @"C:\ProgramData\MultiSeat", $"ms_advcolor_{Guid.NewGuid():N}.json");
+                var exe = Path.Combine(AppContext.BaseDirectory, "Kinseat.Service.exe");
+
+                try
+                {
+                    // ?enable=true asks Windows to turn Advanced Color on before re-reading, which
+                    // distinguishes "Windows refused" from "nobody ever asked".
+                    var arg = enable == true ? " enable" : "";
+                    launcher.RunHelperInSeatSession(
+                        seat.SessionId, seat.AccountName, $"\"{exe}\" --advanced-color \"{outFile}\"{arg}");
+
+                    // Fire-and-forget launch, so wait for the artefact rather than an exit code.
+                    for (var i = 0; i < 40 && !File.Exists(outFile); i++)
+                        await Task.Delay(200, ct);
+
+                    if (!File.Exists(outFile))
+                        return Results.Problem("The probe did not produce a result in the seat session.");
+
+                    using var doc = JsonDocument.Parse(await File.ReadAllTextAsync(outFile, ct));
+                    return Results.Ok(doc.RootElement.Clone());
+                }
+                catch (Exception ex)
+                {
+                    return Results.Problem(ex.Message);
+                }
+                finally
+                {
+                    try { File.Delete(outFile); } catch { /* best effort */ }
+                }
+            });
+
+        // Issue #93: what scale is this seat's session ACTUALLY running at? Reads it from inside
+        // the session (per monitor, plus the system DPI) and returns it beside the scale
+        // MultiSeat asked for. Everything else the API reports about scale is the request; this
+        // is the only answer from the session itself. Run it again after a client connects to see
+        // the scale of Apollo's virtual display, which the reading taken at reconnect predates.
+        group.MapGet("/{id:guid}/diagnostics/applied-scale",
+            async (Guid id, SeatManager mgr, CancellationToken ct) =>
+            {
+                if (mgr.GetSeat(id) is null) return Results.NotFound();
+                try
+                {
+                    var (seat, verdict, observation) = await mgr.CheckAppliedScaleAsync(id, ct);
+                    return Results.Ok(new
+                    {
+                        intendedScaleFactor = seat.ScaleFactor,
+                        intendedSource = seat.ScaleFactorSource,
+                        appliedScaleFactor = seat.AppliedScaleFactor,
+                        verdict = verdict.ToString(),
+                        scaleMismatch = seat.ScaleMismatch,
+                        scaleNote = seat.ScaleNote,
+                        sessionId = seat.SessionId,
+                        systemScaleFactor = observation?.SystemPercent,
+                        error = observation is null ? "The helper produced no result in the seat session." : observation.Error,
+                        monitors = observation?.Monitors.Select(m => new
+                        {
+                            gdiName = m.GdiName,
+                            adapter = m.Adapter,
+                            primary = m.Primary,
+                            widthPx = m.WidthPx,
+                            heightPx = m.HeightPx,
+                            effectiveScaleFactor = m.EffectivePercent,
+                            storedScaleFactor = m.StoredPercent,
+                        }),
+                    });
+                }
+                catch (InvalidOperationException ex)
+                {
+                    return ApiErrors.ToResult(ex);
+                }
+            });
+
+        // Issue #96: start an input-desktop readiness probe inside an ALREADY-LIVE seat, on
+        // demand, so a mid-stream desktop-switch (a UAC prompt, a third-party elevation task) can
+        // be measured with the same instrument that MultiSeat:DiagnoseInputDesktopReadiness
+        // auto-launches at provision time. That auto-launch only ever runs once, right after the
+        // session is created — there was no way to point the probe at a seat that is already
+        // Ready, which is exactly what testing a mid-capture switch needs.
+        //
+        // Fire-and-forget, like advanced-color's helper launch, but NOT awaited for a result file
+        // the way advanced-color is: a readiness probe runs for up to "seconds" (default 90), far
+        // longer than advanced-color's quick read, so this returns immediately with the output
+        // path rather than blocking the request for the probe's whole duration.
+        group.MapPost("/{id:guid}/diagnostics/input-desktop-probe",
+            (Guid id, int? seconds, SeatManager mgr, SessionLauncher launcher) =>
+            {
+                var seat = mgr.GetSeat(id);
+                if (seat is null) return Results.NotFound();
+                if (seat.SessionId < 0)
+                    return Results.BadRequest(new { error = "Seat has no session." });
+
+                var probeSeconds = seconds is > 0 ? seconds.Value : 90;
+
+                // Suffixed with a tick count, not just the seat id, so this can be called more
+                // than once against the same seat (e.g. once at startup, again mid-stream)
+                // without each run overwriting the last one's file.
+                var outFile = Path.Combine(
+                    @"C:\ProgramData\MultiSeat",
+                    $"ms_inputdesktop_readiness_ondemand_{id:N}_{DateTime.UtcNow.Ticks}.jsonl");
+                var exe = Path.Combine(AppContext.BaseDirectory, "Kinseat.Service.exe");
+
+                _ = Task.Run(() =>
+                {
+                    try
+                    {
+                        launcher.RunHelperInSeatSession(
+                            seat.SessionId, seat.AccountName,
+                            $"\"{exe}\" --input-desktop-probe \"{outFile}\" {probeSeconds}");
+                    }
+                    catch
+                    {
+                        // Best-effort: there is no request left to report to by the time this
+                        // runs. A missing output file is the caller's signal that it failed.
+                    }
+                });
+
+                return Results.Ok(new { outputFile = outFile, seconds = probeSeconds });
+            });
+
+        // ── Paired client management ───────────────────────────────────
+
+        group.MapPost("/{id:guid}/pair", async (Guid id, PairingRequest req, SeatManager mgr, CancellationToken ct) =>
+        {
+            if (!Streaming.ApolloPairingClient.Valid(req.Pin, req.Name))
+                return Results.BadRequest(new { code = "invalid_params", message = "PIN ou nom d'appareil invalide" });
+            if (mgr.GetSeat(id) is null) return Results.NotFound();
+            try
+            {
+                await mgr.SubmitPairingPinAsync(id, req.Pin!, req.Name!, ct);
+                return Results.Ok(new { ok = true });
+            }
+            catch (InvalidOperationException ex) { return ApiErrors.ToResult(ex); }
+        });
+
+        group.MapGet("/{id:guid}/clients", (Guid id, SeatManager mgr) =>
+        {
+            if (mgr.GetSeat(id) is null) return Results.NotFound();
+            return Results.Ok(mgr.GetPairedClients(id));
+        });
+
+        group.MapDelete("/{id:guid}/clients", (Guid id, SeatManager mgr) =>
+        {
+            if (mgr.GetSeat(id) is null) return Results.NotFound();
+            mgr.UnpairAllClients(id);
+            return Results.NoContent();
+        });
+
+        group.MapDelete("/{id:guid}/clients/{name}", (Guid id, string name, SeatManager mgr) =>
+        {
+            if (mgr.GetSeat(id) is null) return Results.NotFound();
+            var removed = mgr.UnpairClient(id, name);
+            return removed ? Results.NoContent() : Results.NotFound();
+        });
+
+        group.MapPost("/{id:guid}/nvenc-preset",
+            async (Guid id, NvencPresetRequest req, SeatManager mgr,
+                   SeatPresetStore presets, CancellationToken ct) =>
+            {
+                if (mgr.GetSeat(id) is null)
+                    return Results.NotFound();
+                try
+                {
+                    await mgr.SetNvencPresetAsync(id, req.Preset, presets, ct);
+                    return Results.Ok(new { preset = req.Preset.ToString() });
+                }
+                catch (InvalidOperationException ex)
+                {
+                    return ApiErrors.ToResult(ex);
+                }
+            });
+    }
+
+    internal static async Task DeleteSeatAsync(Guid id, SeatManager mgr, CancellationToken ct)
+    {
+        var seat = mgr.GetSeat(id) ?? throw new SeatNotFoundException();
+        await mgr.TeardownSeatAsync(id, ct);
+        mgr.RemovePublicDesktopDeny(seat.AccountName);
+    }
+
+    internal static async Task<SeatInfo> ProvisionValidatedAsync(
+        SeatRequest request, Func<SeatRequest, CancellationToken, Task<SeatInfo>> provision,
+        SeatPresetStore presets, CancellationToken ct)
+    {
+        if (!ApiInputValidation.IsValidAccountName(request.AccountName))
+            throw new ArgumentException("Invalid account name.");
+        if (ApiInputValidation.ScaleFactorError(request.ScaleFactor) is not null)
+            throw new ArgumentException("Invalid scale factor.");
+
+        var seat = await provision(request, ct);
+        if (request.AutoStart is { } autoStart)
+            SetAutoStart(seat, autoStart, presets);
+        else
+            seat.AutoStart = presets.GetByAccount(seat.AccountName)?.AutoStart == true;
+        return seat;
+    }
+
+    /// <summary>
+    /// POST /api/seats. A method rather than a lambda so tests can call the real handler.
+    /// </summary>
+    internal static Task<IResult> CreateSeatAsync(
+        SeatRequest request, SeatManager mgr, SeatPresetStore presets, CancellationToken ct) =>
+        // A lambda rather than the method group: the group would dereference mgr here, before
+        // the validation below has had its chance to refuse the request.
+        CreateSeatCoreAsync(request, (r, c) => mgr.ProvisionSeatAsync(r, c), presets, ct);
+
+    /// <summary>
+    /// The create handler with provisioning passed in, so tests can check what happens around a
+    /// provision (validation first, autostart saved only after success) without a Windows session.
+    /// </summary>
+    internal static async Task<IResult> CreateSeatCoreAsync(
+        SeatRequest request,
+        Func<SeatRequest, CancellationToken, Task<SeatInfo>> provision,
+        SeatPresetStore presets,
+        CancellationToken ct)
+    {
+        if (!ApiInputValidation.IsValidAccountName(request.AccountName))
+            return ApiInputValidation.AccountNameError();
+
+        // Checked before the seat manager is touched, so a scale RDP would ignore never starts
+        // a provision and never reaches Default.rdp.
+        if (ApiInputValidation.ScaleFactorError(request.ScaleFactor) is { } scaleError)
+            return scaleError;
+
+        try
+        {
+            var seat = await ProvisionValidatedAsync(request, provision, presets, ct);
+            return Results.Created($"/api/seats/{seat.Id}", seat);
+        }
+        // No ArgumentException catch on purpose: the scale is validated above, and a broad catch
+        // here would also turn an unrelated ArgumentNullException deep in provisioning into a 400
+        // that blames the caller.
+        catch (InvalidOperationException ex)
+        {
+            return ApiErrors.ToResult(ex);
+        }
+    }
+
+    /// <summary>
+    /// Turn a live seat's autostart on or off. The one place this is done, so the toggle on the
+    /// seat card (PUT /api/seats/{id}/autostart) and the choice made at creation (POST
+    /// /api/seats) cannot drift apart. On saves the seat's full preset through
+    /// <see cref="SeatPreset.ForAutoStart"/>; off deletes the account's preset.
+    /// </summary>
+    internal static void SetAutoStart(SeatInfo seat, bool enabled, SeatPresetStore presets)
+    {
+        seat.AutoStart = enabled;
+
+        if (enabled)
+            presets.Upsert(SeatPreset.ForAutoStart(seat));
+        else
+            presets.DeleteByAccount(seat.AccountName);
+    }
+
+    /// <summary>
+    /// POST /api/seats/{id}/scale. A method rather than a lambda so tests can call the real
+    /// handler.
+    /// </summary>
+    internal static async Task<IResult> SetScaleAsync(
+        Guid id, ScaleFactorRequest req, SeatManager mgr,
+        SeatPresetStore presets, CancellationToken ct)
+    {
+        // Before the seat lookup: a value mstsc would ignore is a bad request whatever the seat.
+        if (ApiInputValidation.ScaleFactorError(req.ScaleFactor) is { } scaleError)
+            return scaleError;
+
+        if (mgr.GetSeat(id) is null)
+            return Results.NotFound();
+        try
+        {
+            await mgr.SetScaleFactorAsync(id, req.ScaleFactor, presets, ct);
+            var seat = mgr.GetSeat(id);
+            return Results.Ok(new
+            {
+                scaleFactor = seat?.ScaleFactor,
+                scaleFactorSource = seat?.ScaleFactorSource,
+                scaleFactorOverride = seat?.ScaleFactorOverride,
+                appliedScaleFactor = seat?.AppliedScaleFactor,
+                scaleMismatch = seat?.ScaleMismatch,
+                scaleNote = seat?.ScaleNote,
+                sessionId = seat?.SessionId,
+            });
+        }
+        // As in CreateSeatAsync, the scale was validated above; no broad ArgumentException catch.
+        catch (InvalidOperationException ex)
+        {
+            return ApiErrors.ToResult(ex);
+        }
+    }
+}

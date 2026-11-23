@@ -70,7 +70,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$exe = 'C:\Program Files\MultiSeat\MultiSeat.Service.exe'
+$exe = 'C:\Program Files\MultiSeat\Kinseat.Service.exe'
 $localConfigPath = 'C:\Program Files\MultiSeat\appsettings.local.json'
 
 function Refuse {

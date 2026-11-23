@@ -414,7 +414,7 @@ mod tests {
         assert_eq!(status(&f, "ports"), Statut::Ok);
         // Le service Kinseat déjà installé n'est pas un conflit.
         f.ports[0].numero = 9550;
-        f.ports[0].processus = Some("MultiSeat.Service.exe".into());
+        f.ports[0].processus = Some("Kinseat.Service.exe".into());
         assert_eq!(status(&f, "ports"), Statut::Ok);
     }
     #[test]

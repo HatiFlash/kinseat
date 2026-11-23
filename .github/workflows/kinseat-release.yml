@@ -20,20 +20,20 @@ jobs:
 
       - name: Build x64 and x86 native helpers
         shell: pwsh
-        run: ./src/MultiSeat.SteamIsolation/build.ps1
+        run: ./src/Kinseat.SteamIsolation/build.ps1
 
       - name: Upload native helpers
         uses: actions/upload-artifact@v6
         with:
           name: steam-isolation-binaries
           path: |
-            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamLauncher.exe
-            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamLauncher32.exe
-            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamHook.dll
-            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamHook32.dll
-            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamShim.exe
-            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.GameFiles.dll
-            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.GameFiles32.dll
+            src/Kinseat.SteamIsolation/artifacts/Kinseat.SteamLauncher.exe
+            src/Kinseat.SteamIsolation/artifacts/Kinseat.SteamLauncher32.exe
+            src/Kinseat.SteamIsolation/artifacts/Kinseat.SteamHook.dll
+            src/Kinseat.SteamIsolation/artifacts/Kinseat.SteamHook32.dll
+            src/Kinseat.SteamIsolation/artifacts/Kinseat.SteamShim.exe
+            src/Kinseat.SteamIsolation/artifacts/Kinseat.GameFiles.dll
+            src/Kinseat.SteamIsolation/artifacts/Kinseat.GameFiles32.dll
           if-no-files-found: error
 
   host-windows-x64:
@@ -53,7 +53,7 @@ jobs:
         with:
           node-version: '20'
           cache: npm
-          cache-dependency-path: src/MultiSeat.Dashboard/package-lock.json
+          cache-dependency-path: src/Kinseat.Dashboard/package-lock.json
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -65,17 +65,17 @@ jobs:
           "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Publish MultiSeat.Service (win-x64 self-contained)
-        run: dotnet publish src/MultiSeat.Service -c Release -r win-x64 --self-contained -o publish/MultiSeat
+        run: dotnet publish src/Kinseat.Service -c Release -r win-x64 --self-contained -o publish/MultiSeat
 
       - name: Build Dashboard (wwwroot)
-        working-directory: src/MultiSeat.Dashboard
+        working-directory: src/Kinseat.Dashboard
         run: |
           npm ci
           npm run build
 
       - name: Stage Dashboard into wwwroot
         shell: pwsh
-        run: Copy-Item src/MultiSeat.Dashboard/dist publish/MultiSeat/wwwroot -Recurse -Force
+        run: Copy-Item src/Kinseat.Dashboard/dist publish/MultiSeat/wwwroot -Recurse -Force
 
       - name: Download SteamIsolation helpers
         uses: actions/download-artifact@v6

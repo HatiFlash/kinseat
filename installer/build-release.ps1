@@ -14,8 +14,8 @@ $payload=Join-Path $dist 'payload'
 $zip=Join-Path $OutDir 'host-payload-0.3.18.zip'
 if ((Test-Path -LiteralPath $dist) -or (Test-Path -LiteralPath $zip)) { throw 'Sortie existante : suppression manuelle requise' }
 foreach($file in @($HostExe,$AgentExe)) { if(-not (Test-Path -LiteralPath $file -PathType Leaf)){throw "Binaire absent : $file"} }
-if(-not (Test-Path -LiteralPath (Join-Path $ServicePublishDir 'MultiSeat.Service.exe')) -or -not (Test-Path -LiteralPath (Join-Path $ServicePublishDir 'wwwroot/index.html'))) { throw 'Publication service incomplète' }
-foreach($name in @('MultiSeat.SteamLauncher.exe','MultiSeat.SteamHook.dll','MultiSeat.SteamHook32.dll','MultiSeat.GameFiles.dll','MultiSeat.GameFiles32.dll')) {
+if(-not (Test-Path -LiteralPath (Join-Path $ServicePublishDir 'Kinseat.Service.exe')) -or -not (Test-Path -LiteralPath (Join-Path $ServicePublishDir 'wwwroot/index.html'))) { throw 'Publication service incomplète' }
+foreach($name in @('Kinseat.SteamLauncher.exe','Kinseat.SteamHook.dll','Kinseat.SteamHook32.dll','Kinseat.GameFiles.dll','Kinseat.GameFiles32.dll')) {
     if(-not (Test-Path -LiteralPath (Join-Path $ServicePublishDir "SteamIsolation/$name") -PathType Leaf)) { throw "Publication isolation incomplète : $name" }
 }
 New-Item -ItemType Directory -Path (Join-Path $payload 'service') -Force | Out-Null
@@ -53,7 +53,7 @@ try {
         $file=Join-Path $payload $item.file
         if(-not (Test-Path -LiteralPath $file -PathType Leaf) -or (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne $item.sha256){throw "Manifeste incorrect : $($item.file)"}
     }
-    foreach($required in @('Install-Kinseat.ps1','Uninstall-Kinseat.ps1','MultiSession-Kinseat.ps1','rdpwrap-offsets.ini','service/MultiSeat.Service.exe','service/SteamIsolation/MultiSeat.GameFiles.dll','service/SteamIsolation/MultiSeat.GameFiles32.dll','kinseat.exe','kinseat-agent.exe')) {if(-not @($readback.artifacts | Where-Object { $_.file -eq $required -and $_.required }).Count){throw "Manquant : $required"}}
+    foreach($required in @('Install-Kinseat.ps1','Uninstall-Kinseat.ps1','MultiSession-Kinseat.ps1','rdpwrap-offsets.ini','service/Kinseat.Service.exe','service/SteamIsolation/Kinseat.GameFiles.dll','service/SteamIsolation/Kinseat.GameFiles32.dll','kinseat.exe','kinseat-agent.exe')) {if(-not @($readback.artifacts | Where-Object { $_.file -eq $required -and $_.required }).Count){throw "Manquant : $required"}}
     # .NET ZipFile écrit des séparateurs « / » (Compress-Archive 5.1 écrit des « \ »).
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [IO.Compression.ZipFile]::CreateFromDirectory($payload, $zip, [IO.Compression.CompressionLevel]::Optimal, $false)

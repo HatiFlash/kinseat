@@ -34,7 +34,7 @@ jobs:
   #
   # Its own job, on windows-2022, because build.ps1 asks for Visual Studio 2022 and
   # windows-latest is free to move to a newer Visual Studio. The same smoke tests that run on
-  # every push to src/MultiSeat.SteamIsolation run again here, so a shipped binary has passed
+  # every push to src/Kinseat.SteamIsolation run again here, so a shipped binary has passed
   # them, rather than relying on the last push having been green.
   steam-isolation:
     name: Build Steam isolation helpers (x64 and x86)
@@ -46,34 +46,34 @@ jobs:
 
       - name: Build launchers, hooks and the safe fixtures
         shell: pwsh
-        run: ./src/MultiSeat.SteamIsolation/build.ps1 -BuildFixture
+        run: ./src/Kinseat.SteamIsolation/build.ps1 -BuildFixture
 
       - name: Check native isolation policies
         shell: pwsh
         run: |
           foreach ($architecture in @('x64', 'Win32')) {
-            ctest --test-dir "src/MultiSeat.SteamIsolation/build-$architecture" -C Release --output-on-failure
+            ctest --test-dir "src/Kinseat.SteamIsolation/build-$architecture" -C Release --output-on-failure
             if ($LASTEXITCODE -ne 0) { throw "Policy checks failed for $architecture" }
           }
 
       - name: Check launch, restart, readiness, and cleanup
         shell: pwsh
-        run: ./src/MultiSeat.SteamIsolation/tests/LauncherSmoke.ps1
+        run: ./src/Kinseat.SteamIsolation/tests/LauncherSmoke.ps1
 
       - name: Check direct game environment and working directory
         shell: pwsh
-        run: ./src/MultiSeat.SteamIsolation/tests/GameLauncherSmoke.ps1
+        run: ./src/Kinseat.SteamIsolation/tests/GameLauncherSmoke.ps1
 
       - name: Require all five helper binaries
         shell: pwsh
         # Half a set is worse than none: the service picks the launcher and hook by the
         # architecture of the Steam it starts, so a missing one fails for one Steam only.
         run: |
-          $dir = 'src/MultiSeat.SteamIsolation/artifacts'
-          $names = @('MultiSeat.SteamLauncher.exe', 'MultiSeat.SteamLauncher32.exe',
-                     'MultiSeat.SteamHook.dll', 'MultiSeat.SteamHook32.dll',
-                     'MultiSeat.SteamShim.exe',
-                     'MultiSeat.GameFiles.dll', 'MultiSeat.GameFiles32.dll')
+          $dir = 'src/Kinseat.SteamIsolation/artifacts'
+          $names = @('Kinseat.SteamLauncher.exe', 'Kinseat.SteamLauncher32.exe',
+                     'Kinseat.SteamHook.dll', 'Kinseat.SteamHook32.dll',
+                     'Kinseat.SteamShim.exe',
+                     'Kinseat.GameFiles.dll', 'Kinseat.GameFiles32.dll')
           $missing = @($names | Where-Object { -not (Test-Path (Join-Path $dir $_)) })
           if ($missing.Count) { throw "build.ps1 did not produce: $($missing -join ', ')" }
           $names | ForEach-Object { Get-Item (Join-Path $dir $_) | Select-Object Name, Length | Format-Table -HideTableHeaders }
@@ -84,13 +84,13 @@ jobs:
           name: steam-isolation-binaries
           # Listed one by one so the test fixtures built beside them never reach the asset.
           path: |
-            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamLauncher.exe
-            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamLauncher32.exe
-            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamHook.dll
-            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamHook32.dll
-            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamShim.exe
-            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.GameFiles.dll
-            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.GameFiles32.dll
+            src/Kinseat.SteamIsolation/artifacts/Kinseat.SteamLauncher.exe
+            src/Kinseat.SteamIsolation/artifacts/Kinseat.SteamLauncher32.exe
+            src/Kinseat.SteamIsolation/artifacts/Kinseat.SteamHook.dll
+            src/Kinseat.SteamIsolation/artifacts/Kinseat.SteamHook32.dll
+            src/Kinseat.SteamIsolation/artifacts/Kinseat.SteamShim.exe
+            src/Kinseat.SteamIsolation/artifacts/Kinseat.GameFiles.dll
+            src/Kinseat.SteamIsolation/artifacts/Kinseat.GameFiles32.dll
           if-no-files-found: error
 
   release:
@@ -142,12 +142,12 @@ jobs:
 
       - name: Publish service (self-contained)
         run: >
-          dotnet publish src/MultiSeat.Service
+          dotnet publish src/Kinseat.Service
           -c Release -r win-x64 --self-contained
           -o publish/MultiSeat
 
       - name: Build dashboard
-        working-directory: src/MultiSeat.Dashboard
+        working-directory: src/Kinseat.Dashboard
         run: |
           npm ci
           npm run build
@@ -157,7 +157,7 @@ jobs:
         # install-service.ps1 puts the built dashboard in wwwroot beside the exe; the zip has
         # to match that layout exactly or the extract-based install serves nothing.
         run: |
-          $dist = "src/MultiSeat.Dashboard/dist"
+          $dist = "src/Kinseat.Dashboard/dist"
           if (-not (Test-Path $dist)) { throw "dashboard build produced no dist/ - refusing to ship a zip with no UI" }
           Copy-Item $dist "publish/MultiSeat/wwwroot" -Recurse -Force
 
@@ -191,7 +191,7 @@ jobs:
         # quietly stops existing.
         continue-on-error: true
         run: |
-          $src = "src/MultiSeat.InputHook"
+          $src = "src/Kinseat.InputHook"
           if (-not (Test-Path "$src/CMakeLists.txt")) {
             Write-Host "::warning::no InputHook CMakeLists.txt; skipping"
             exit 0
@@ -254,7 +254,7 @@ jobs:
           if (-not (Test-Path "$root/scripts/install-service.ps1")) { $problems += "scripts/install-service.ps1 missing - the asset cannot install itself" }
           if (-not (Test-Path "$root/scripts/lib/install-lib.ps1")) { $problems += "scripts/lib/install-lib.ps1 missing - install-service.ps1 dot-sources it and would fail on the first step" }
           if (-not (Test-Path "$root/prerequisites/install-prerequisites.ps1")) { $problems += "prerequisites/install-prerequisites.ps1 missing" }
-          if (-not (Test-Path "$root/MultiSeat.Service.exe")) { $problems += "MultiSeat.Service.exe missing" }
+          if (-not (Test-Path "$root/Kinseat.Service.exe")) { $problems += "Kinseat.Service.exe missing" }
           if (-not (Test-Path "$root/wwwroot/index.html"))    { $problems += "wwwroot/index.html missing (dashboard not staged)" }
           if (-not (Test-Path "$root/appsettings.json"))      { $problems += "appsettings.json missing" }
           # Self-contained means the runtime must be inside. If this is absent the zip would
@@ -262,7 +262,7 @@ jobs:
           if (-not (Test-Path "$root/hostfxr.dll"))           { $problems += "hostfxr.dll missing - build is NOT self-contained" }
           # The installer replaces the whole install folder, so the helpers have to ride in the
           # asset or an upgrade removes them. All five or nothing; see the steam-isolation job.
-          foreach ($n in @('MultiSeat.SteamLauncher.exe', 'MultiSeat.SteamLauncher32.exe', 'MultiSeat.SteamHook.dll', 'MultiSeat.SteamHook32.dll', 'MultiSeat.SteamShim.exe', 'MultiSeat.GameFiles.dll', 'MultiSeat.GameFiles32.dll')) {
+          foreach ($n in @('Kinseat.SteamLauncher.exe', 'Kinseat.SteamLauncher32.exe', 'Kinseat.SteamHook.dll', 'Kinseat.SteamHook32.dll', 'Kinseat.SteamShim.exe', 'Kinseat.GameFiles.dll', 'Kinseat.GameFiles32.dll')) {
             if (-not (Test-Path "$root/SteamIsolation/$n")) { $problems += "SteamIsolation/$n missing - an upgrade would remove the Steam isolation helpers" }
           }
           if ($problems.Count) {

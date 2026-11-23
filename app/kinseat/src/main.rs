@@ -1969,7 +1969,7 @@ impl Kinseat {
                     ui.set_width(440.0);
                     let free: Vec<String> = self.accounts.as_deref().unwrap_or_default().iter()
                         .filter(|a| a.is_managed && !a.has_seat).map(|a| a.username.clone()).collect();
-                    let max_body = (screen.height() - 170.0).max(220.0);
+                    let max_body = (screen.height() - 240.0).max(200.0);
                     egui::ScrollArea::vertical()
                         .id_salt("add-seat-scroll")
                         .max_height(max_body)

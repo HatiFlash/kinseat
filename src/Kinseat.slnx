@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="Kinseat.Service/Kinseat.Service.csproj" />
+  <Project Path="Kinseat.Shared/Kinseat.Shared.csproj" />
+  <Project Path="Kinseat.Tests/Kinseat.Tests.csproj" />
+</Solution>

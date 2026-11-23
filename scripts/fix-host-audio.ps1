@@ -77,7 +77,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$Exe         = 'C:\Program Files\MultiSeat\MultiSeat.Service.exe'
+$Exe         = 'C:\Program Files\MultiSeat\Kinseat.Service.exe'
 $script:CableInstId = $CableInstanceId   # resolved from the default endpoint when not given
 $script:ToneFile    = $ToneWav
 
@@ -87,7 +87,7 @@ function Write-Bad($t)  { Write-Host "  FAIL  $t" -ForegroundColor Red }
 function Write-Info($t) { Write-Host "  $t" -ForegroundColor Gray }
 
 if (-not (Test-Path $Exe)) {
-    throw "MultiSeat.Service.exe not found at $Exe - this script uses its audio instruments."
+    throw "Kinseat.Service.exe not found at $Exe - this script uses its audio instruments."
 }
 
 # ---- Tone generator ---------------------------------------------------------
