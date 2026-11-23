@@ -82,6 +82,11 @@ fn service_label(svc: &Service, installed_by_setup: bool) -> &'static str {
         (false, _) => "absent",
     }
 }
+fn is_home_edition(edition: &str) -> bool {
+    let lower = edition.to_ascii_lowercase();
+    lower.contains("home") || lower == "core" || lower.starts_with("core")
+}
+
 /// « Windows 11 Pro (build 26100) » : Windows 11 se déclare en version 10, on se fie au build.
 fn windows_label(f: &SystemFacts) -> String {
     let name = match (f.windows_major, f.build) {
@@ -90,9 +95,7 @@ fn windows_label(f: &SystemFacts) -> String {
         _ => "Windows",
     };
     let edition = match f.edition.as_deref() {
-        Some(e) if e.to_ascii_lowercase().contains("home") || e.eq_ignore_ascii_case("core") => {
-            " Famille"
-        }
+        Some(e) if is_home_edition(e) => " Famille",
         Some(e) if e.to_ascii_lowercase().contains("pro") => " Pro",
         Some(e)
             if e.to_ascii_lowercase().contains("enterprise")
@@ -129,7 +132,7 @@ pub fn evaluate(f: &SystemFacts) -> Vec<Check> {
         .is_none_or(|e| !e.to_ascii_lowercase().contains("server"));
     // Un build/une édition inconnu(e) ne prouve jamais la compatibilité.
     let os = match (f.windows_major, f.build, f.edition.as_deref()) {
-        (_, _, Some(e)) if e.to_ascii_lowercase().contains("home") => Statut::Bloquant,
+        (_, _, Some(e)) if is_home_edition(e) => Statut::Bloquant,
         (Some(10), Some(b), Some(e))
             if b >= 22631
                 && (e.to_ascii_lowercase().contains("pro")
@@ -302,7 +305,7 @@ pub fn evaluate(f: &SystemFacts) -> Vec<Check> {
         }
         .into(),
         "Sessions simultanées possibles",
-        "Sur Windows Pro, jouer à plusieurs en même temps peut nécessiter un composant multi-session (RDPWrap/TermWrap). Kinseat ne l'installe pas."
+        "Sur Windows Pro, jouer à plusieurs en même temps nécessite un composant multi-session (proposé à l'étape suivante)."
     );
     for (id, title, svc, installed_by_setup, advice) in [
         ("termservice", "Bureau à distance Windows", &f.term_service, false,
@@ -359,6 +362,14 @@ mod tests {
         assert_eq!(status(&f, "windows"), Statut::Attention);
         f.build = None;
         assert_eq!(status(&f, "windows"), Statut::Attention);
+    }
+    #[test]
+    fn windows_home_core_is_blocking() {
+        for edition in ["Core", "CoreSingleLanguage", "CoreN", "Home"] {
+            let mut f = base();
+            f.edition = Some(edition.into());
+            assert_eq!(status(&f, "windows"), Statut::Bloquant, "edition={edition}");
+        }
     }
     #[test]
     fn admin() {

@@ -75,7 +75,8 @@ jobs:
           $dir = 'src/MultiSeat.SteamIsolation/artifacts'
           $names = @('MultiSeat.SteamLauncher.exe', 'MultiSeat.SteamLauncher32.exe',
                      'MultiSeat.SteamHook.dll', 'MultiSeat.SteamHook32.dll',
-                     'MultiSeat.SteamShim.exe')
+                     'MultiSeat.SteamShim.exe',
+                     'MultiSeat.GameFiles.dll', 'MultiSeat.GameFiles32.dll')
           $missing = @($names | Where-Object { -not (Test-Path (Join-Path $dir $_)) })
           if ($missing.Count) { throw "build.ps1 did not produce: $($missing -join ', ')" }
           $names | ForEach-Object { Get-Item (Join-Path $dir $_) | Select-Object Name, Length | Format-Table -HideTableHeaders }
@@ -91,6 +92,8 @@ jobs:
             src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamHook.dll
             src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamHook32.dll
             src/MultiSeat.SteamIsolation/artifacts/MultiSeat.SteamShim.exe
+            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.GameFiles.dll
+            src/MultiSeat.SteamIsolation/artifacts/MultiSeat.GameFiles32.dll
           if-no-files-found: error
 
   release:
@@ -103,7 +106,7 @@ jobs:
 
       - uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: '9.0.x'
+          dotnet-version: '10.0.x'
 
       - uses: actions/setup-node@v5
         with:
@@ -262,7 +265,7 @@ jobs:
           if (-not (Test-Path "$root/hostfxr.dll"))           { $problems += "hostfxr.dll missing - build is NOT self-contained" }
           # The installer replaces the whole install folder, so the helpers have to ride in the
           # asset or an upgrade removes them. All five or nothing; see the steam-isolation job.
-          foreach ($n in @('MultiSeat.SteamLauncher.exe', 'MultiSeat.SteamLauncher32.exe', 'MultiSeat.SteamHook.dll', 'MultiSeat.SteamHook32.dll', 'MultiSeat.SteamShim.exe')) {
+          foreach ($n in @('MultiSeat.SteamLauncher.exe', 'MultiSeat.SteamLauncher32.exe', 'MultiSeat.SteamHook.dll', 'MultiSeat.SteamHook32.dll', 'MultiSeat.SteamShim.exe', 'MultiSeat.GameFiles.dll', 'MultiSeat.GameFiles32.dll')) {
             if (-not (Test-Path "$root/SteamIsolation/$n")) { $problems += "SteamIsolation/$n missing - an upgrade would remove the Steam isolation helpers" }
           }
           if ($problems.Count) {

@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 param([switch]$KeepData,[Parameter(Mandatory=$true)][string]$Log,[Parameter(Mandatory=$true)][string]$Progress)
 $ErrorActionPreference='Stop'
 $install=Join-Path $env:ProgramFiles 'Kinseat'
@@ -37,7 +37,7 @@ try {
     if(Test-Path -LiteralPath $hhCli){
         $tmp=Join-Path $env:TEMP ('hh-'+[guid]::NewGuid().ToString('N')+'.txt')
         & cmd.exe /c "`"$hhCli`" --dev-list > `"$tmp`" 2>&1"
-        $jailed=@(Get-Content -LiteralPath $tmp -ErrorAction SilentlyContinue | ForEach-Object { if($_ -match '--dev-hide "(.+![0-9]+)"'){ $Matches[1] } })
+        $jailed=@(Get-Content -LiteralPath $tmp -ErrorAction SilentlyContinue | ForEach-Object { if($_ -match '--dev-hide "([A-Za-z0-9\\&_!.\-{}:]+![0-9]+)"'){ $Matches[1] } })
         foreach($rule in $jailed){ & cmd.exe /c "`"$hhCli`" --dev-unhide `"$rule`" > nul 2>&1" }
         $remaining=@(Get-Content -LiteralPath $tmp -ErrorAction SilentlyContinue | Where-Object { $_ -match '--dev-hide' }).Count - $jailed.Count
         if($remaining -le 0){ & cmd.exe /c "`"$hhCli`" --cloak-off > nul 2>&1" }

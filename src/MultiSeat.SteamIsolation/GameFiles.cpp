@@ -15,16 +15,18 @@
 #include <algorithm>
 #include <unordered_map>
 #include <map>
+#include <atomic>
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 namespace {
 using namespace game_files;
-Manifest manifest;
-std::wstring dllPath;
-std::wstring activeManifestPath;
+// Hooks stay active through CRT teardown; keep all hook-referenced globals immortal.
+Manifest& manifest = *new Manifest;
+std::wstring& dllPath = *new std::wstring;
+std::wstring& activeManifestPath = *new std::wstring;
 LONG state = 0;
 thread_local bool inside = false;
-std::mutex logMutex;
+std::mutex& logMutex = *new std::mutex;
 struct Guard { bool previous = inside; Guard() { inside = true; } ~Guard() { inside = previous; } };
 void Log(const std::wstring& text) {
     if (manifest.logFile.empty() || inside) return;
@@ -81,7 +83,7 @@ void Parents(const std::wstring& target) {
         }
     }
 }
-std::mutex deletedMutex;
+std::mutex& deletedMutex = *new std::mutex;
 std::wstring DeletedFile(const Redirect& rule) { return Normalize(rule.to, L"") + L"\\.kinseat-deleted"; }
 std::string Utf8(const std::wstring& value) {
     int n = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
@@ -105,8 +107,9 @@ bool Tombstone(const Redirect& rule, const std::wstring& relative, bool add) {
     Guard guard;
     std::lock_guard<std::mutex> lock(deletedMutex);
     std::wstring file = DeletedFile(rule);
+    if (add) Parents(file);
     HANDLE h = CreateFileW(file.c_str(), GENERIC_READ | (add ? FILE_APPEND_DATA : 0),
-        FILE_SHARE_READ, nullptr, add ? OPEN_ALWAYS : OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, add ? OPEN_ALWAYS : OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER size{};
     std::string content;
@@ -261,8 +264,11 @@ NTSTATUS NTAPI Set(HANDLE file, PIO_STATUS_BLOCK io, PVOID data, ULONG length, F
         break;
     }
     if (!inside && overlaySource && (code == 13 || code == 64)) {
+        const bool markDelete = data && (
+            (code == 13 && length >= 1 && *static_cast<const BYTE*>(data) != 0) ||
+            (code == 64 && length >= sizeof(ULONG) && (*static_cast<const ULONG*>(data) & 1u) != 0));
         auto status = setOriginal(file, io, data, length, kind);
-        if (status >= 0 && !sourceRelative.empty()) {
+        if (status >= 0 && markDelete && !sourceRelative.empty()) {
             auto originalPath = Normalize(overlaySource->from, L"") + sourceRelative;
             if (Exists(originalPath)) Tombstone(*overlaySource, sourceRelative, true);
         }
@@ -321,12 +327,36 @@ struct Listing { std::vector<Entry> entries; size_t next = 0; std::wstring direc
 // a global mutex/map destructor can otherwise run before the final handles are closed.
 std::mutex& listingMutex = *new std::mutex;
 std::unordered_map<HANDLE, Listing>& listings = *new std::unordered_map<HANDLE, Listing>;
+std::atomic<size_t> activeListings{0};
+// Iterative wildcard matcher supporting both standard (*, ?) and NT DOS wildcards (<, >, ")
+// emitted by Win32 FindFirstFileW (e.g. "*.sav" -> "<.sav").
 bool Wildcard(const wchar_t* pattern, const wchar_t* name) {
-    if (!pattern || !*pattern) return !*name;
-    if (pattern[0] == L'*' && pattern[1] == L'.' && pattern[2] == L'*' && !pattern[3]) return true;
-    if (*pattern == L'*') return Wildcard(pattern + 1, name) || (*name && Wildcard(pattern, name + 1));
-    auto fold = [](wchar_t c) { return c >= L'A' && c <= L'Z' ? c + 32 : c; };
-    return *name && (*pattern == L'?' || fold(*pattern) == fold(*name)) && Wildcard(pattern + 1, name + 1);
+    if (!pattern || !*pattern) return !name || !*name;
+    if (!name) return false;
+    auto fold = [](wchar_t c) -> wchar_t { return c >= L'A' && c <= L'Z' ? static_cast<wchar_t>(c + 32) : c; };
+    const wchar_t* p = pattern;
+    const wchar_t* n = name;
+    const wchar_t* starP = nullptr;
+    const wchar_t* starN = nullptr;
+    while (*n) {
+        if (*p == L'*' || *p == L'<') {
+            starP = p++;
+            starN = n;
+        } else if (*p == L'?' || *p == L'>' || fold(*p) == fold(*n)) {
+            ++p;
+            ++n;
+        } else if (*p == L'"' && *n == L'.') {
+            ++p;
+            ++n;
+        } else if (starP) {
+            p = starP + 1;
+            n = ++starN;
+        } else {
+            return false;
+        }
+    }
+    while (*p == L'*' || *p == L'<' || *p == L'>' || *p == L'"') ++p;
+    return !*p;
 }
 std::vector<Entry> Scan(const std::wstring& dir, const std::wstring& pattern) {
     std::vector<Entry> result;
@@ -400,10 +430,21 @@ NTSTATUS Serve(HANDLE h, PIO_STATUS_BLOCK io, PVOID buffer, ULONG length, FILE_I
     if (!DirectoryPaths(path, original, overlay, rule)) return static_cast<NTSTATUS>(0xC0000001);
     std::wstring pattern = L"*";
     if (mask && mask->Buffer && mask->Length) pattern.assign(mask->Buffer, mask->Length / sizeof(wchar_t));
+    bool needsCollect = restart;
+    if (!needsCollect) {
+        std::lock_guard<std::mutex> lock(listingMutex);
+        auto it = listings.find(h);
+        needsCollect = (it == listings.end() || it->second.directory != path);
+    }
+    Listing fresh;
+    if (needsCollect) fresh = Collect(path, pattern);
     std::lock_guard<std::mutex> lock(listingMutex);
     auto it = listings.find(h);
-    if (restart || it == listings.end() || it->second.directory != path)
-        it = listings.insert_or_assign(h, Collect(path, pattern)).first;
+    if (needsCollect || it == listings.end() || it->second.directory != path) {
+        if (!needsCollect) fresh = Collect(path, pattern);
+        it = listings.insert_or_assign(h, std::move(fresh)).first;
+        activeListings.store(listings.size(), std::memory_order_relaxed);
+    }
     auto& listing = it->second;
     if (listing.next == listing.entries.size()) {
         io->Information = 0;
@@ -465,7 +506,10 @@ NTSTATUS NTAPI QueryEx(HANDLE h, HANDLE event, PIO_APC_ROUTINE apc, PVOID contex
     return Serve(h, io, buffer, length, kind, (flags & 2u) != 0, mask, (flags & 1u) != 0);
 }
 NTSTATUS NTAPI Close(HANDLE h) {
-    if (!inside) { std::lock_guard<std::mutex> lock(listingMutex); listings.erase(h); }
+    if (!inside && activeListings.load(std::memory_order_relaxed) != 0) {
+        std::lock_guard<std::mutex> lock(listingMutex);
+        if (listings.erase(h) > 0) activeListings.store(listings.size(), std::memory_order_relaxed);
+    }
     return closeOriginal(h);
 }
 using CreateInternal = BOOL (WINAPI*)(HANDLE, LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES,
@@ -557,11 +601,18 @@ template<class T> bool Hook(const wchar_t* module, const char* symbol, void* rep
 #pragma comment(linker, "/EXPORT:MultiSeatInitialize=_MultiSeatInitialize@4")
 #endif
 extern "C" __declspec(dllexport) DWORD WINAPI MultiSeatInitialize(void*) {
+    try {
     if (InterlockedCompareExchange(&state, 1, 0) != 0) return state == 2 ? 1 : 0;
-    wchar_t manifestPath[32768];
-    DWORD size = GetEnvironmentVariableW(L"MULTISEAT_GAME_MANIFEST", manifestPath, 32768);
-    if (!size || size >= 32768) return 0;
-    std::ifstream stream(manifestPath, std::ios::binary);
+    HMODULE pinned = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+        reinterpret_cast<LPCWSTR>(&__ImageBase), &pinned);
+    std::vector<wchar_t> manifestPath(32768);
+    DWORD size = GetEnvironmentVariableW(L"MULTISEAT_GAME_MANIFEST", manifestPath.data(), static_cast<DWORD>(manifestPath.size()));
+    if (!size || size >= manifestPath.size()) return 0;
+    WIN32_FILE_ATTRIBUTE_DATA manifestAttrs{};
+    if (!GetFileAttributesExW(manifestPath.data(), GetFileExInfoStandard, &manifestAttrs) ||
+        manifestAttrs.nFileSizeHigh || manifestAttrs.nFileSizeLow > 1024 * 1024) return 0;
+    std::ifstream stream(manifestPath.data(), std::ios::binary);
     if (!stream) return 0;
     std::string json((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
     std::string error;
@@ -581,7 +632,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI MultiSeatInitialize(void*) {
     DWORD n = GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), module.data(), static_cast<DWORD>(module.size()));
     if (!n || n >= module.size()) return 0;
     dllPath.assign(module.data(), n);
-    activeManifestPath.assign(manifestPath, size);
+    activeManifestPath.assign(manifestPath.data(), size);
     if (MH_Initialize() != MH_OK) return 0;
     bool ok = Hook(L"ntdll.dll", "NtCreateFile", reinterpret_cast<void*>(Create), &createOriginal)
         && Hook(L"ntdll.dll", "NtOpenFile", reinterpret_cast<void*>(Open), &openOriginal)
@@ -596,6 +647,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI MultiSeatInitialize(void*) {
     if (ok) Hook(L"kernelbase.dll", "CreateProcessInternalW", reinterpret_cast<void*>(Child), &createInternal);
     if (!ok || MH_EnableHook(MH_ALL_HOOKS) != MH_OK) { MH_Uninitialize(); return 0; }
     InterlockedExchange(&state, 2); Log(L"Redirection de fichiers active"); return 1;
+    } catch (...) { return 0; }
 }
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) DisableThreadLibraryCalls(module);

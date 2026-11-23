@@ -160,12 +160,12 @@ public class ConsoleCallerCheckTests
     }
 
     [Fact]
-    public void IfTheSeatAccountsCannotBeListed_NothingExtraIsRefused()
+    public void IfTheSeatAccountsCannotBeListed_AccessIsRefusedFailClosed()
     {
         var check = new ConsoleCallerCheck(
             (_, _) => Found(), _ => new FakeOwner(), () => ConsoleSession, _ => ConsoleUser,
             () => throw new InvalidOperationException("no list"));
-        Assert.Equal(CallerVerdict.Allowed, check.Check(IPAddress.Loopback, 50000, 9550));
+        Assert.Equal(CallerVerdict.NotConsoleUser, check.Check(IPAddress.Loopback, 50000, 9550));
     }
 
     // ── which accounts count as seat accounts ─────────────────────────

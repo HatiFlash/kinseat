@@ -198,7 +198,7 @@ public sealed class HidHideCli
         // which is the form measured to exit in under a second.
         var startInfo = new ProcessStartInfo
         {
-            FileName = "cmd.exe",
+            FileName = Path.Combine(Environment.SystemDirectory, "cmd.exe"),
             Arguments = $"/c \"\"{_cliPath}\" {arguments} > \"{transcript}\" 2>&1\"",
             CreateNoWindow = true,
             UseShellExecute = false,

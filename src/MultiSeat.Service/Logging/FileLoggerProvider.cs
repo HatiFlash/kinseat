@@ -47,15 +47,22 @@ public sealed class FileLoggerProvider : ILoggerProvider
 
     private async Task WriteLoopAsync()
     {
+        DateOnly lastPrunedDay = default;
         await foreach (var line in _queue.Reader.ReadAllAsync())
         {
             try
             {
-                var path = Path.Combine(_directory, $"service-{DateTime.UtcNow:yyyyMMdd}.log");
+                var now = DateTime.UtcNow;
+                var today = DateOnly.FromDateTime(now);
+                var path = Path.Combine(_directory, $"service-{now:yyyyMMdd}.log");
                 Rotate(path, Encoding.UTF8.GetByteCount(line));
                 await File.AppendAllTextAsync(path, line, Encoding.UTF8);
-                foreach (var old in Directory.EnumerateFiles(_directory, "service-*.log*")
-                    .Where(f => File.GetLastWriteTimeUtc(f) < DateTime.UtcNow.AddDays(-7))) File.Delete(old);
+                if (today != lastPrunedDay)
+                {
+                    lastPrunedDay = today;
+                    foreach (var old in Directory.EnumerateFiles(_directory, "service-*.log*")
+                        .Where(f => File.GetLastWriteTimeUtc(f) < now.AddDays(-7))) File.Delete(old);
+                }
             }
             catch (Exception) { /* Logging must never block or crash seat provisioning. */ }
         }

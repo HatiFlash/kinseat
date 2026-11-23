@@ -148,10 +148,20 @@ fn text(ui: &mut egui::Ui, label: impl Into<String>, size: f32, color: Color32) 
     ui.label(RichText::new(label.into()).size(size).color(color));
 }
 fn title(ui: &mut egui::Ui, s: &str) {
-    ui.label(RichText::new(s).size(32.0).color(t::PRIMARY).strong());
+    ui.label(
+        RichText::new(s)
+            .size(30.0)
+            .color(t::PRIMARY)
+            .family(t::title_family()),
+    );
 }
 fn section(ui: &mut egui::Ui, s: &str) {
-    ui.label(RichText::new(s).size(20.0).color(t::PRIMARY).strong());
+    ui.label(
+        RichText::new(s)
+            .size(19.0)
+            .color(t::PRIMARY)
+            .family(t::title_family()),
+    );
 }
 fn space(ui: &mut egui::Ui, n: f32) {
     ui.add_space(n);
@@ -159,7 +169,8 @@ fn space(ui: &mut egui::Ui, n: f32) {
 fn card(ui: &mut egui::Ui, f: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(t::SURFACE)
-        .corner_radius(10)
+        .stroke(Stroke::new(1.0_f32, t::BORDER))
+        .corner_radius(12)
         .inner_margin(24)
         .show(ui, |ui| {
             ui.vertical(f);
@@ -175,9 +186,9 @@ fn action(ui: &mut egui::Ui, s: &str, primary: bool) -> bool {
     let color = if primary { t::ON_ACCENT } else { t::PRIMARY };
     ui.add_sized(
         [190.0, 42.0],
-        egui::Button::new(RichText::new(s).size(15.0).color(color))
+        egui::Button::new(RichText::new(s).size(14.5).color(color))
             .fill(if primary { t::ACCENT } else { t::HOVER })
-            .corner_radius(6),
+            .corner_radius(8),
     )
     .clicked()
 }
@@ -186,7 +197,7 @@ fn avatar(ui: &mut egui::Ui, member: usize, diameter: f32) {
     let p = ui.painter();
     let c = rect.center();
     p.circle_stroke(c, diameter / 2.0 + 3.0, Stroke::new(2.0_f32, t::ACCENT));
-    t::draw_avatar(p, c, diameter / 2.0, t::MEMBERS[member]);
+    t::draw_avatar(p, c, diameter / 2.0, t::MEMBERS[member % t::MEMBERS.len()]);
 }
 fn dots(ui: &mut egui::Ui, code: &str, count: usize, error: bool) {
     ui.horizontal(|ui| {
@@ -215,58 +226,94 @@ fn dots(ui: &mut egui::Ui, code: &str, count: usize, error: bool) {
         }
     });
 }
-/// Panneau « radar » de la recherche (démonstration et mode réel) : le point vert n'apparaît
-/// qu'une fois un PC trouvé.
+/// Panneau « radar » animé de la recherche : ondes concentriques ambrées, balayage doux
+/// et balise verte pulsante dès qu'un PC Kinseat est détecté.
 fn radar(ui: &mut egui::Ui, col: f32, found: bool) {
+    ui.ctx().request_repaint_after(Duration::from_millis(33));
+    let time = ui.ctx().input(|i| i.time) as f32;
     fixed_card(ui, col, |ui| {
         ui.set_width(col - 50.0);
         let (r, _) = ui.allocate_exact_size(vec2(col - 50.0, 300.0), Sense::hover());
         let p = ui.painter();
         let c = r.center();
-        for radius in [55.0, 96.0, 135.0] {
+        for radius in [52.0, 92.0, 132.0] {
             p.circle_stroke(c, radius, Stroke::new(1.0_f32, t::BORDER));
         }
+        // Deux ondes radar qui s'étendent en boucle.
+        let wave_color = if found { t::OK } else { t::ACCENT };
+        for phase_offset in [0.0_f32, 0.5_f32] {
+            let phase = (time * 0.42 + phase_offset).fract();
+            let radius = 36.0 + phase * 100.0;
+            let alpha = (1.0 - phase).powf(1.6) * 0.55;
+            p.circle_stroke(
+                c,
+                radius,
+                Stroke::new(2.0_f32, wave_color.gamma_multiply(alpha)),
+            );
+        }
+        // Aiguille de balayage subtile.
+        let angle = time * 1.1;
+        let tip = c + vec2(angle.cos() * 130.0, angle.sin() * 130.0);
+        p.line_segment(
+            [c, tip],
+            Stroke::new(1.5_f32, wave_color.gamma_multiply(0.35)),
+        );
+        // Écran PC central.
+        let screen = egui::Rect::from_center_size(c, vec2(74.0, 52.0));
+        p.rect_filled(screen, 7, t::CANVAS);
         p.rect_stroke(
-            egui::Rect::from_center_size(c, vec2(72.0, 52.0)),
-            5,
-            Stroke::new(3.0_f32, t::ACCENT),
+            screen,
+            7,
+            Stroke::new(2.5_f32, t::ACCENT),
             StrokeKind::Inside,
         );
         p.line_segment(
-            [pos2(c.x - 20.0, c.y + 32.0), pos2(c.x + 20.0, c.y + 32.0)],
-            Stroke::new(2.0_f32, t::ACCENT),
+            [pos2(c.x - 20.0, c.y + 33.0), pos2(c.x + 20.0, c.y + 33.0)],
+            Stroke::new(2.5_f32, t::ACCENT),
         );
         if found {
-            p.circle_filled(c + vec2(96.0, -12.0), 5.0, t::OK);
+            let beacon = c + vec2(88.0, -24.0);
+            let halo = 8.0 + ((time * 3.0).sin() * 0.5 + 0.5) * 7.0;
+            p.circle_filled(beacon, halo, t::OK.gamma_multiply(0.22));
+            p.circle_filled(beacon, 5.5, t::OK);
         }
     });
 }
-/// En-tête commun : logo, mention facultative, bouton Paramètres/Retour. Renvoie true au clic.
+/// En-tête commun : emblème Kinseat, logo, mention facultative, bouton Paramètres/Retour.
 fn header(ctx: &egui::Context, settings_open: bool, tag: Option<&str>) -> bool {
     let mut clicked = false;
     egui::TopBottomPanel::top("header")
-        .exact_height(68.0)
-        .frame(egui::Frame::new().fill(t::RAIL))
+        .exact_height(64.0)
+        .frame(
+            egui::Frame::new()
+                .fill(t::RAIL)
+                .stroke(Stroke::new(1.0_f32, t::BORDER)),
+        )
         .show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
-                ui.add_space(38.0);
+                ui.add_space(32.0);
+                let (mark, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+                t::draw_brand_mark(ui.painter(), mark.min + vec2(0.0, 1.0), 1.0);
+                ui.add_space(4.0);
                 ui.label(
                     RichText::new("Kinseat")
-                        .size(21.0)
-                        .color(t::ACCENT)
-                        .strong(),
+                        .size(20.0)
+                        .color(t::PRIMARY)
+                        .family(t::title_family()),
                 );
+                ui.label(RichText::new("Client").size(12.0).color(t::ACCENT));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(34.0);
+                    ui.add_space(32.0);
                     clicked = ui
                         .add_sized(
-                            [116.0, 38.0],
+                            [116.0, 36.0],
                             egui::Button::new(if settings_open {
                                 "Retour"
                             } else {
                                 "Paramètres"
                             })
-                            .fill(t::HOVER),
+                            .fill(t::HOVER)
+                            .corner_radius(8),
                         )
                         .clicked();
                     if let Some(tag) = tag {

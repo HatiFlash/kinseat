@@ -137,13 +137,14 @@ impl Setup {
         uninstall: bool,
         screenshot: Option<PathBuf>,
     ) -> Self {
+        cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = CANVAS;
         visuals.window_fill = SURFACE;
         visuals.widgets.inactive.bg_fill = HOVER;
         visuals.widgets.inactive.weak_bg_fill = HOVER;
         visuals.selection.bg_fill = AMBER;
-        cc.egui_ctx.set_visuals(visuals);
+        cc.egui_ctx.set_visuals_of(egui::Theme::Dark, visuals);
         #[cfg(windows)]
         {
             use egui::{FontData, FontDefinitions, FontFamily};

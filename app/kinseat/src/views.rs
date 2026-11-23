@@ -1149,7 +1149,7 @@ pub fn members(
         );
         if !account.has_seat {
             let b = Rect::from_min_size(
-                pos2(r.right() - 170.0, r.center().y - 15.0),
+                pos2(r.right() - 196.0, r.center().y - 15.0),
                 vec2(150.0, 30.0),
             );
             if ui

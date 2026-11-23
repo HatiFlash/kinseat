@@ -308,6 +308,15 @@ impl Panel {
             if choice.as_deref() != Some(previous_seat.as_str()) {
                 graphics = kinseat_ipc::GraphicsChoice::preset(initial);
             }
+            let screen = ctx.screen_rect();
+            egui::Area::new(egui::Id::new("join-request-scrim"))
+                .order(egui::Order::Middle)
+                .fixed_pos(screen.min)
+                .show(ctx, |ui| {
+                    let (rect, _) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                    ui.painter()
+                        .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(145));
+                });
             egui::Window::new("Demande d'accès")
                 .id(egui::Id::new("join-request"))
                 .collapsible(false)
@@ -397,7 +406,17 @@ impl Panel {
                                 });
                             }
                         }
-                        if ui.button("Créer une place").clicked() {
+                        let create_btn = if ready.is_empty() {
+                            egui::Button::new(theme::text(
+                                "Créer une place",
+                                14.0,
+                                theme::ON_ACCENT,
+                            ))
+                            .fill(theme::ACCENT)
+                        } else {
+                            egui::Button::new("Créer une place")
+                        };
+                        if ui.add(create_btn).clicked() {
                             actions.push(Action::CreateSeat {
                                 request_id: request.id.clone(),
                                 graphics: graphics.clone(),

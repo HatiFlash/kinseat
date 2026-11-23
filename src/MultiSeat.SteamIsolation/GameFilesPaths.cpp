@@ -192,8 +192,14 @@ std::vector<std::wstring> MergeNames(const std::vector<std::wstring>& original,
     };
     std::vector<std::wstring> result;
     std::vector<std::wstring> seen;
+    // Overlay entries always win over tombstones so a deleted-then-recreated file stays visible.
+    for (const auto& name : overlay) {
+        auto folded = key(name);
+        if (folded == L".kinseat-deleted" || std::find(seen.begin(), seen.end(), folded) != seen.end()) continue;
+        seen.push_back(std::move(folded)); result.push_back(name);
+    }
     for (const auto& name : deleted) seen.push_back(key(name));
-    for (const auto& group : {overlay, original}) for (const auto& name : group) {
+    for (const auto& name : original) {
         auto folded = key(name);
         if (folded == L".kinseat-deleted" || std::find(seen.begin(), seen.end(), folded) != seen.end()) continue;
         seen.push_back(std::move(folded)); result.push_back(name);

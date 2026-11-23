@@ -1952,16 +1952,30 @@ impl Kinseat {
     fn seat_modals(&mut self, ctx: &egui::Context) {
         if let Some((mut account, mut display)) = self.add_seat.clone() {
             let (mut cancel, mut submit, mut open_member) = (false, false, false);
+            let screen = ctx.screen_rect();
+            egui::Area::new(egui::Id::new("add-seat-scrim"))
+                .order(egui::Order::Middle)
+                .fixed_pos(screen.min)
+                .show(ctx, |ui| {
+                    let (rect, _) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                    ui.painter()
+                        .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(145));
+                });
             egui::Window::new("Ajouter une place")
                 .collapsible(false).resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .max_width(480.0)
                 .show(ctx, |ui| {
                     ui.set_width(440.0);
-                    ui.label(theme::text("La place ouvre une session Windows dédiée au membre, diffusée vers son appareil.", 14.0, theme::SECONDARY));
-                    ui.add_space(12.0);
                     let free: Vec<String> = self.accounts.as_deref().unwrap_or_default().iter()
                         .filter(|a| a.is_managed && !a.has_seat).map(|a| a.username.clone()).collect();
+                    let max_body = (screen.height() - 170.0).max(220.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("add-seat-scroll")
+                        .max_height(max_body)
+                        .show(ui, |ui| {
+                    ui.label(theme::text("La place ouvre une session Windows dédiée au membre, diffusée vers son appareil.", 14.0, theme::SECONDARY));
+                    ui.add_space(12.0);
                     let from_join = self.join_after_create.is_some();
                     if from_join {
                         ui.horizontal(|ui| {
@@ -2017,6 +2031,7 @@ impl Kinseat {
                             });
                         });
                     }
+                    });
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         if ui.add_enabled(!self.seat_pending, egui::Button::new("Annuler")).clicked() { cancel = true; }
@@ -2936,6 +2951,7 @@ impl eframe::App for Kinseat {
                                                 self.confirm_close = Some(id)
                                             }
                                             overview::Intent::Seats => self.page = Page::Seats,
+                                            overview::Intent::AddSeat => self.open_add_seat(None),
                                             overview::Intent::Cancel(id) => {
                                                 self.dispatch(Command::Cancel(id))
                                             }

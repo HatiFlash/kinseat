@@ -34,14 +34,21 @@ public static class SystemEndpoints
                 return Results.BadRequest(new { error = $"Script not found: {script}" });
 
             // Detached PowerShell: wait 3s then run the install script (which stops + restarts the service).
-            var ps = $"Start-Sleep 3; & '{script}'";
-            Process.Start(new ProcessStartInfo(
-                "powershell.exe",
-                $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"{ps}\"")
+            // Pass the script path via an environment variable so it is never interpolated into a shell string.
+            var psExe = Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe");
+            var psi = new ProcessStartInfo(psExe)
             {
                 CreateNoWindow = true,
                 UseShellExecute = false,
-            });
+            };
+            psi.ArgumentList.Add("-NoProfile");
+            psi.ArgumentList.Add("-NonInteractive");
+            psi.ArgumentList.Add("-ExecutionPolicy");
+            psi.ArgumentList.Add("Bypass");
+            psi.ArgumentList.Add("-Command");
+            psi.ArgumentList.Add("Start-Sleep 3; & $env:MULTISEAT_REBUILD_SCRIPT");
+            psi.Environment["MULTISEAT_REBUILD_SCRIPT"] = script;
+            Process.Start(psi);
 
             log.LogInformation("Rebuild triggered — service will restart in ~3s");
             return Results.Accepted(value: new { message = "Rebuild started — service will restart shortly" });
@@ -129,9 +136,10 @@ public static class SystemEndpoints
                     node!["MultiSeat"] = ms;
                 }
 
-                // An explicit key when on, the explicit opt-out when off. Never "", which is the
-                // overloaded value that made this confusing in the first place.
-                ms["ApiKey"] = body.Enabled ? key! : "disabled";
+                // Never persist the plaintext key into Program Files\...\appsettings*.json, which
+                // inherits BUILTIN\Users:(RX). When enabled, store "" so ApiServer loads the key
+                // exclusively from the ACL-hardened C:\ProgramData\MultiSeat\api-key.txt.
+                ms["ApiKey"] = body.Enabled ? "" : "disabled";
 
                 await File.WriteAllTextAsync(settingsPath,
                     node!.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));

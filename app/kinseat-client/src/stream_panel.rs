@@ -1,4 +1,4 @@
-use crate::{stream_menu, Client, Screen, STREAM_SHORTCUTS};
+use crate::{stream_menu, theme as t, Client, Screen, STREAM_SHORTCUTS};
 use egui::{Color32, RichText};
 use std::{
     net::{TcpStream, ToSocketAddrs},
@@ -20,66 +20,152 @@ struct Snapshot {
     state: stream_menu::Panel,
 }
 
+fn stat_tile(ui: &mut egui::Ui, width: f32, label: &str, value: &str) {
+    egui::Frame::new()
+        .fill(t::SURFACE)
+        .stroke(egui::Stroke::new(1.0_f32, t::BORDER))
+        .corner_radius(8)
+        .inner_margin(10)
+        .show(ui, |ui| {
+            ui.set_width((width - 22.0).max(60.0));
+            ui.label(RichText::new(label).size(11.0).color(t::FAINT));
+            ui.label(RichText::new(value).size(13.0).color(t::PRIMARY));
+        });
+}
+
 fn draw(
     ui: &mut egui::Ui,
     snapshot: &Snapshot,
     actions: &std::sync::mpsc::Sender<stream_menu::Action>,
 ) {
     ui.set_width(336.0);
-    ui.add_space(24.0);
-    ui.heading(RichText::new("Kinseat · Session").color(Color32::from_rgb(108, 218, 195)));
+    ui.add_space(16.0);
+    ui.horizontal(|ui| {
+        let (mark, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+        t::draw_brand_mark(ui.painter(), mark.min, 0.9);
+        ui.label(
+            RichText::new("Kinseat · Session")
+                .size(16.0)
+                .color(t::ACCENT)
+                .family(t::title_family()),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            egui::Frame::new()
+                .fill(t::OK.gamma_multiply(0.15))
+                .corner_radius(10)
+                .inner_margin(egui::Margin::symmetric(8, 3))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(&snapshot.latency).size(11.5).color(t::OK));
+                });
+        });
+    });
+    ui.add_space(6.0);
     ui.separator();
-    for (key, value) in [
-        ("Place", &snapshot.name),
-        ("PC hôte", &snapshot.host),
-        ("Durée", &snapshot.elapsed),
-        ("Profil demandé", &snapshot.profile),
-        ("Latence réseau", &snapshot.latency),
-        ("Manettes", &snapshot.controllers),
-    ] {
-        ui.label(RichText::new(key).color(Color32::GRAY));
-        ui.label(value);
-        ui.add_space(8.0);
+    ui.add_space(8.0);
+
+    // Grille compacte 2x2 des informations de session.
+    let tile_w = 158.0;
+    ui.horizontal(|ui| {
+        stat_tile(ui, tile_w, "Place", &snapshot.name);
+        stat_tile(ui, tile_w, "PC hôte", &snapshot.host);
+    });
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        stat_tile(ui, tile_w, "Durée", &snapshot.elapsed);
+        stat_tile(ui, tile_w, "Profil", &snapshot.profile);
+    });
+    if snapshot.controllers != "indisponible" {
+        ui.add_space(6.0);
+        stat_tile(ui, 324.0, "Manettes", &snapshot.controllers);
     }
-    ui.separator();
+    ui.add_space(14.0);
+
     let button = |ui: &mut egui::Ui, title: &str, action| {
         if ui
-            .add_sized([320.0, 30.0], egui::Button::new(title))
+            .add_sized([324.0, 32.0], egui::Button::new(title).corner_radius(8))
             .clicked()
         {
             let _ = actions.send(action);
         }
     };
-    button(ui, "Reprendre", stream_menu::Action::Resume);
-    ui.add_space(12.0);
+    if ui
+        .add_sized(
+            [324.0, 36.0],
+            egui::Button::new(
+                RichText::new("Reprendre (Échap)")
+                    .size(14.0)
+                    .color(t::ON_ACCENT),
+            )
+            .fill(t::ACCENT)
+            .corner_radius(8),
+        )
+        .clicked()
+    {
+        let _ = actions.send(stream_menu::Action::Resume);
+    }
+    ui.add_space(14.0);
+    ui.label(RichText::new("ACTIONS RAPIDES").size(11.0).color(t::FAINT));
+    ui.add_space(6.0);
+    let quick = |ui: &mut egui::Ui, title: &str, key: u8| {
+        if ui
+            .add_sized(
+                [158.0, 32.0],
+                egui::Button::new(RichText::new(title).size(12.5).color(t::PRIMARY))
+                    .fill(t::SURFACE)
+                    .corner_radius(8),
+            )
+            .clicked()
+        {
+            let _ = actions.send(stream_menu::Action::Key(key));
+        }
+    };
+    ui.horizontal(|ui| {
+        quick(ui, "Statistiques", b'S');
+        quick(ui, "Libérer souris", b'Z');
+    });
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        quick(ui, "Plein écran", b'X');
+        quick(ui, "Coller texte", b'V');
+    });
+    ui.add_space(6.0);
+    button(ui, "Réduire la fenêtre", stream_menu::Action::Key(b'D'));
+    button(ui, "Raccourcis clavier", stream_menu::Action::Shortcuts);
+    if snapshot.state.shortcuts {
+        ui.add_space(4.0);
+        egui::Frame::new()
+            .fill(t::SURFACE)
+            .stroke(egui::Stroke::new(1.0_f32, t::BORDER))
+            .corner_radius(8)
+            .inner_margin(10)
+            .show(ui, |ui| {
+                for (keys, name) in STREAM_SHORTCUTS {
+                    ui.label(
+                        RichText::new(format!("{keys}  ·  {name}"))
+                            .size(11.5)
+                            .color(t::SECONDARY),
+                    );
+                }
+            });
+    }
+    ui.add_space(16.0);
+    ui.separator();
+    ui.add_space(10.0);
     if snapshot.state.confirm_quit {
-        ui.colored_label(Color32::LIGHT_RED, "Quitter ce flux ?");
+        ui.colored_label(t::ERR, "Quitter ce flux ?");
+        ui.add_space(6.0);
         button(ui, "Confirmer la sortie", stream_menu::Action::Quit);
         button(ui, "Annuler", stream_menu::Action::CancelQuit);
     } else if ui
         .add_sized(
-            [320.0, 32.0],
-            egui::Button::new(RichText::new("Quitter le flux").color(Color32::WHITE))
-                .fill(Color32::from_rgb(107, 37, 47)),
+            [324.0, 34.0],
+            egui::Button::new(RichText::new("Quitter le flux").color(t::PRIMARY))
+                .fill(Color32::from_rgb(0x6b, 0x26, 0x24))
+                .corner_radius(8),
         )
         .clicked()
     {
         let _ = actions.send(stream_menu::Action::ConfirmQuit);
-    }
-    for (name, key) in [
-        ("Afficher / masquer les statistiques", b'S'),
-        ("Libérer la souris", b'Z'),
-        ("Plein écran / fenêtré", b'X'),
-        ("Coller le presse-papiers", b'V'),
-        ("Réduire", b'D'),
-    ] {
-        button(ui, name, stream_menu::Action::Key(key));
-    }
-    button(ui, "Raccourcis clavier", stream_menu::Action::Shortcuts);
-    if snapshot.state.shortcuts {
-        for (keys, name) in STREAM_SHORTCUTS {
-            ui.label(format!("{keys}  {name}"));
-        }
     }
 }
 
@@ -232,15 +318,15 @@ impl Client {
                     self.close_panel();
                     #[cfg(windows)]
                     if let Some(pid) = self.moonlight_pid {
-                        let ok = if key == b'Z' {
-                            crate::stream_windows::release_mouse(pid)
-                        } else {
-                            crate::stream_windows::send_shortcut(pid, key as u16)
-                        };
-                        if !ok {
-                            self.notice =
-                                Some("Impossible d'envoyer le raccourci à Moonlight".into());
-                        }
+                        // Exécuter hors du thread UI pour éviter de geler l'interface pendant
+                        // la remise du focus et l'injection du raccourci (300 ms à 1,3 s).
+                        std::thread::spawn(move || {
+                            if key == b'Z' {
+                                let _ = crate::stream_windows::release_mouse(pid);
+                            } else {
+                                let _ = crate::stream_windows::send_shortcut(pid, key as u16);
+                            }
+                        });
                     }
                     #[cfg(not(windows))]
                     let _ = key;
@@ -266,11 +352,7 @@ impl Client {
         if self.demo {
             egui::SidePanel::right("stream-menu-demo")
                 .exact_width(360.0)
-                .frame(
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(19, 25, 33))
-                        .inner_margin(12.0),
-                )
+                .frame(egui::Frame::new().fill(t::RAIL).inner_margin(12.0))
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| draw(ui, &snapshot, &tx));
                 });
@@ -302,11 +384,7 @@ impl Client {
                         let _ = tx.send(stream_menu::Action::Resume);
                     }
                     egui::CentralPanel::default()
-                        .frame(
-                            egui::Frame::new()
-                                .fill(Color32::from_rgb(19, 25, 33))
-                                .inner_margin(12.0),
-                        )
+                        .frame(egui::Frame::new().fill(t::RAIL).inner_margin(12.0))
                         .show(child, |ui| {
                             egui::ScrollArea::vertical().show(ui, |ui| draw(ui, &snapshot, &tx));
                         });

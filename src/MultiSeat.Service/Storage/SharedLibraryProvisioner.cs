@@ -43,13 +43,27 @@ public sealed class SharedLibraryProvisioner
         try
         {
             var root = _options.SharedGameLibraryDir;
+            if (IsReparsePoint(root))
+            {
+                _logger.LogWarning("Refusing to provision shared game library: {Dir} is a reparse point", root);
+                return;
+            }
+
             Directory.CreateDirectory(root);
-            Directory.CreateDirectory(SteamLibraryDir);
-            Directory.CreateDirectory(RomsDir);
+            if (!IsReparsePoint(SteamLibraryDir))
+                Directory.CreateDirectory(SteamLibraryDir);
+            if (!IsReparsePoint(RomsDir))
+                Directory.CreateDirectory(RomsDir);
 
             // Grant BUILTIN\Users Modify with inheritance so every seat account can read ROMs and
             // download into the Steam library. (OI)(CI) = object + container inherit; M = Modify.
+            // Never pass /T on a user-writable tree as SYSTEM — a seat user could plant an NTFS
+            // junction and escalate privileges on the next service startup.
             await GrantUsersModifyAsync(root, ct);
+            if (!IsReparsePoint(SteamLibraryDir))
+                await GrantUsersModifyAsync(SteamLibraryDir, ct);
+            if (!IsReparsePoint(RomsDir))
+                await GrantUsersModifyAsync(RomsDir, ct);
 
             _logger.LogInformation(
                 "Shared game library ready: Steam → {Steam} | ROMs → {Roms}. " +
@@ -74,13 +88,23 @@ public sealed class SharedLibraryProvisioner
     /// SharedGameLibraryDir is user-settable and one space would truncate the command).
     /// </summary>
     internal static string IcaclsArguments(string dir) =>
-        $"\"{dir}\" /grant \"{UsersSid}:(OI)(CI)M\" /T /C /Q";
+        $"\"{dir}\" /grant \"{UsersSid}:(OI)(CI)M\" /C /Q";
+
+    internal static bool IsReparsePoint(string path) =>
+        Directory.Exists(path) && (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0;
 
     private async Task GrantUsersModifyAsync(string dir, CancellationToken ct)
     {
         try
         {
-            var psi = new ProcessStartInfo("icacls", IcaclsArguments(dir))
+            if (IsReparsePoint(dir))
+            {
+                _logger.LogWarning("Skipping icacls grant on reparse point {Dir}", dir);
+                return;
+            }
+
+            var icaclsPath = Path.Combine(Environment.SystemDirectory, "icacls.exe");
+            var psi = new ProcessStartInfo(icaclsPath, IcaclsArguments(dir))
             {
                 CreateNoWindow = true,
                 UseShellExecute = false,

@@ -167,6 +167,7 @@ pub struct Panel {
     pub error: Option<String>,
     pub search: String,
     pub source: String,
+    pub show_add_form: bool,
     pub name: String,
     pub exe_path: String,
     /// Confirmation d'un octroi : jeu, membre, dossier exact envoyé au service.
@@ -241,13 +242,26 @@ impl Panel {
                     .request_repaint_after(std::time::Duration::from_millis(100)),
             }
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(!self.loading, egui::Button::new("Analyser"))
                 .clicked()
             {
                 self.loading = true;
                 action = Some(Command::LibraryScan);
+            }
+            let add_label = if self.show_add_form {
+                "Masquer l'ajout manuel"
+            } else {
+                "+ Ajouter un jeu"
+            };
+            let add_btn = if self.show_add_form {
+                egui::Button::new(t::text(add_label, 13.0, t::PRIMARY)).fill(t::HOVER)
+            } else {
+                egui::Button::new(t::text(add_label, 13.0, t::ON_ACCENT)).fill(t::ACCENT)
+            };
+            if ui.add(add_btn).clicked() {
+                self.show_add_form = !self.show_add_form;
             }
             ui.label(t::text(
                 "Catalogue local : Steam, Epic, GOG, EA, Ubisoft et jeux ajoutés manuellement.",
@@ -275,67 +289,88 @@ impl Panel {
                 ui.add(egui::ProgressBar::new(progress).desired_width(280.0));
             });
         }
-        t::frame().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(t::title("Ajouter un jeu manuellement", 16.0));
-            ui.label("Nom du jeu");
-            ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(350.0));
-            ui.label("Chemin de l’exécutable (.exe)");
-            ui.horizontal(|ui| {
+        if self.show_add_form {
+            t::frame().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(t::title("Ajouter un jeu manuellement", 16.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Fermer").clicked() {
+                            self.show_add_form = false;
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+                ui.label("Nom du jeu");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.exe_path)
-                        .desired_width(340.0)
-                        .hint_text(r"C:\Jeux\MonJeu\jeu.exe"),
+                    egui::TextEdit::singleline(&mut self.name)
+                        .desired_width(350.0)
+                        .hint_text("ex. Stardew Valley"),
                 );
-                if ui
-                    .add_enabled(self.picker.is_none(), egui::Button::new("Parcourir…"))
-                    .clicked()
-                {
-                    self.browse(false, ui.ctx().clone());
-                }
-                if ui
-                    .add_enabled(self.picker.is_none(), egui::Button::new("Dossier…"))
-                    .clicked()
-                {
-                    self.browse(true, ui.ctx().clone());
-                }
-            });
-            if !self.candidates.is_empty() {
-                ui.label("Choisir un exécutable du dossier :");
-                for path in self.candidates.clone() {
-                    if ui.button(path.display().to_string()).clicked() {
-                        self.choose(path);
+                ui.label("Chemin de l’exécutable (.exe)");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.exe_path)
+                            .desired_width(340.0)
+                            .hint_text(r"C:\Jeux\MonJeu\jeu.exe"),
+                    );
+                    if ui
+                        .add_enabled(self.picker.is_none(), egui::Button::new("Parcourir…"))
+                        .clicked()
+                    {
+                        self.browse(false, ui.ctx().clone());
+                    }
+                    if ui
+                        .add_enabled(self.picker.is_none(), egui::Button::new("Dossier…"))
+                        .clicked()
+                    {
+                        self.browse(true, ui.ctx().clone());
+                    }
+                });
+                if !self.candidates.is_empty() {
+                    ui.label("Choisir un exécutable du dossier :");
+                    for path in self.candidates.clone() {
+                        if ui.button(path.display().to_string()).clicked() {
+                            self.choose(path);
+                        }
                     }
                 }
-            }
-            if let Some(pending) = self.pending.get(ADD_KEY) {
-                progress(ui, pending);
-            } else if ui
-                .add_enabled(
-                    !self.loading && self.picker.is_none(),
-                    egui::Button::new("Ajouter"),
-                )
-                .clicked()
-            {
-                if self.exe_path.trim().is_empty() {
-                    self.browse(false, ui.ctx().clone());
-                } else if !self.name.trim().is_empty()
-                    && self.pending.begin(ADD_KEY, PendingAction::Add)
+                if let Some(pending) = self.pending.get(ADD_KEY) {
+                    progress(ui, pending);
+                } else if ui
+                    .add_enabled(
+                        !self.loading && self.picker.is_none(),
+                        egui::Button::new(t::text("Ajouter à la bibliothèque", 13.0, t::ON_ACCENT))
+                            .fill(t::ACCENT),
+                    )
+                    .clicked()
                 {
-                    action = Some(Command::LibraryAdd {
-                        name: self.name.trim().into(),
-                        exe_path: self.exe_path.trim().into(),
-                    });
+                    if self.exe_path.trim().is_empty() {
+                        self.browse(false, ui.ctx().clone());
+                    } else if !self.name.trim().is_empty()
+                        && self.pending.begin(ADD_KEY, PendingAction::Add)
+                    {
+                        action = Some(Command::LibraryAdd {
+                            name: self.name.trim().into(),
+                            exe_path: self.exe_path.trim().into(),
+                        });
+                    }
                 }
-            }
-        });
-        ui.add_space(12.0);
+            });
+            ui.add_space(12.0);
+        }
         ui.horizontal(|ui| {
             ui.label("Rechercher");
-            ui.add(egui::TextEdit::singleline(&mut self.search).desired_width(210.0));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .desired_width(210.0)
+                    .hint_text("Filtrer par nom…"),
+            );
             egui::ComboBox::from_id_salt("library-source")
                 .selected_text(if self.source.is_empty() {
                     "Toutes les sources"
+                } else if self.source.eq_ignore_ascii_case("manual") {
+                    "Manuel"
                 } else {
                     &self.source
                 })
@@ -347,7 +382,12 @@ impl Panel {
                         sources.sort_unstable();
                         sources.dedup();
                         for source in sources {
-                            ui.selectable_value(&mut self.source, source.into(), source);
+                            let label = if source.eq_ignore_ascii_case("manual") {
+                                "Manuel"
+                            } else {
+                                source
+                            };
+                            ui.selectable_value(&mut self.source, source.into(), label);
                         }
                     }
                 });
@@ -383,7 +423,12 @@ impl Panel {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.label(t::title(&game.name, 16.0));
-                    views::badge(ui, &game.source, t::ACCENT);
+                    let source_label = if game.source.eq_ignore_ascii_case("manual") {
+                        "Manuel"
+                    } else {
+                        &game.source
+                    };
+                    views::badge(ui, source_label, t::ACCENT);
                     if let Some(pending) = self.pending.get(&game.id) {
                         progress(ui, pending);
                     } else if game.source.eq_ignore_ascii_case("manual")

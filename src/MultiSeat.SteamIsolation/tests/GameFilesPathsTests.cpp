@@ -40,5 +40,7 @@ int main() {
     auto merged = MergeNames({L"cache.bin", L"Save.DAT", L"Host.txt"},
                              {L"CACHE.BIN", L"player.txt"}, {L"save.dat"});
     check(merged == std::vector<std::wstring>({L"CACHE.BIN", L"player.txt", L"Host.txt"}), "overlay union");
+    auto recreated = MergeNames({L"save.dat"}, {L"save.dat"}, {L"save.dat"});
+    check(recreated == std::vector<std::wstring>({L"save.dat"}), "deleted-then-recreated overlay file stays visible");
     return errors ? 1 : 0;
 }
