@@ -104,7 +104,9 @@ public class SharedLibraryProvisionerTests : IDisposable
         var args = SharedLibraryProvisioner.IcaclsArguments(@"C:\MultiSeatGames");
 
         Assert.Contains("(OI)(CI)M", args);
-        Assert.Contains("/T", args);        // and reaches what is already there
+        // Never recurse (/T) into a user-writable directory as SYSTEM: a seat user could plant an
+        // NTFS junction to a privileged directory and gain Modify rights on the next service start.
+        Assert.DoesNotContain("/T", args);
     }
 
     [Fact]

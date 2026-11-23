@@ -141,7 +141,7 @@ internal static class ApolloPairingClient
                 ["display_mode"] = Text(d, "display_mode"),
                 ["perm"] = current | PermPlay,
                 ["enable_legacy_ordering"] = Flag(d, "enable_legacy_ordering", true),
-                ["allow_client_commands"] = Flag(d, "allow_client_commands", true),
+                ["allow_client_commands"] = Flag(d, "allow_client_commands", false),
                 ["always_use_virtual_display"] = Flag(d, "always_use_virtual_display", false),
                 ["do"] = d.TryGetProperty("do", out var doCmds) ? doCmds.Clone() : Array.Empty<object>(),
                 ["undo"] = d.TryGetProperty("undo", out var undoCmds) ? undoCmds.Clone() : Array.Empty<object>(),
@@ -181,7 +181,15 @@ internal static class ApolloPairingClient
         try
         {
             var blob = Convert.FromBase64String(File.ReadAllText(path).Trim());
-            return Encoding.UTF8.GetString(ProtectedData.Unprotect(blob, null, DataProtectionScope.LocalMachine));
+            try
+            {
+                return Encoding.UTF8.GetString(ProtectedData.Unprotect(blob, null, DataProtectionScope.CurrentUser));
+            }
+            catch (CryptographicException)
+            {
+                // Backward-compatible migration for secrets written before switching to CurrentUser (SYSTEM).
+                return Encoding.UTF8.GetString(ProtectedData.Unprotect(blob, null, DataProtectionScope.LocalMachine));
+            }
         }
         catch (Exception) { return null; }
     }
@@ -226,11 +234,13 @@ internal static class ApolloPairingClient
         if (process.ExitCode != 0)
             throw new InvalidOperationException($"Apollo --creds a échoué (code {process.ExitCode})");
         _ = await Task.WhenAll(stdout, stderr);
-        var blob = ProtectedData.Protect(Encoding.UTF8.GetBytes(password), null, DataProtectionScope.LocalMachine);
+        var blob = ProtectedData.Protect(Encoding.UTF8.GetBytes(password), null, DataProtectionScope.CurrentUser);
         Directory.CreateDirectory(apolloConfigDir);
         var path = SecretPath(apolloConfigDir);
-        File.WriteAllText(path, Convert.ToBase64String(blob));
-        Storage.SecureFile.RestrictToSystemAndAdmins(path);
+        var tmpPath = path + $".{Guid.NewGuid():N}.tmp";
+        File.WriteAllText(tmpPath, Convert.ToBase64String(blob));
+        Storage.SecureFile.RestrictToSystemAndAdmins(tmpPath);
+        File.Move(tmpPath, path, overwrite: true);
         return password;
     }
 }

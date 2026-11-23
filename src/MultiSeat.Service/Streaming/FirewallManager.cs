@@ -99,7 +99,7 @@ public sealed class FirewallManager
         await RunNetshAsync(
             $"advfirewall firewall add rule name=\"{ruleName}\" " +
             $"dir=in action=allow protocol=TCP localport={port} " +
-            $"profile=any " +
+            $"profile=private,domain " +
             $"description=\"MultiSeat dashboard and API\"",
             ct);
 
@@ -199,7 +199,8 @@ public sealed class FirewallManager
     {
         try
         {
-            var psi = new ProcessStartInfo("netsh", arguments)
+            var netshPath = Path.Combine(Environment.SystemDirectory, "netsh.exe");
+            var psi = new ProcessStartInfo(netshPath, arguments)
             {
                 CreateNoWindow = true,
                 UseShellExecute = false,

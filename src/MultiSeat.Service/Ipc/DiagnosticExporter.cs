@@ -37,11 +37,33 @@ internal static class DiagnosticExporter
                     using var writer = new StreamWriter(zip.CreateEntry(entry, CompressionLevel.Fastest).Open(), Encoding.UTF8);
                     writer.Write(Encoding.UTF8.GetString(bytes));
                 }
-                void AddFile(string source, string entry)
+                static bool HasReparsePoint(string filePath, string? stopAt)
                 {
                     try
                     {
-                        if (!File.Exists(source) || new FileInfo(source).Length > 5 * 1024 * 1024) return;
+                        var current = Path.GetFullPath(filePath);
+                        var limit = string.IsNullOrEmpty(stopAt) ? null : Path.GetFullPath(stopAt);
+                        while (!string.IsNullOrEmpty(current))
+                        {
+                            if ((File.Exists(current) || Directory.Exists(current)) &&
+                                (File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
+                                return true;
+                            if (limit is not null && string.Equals(current, limit, StringComparison.OrdinalIgnoreCase))
+                                break;
+                            var parent = Path.GetDirectoryName(current);
+                            if (string.IsNullOrEmpty(parent) || string.Equals(parent, current, StringComparison.OrdinalIgnoreCase))
+                                break;
+                            current = parent;
+                        }
+                        return false;
+                    }
+                    catch (Exception) { return true; } // fail closed on inaccessible metadata
+                }
+                void AddFile(string source, string entry, string? stopAt = null)
+                {
+                    try
+                    {
+                        if (!File.Exists(source) || HasReparsePoint(source, stopAt) || new FileInfo(source).Length > 5 * 1024 * 1024) return;
                         AddText(entry, File.ReadAllText(source));
                     }
                     catch (Exception) { /* Unavailable or locked log: continue with the rest. */ }
@@ -62,18 +84,18 @@ internal static class DiagnosticExporter
                     if (account.Length is < 1 or > 128 || account is "." or ".." ||
                         account.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || account.Contains('/') || account.Contains('\\')) continue;
                     var agent = Path.Combine(usersRoot, account, "AppData", "Local", "Kinseat");
-                    AddFile(Path.Combine(agent, "agent.log"), "agents/" + alias + "/agent.log");
-                    AddFile(Path.Combine(agent, "agent.log.1"), "agents/" + alias + "/agent.log.1");
+                    AddFile(Path.Combine(agent, "agent.log"), "agents/" + alias + "/agent.log", usersRoot);
+                    AddFile(Path.Combine(agent, "agent.log.1"), "agents/" + alias + "/agent.log.1", usersRoot);
                     var apollo = Path.Combine(programData, "MultiSeat", "apollo", account);
                     if (Directory.Exists(apollo))
                         foreach (var log in Directory.EnumerateFiles(apollo, "*.log").Take(5))
-                            AddFile(log, "apollo/" + alias + "/" + Path.GetFileName(log));
+                            AddFile(log, "apollo/" + alias + "/" + Path.GetFileName(log), programData);
                 }
                 if (hostAccount is { Length: > 0 and <= 128 } && hostAccount is not ("." or "..") &&
                     hostAccount.IndexOfAny(Path.GetInvalidFileNameChars()) < 0 &&
                     !hostAccount.Contains('/') && !hostAccount.Contains('\\'))
                     AddFile(Path.Combine(usersRoot, hostAccount, "AppData", "Local", "Kinseat", "logs", "kinseat-app.log"),
-                        "hote/kinseat-app.log");
+                        "hote/kinseat-app.log", usersRoot);
                 if (OperatingSystem.IsWindows())
                 {
                     foreach (var channel in new[] { "Application", "System" })

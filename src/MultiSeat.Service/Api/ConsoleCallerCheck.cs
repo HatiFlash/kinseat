@@ -168,6 +168,6 @@ public sealed class ConsoleCallerCheck
     private bool IsSeatAccount(string sid)
     {
         try { return _seatSids().Contains(sid, StringComparer.OrdinalIgnoreCase); }
-        catch (Exception) { return false; } // the set could not be obtained: nothing extra is refused
+        catch (Exception) { return true; } // fail closed: an unresolvable seat set refuses access
     }
 }

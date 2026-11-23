@@ -214,11 +214,12 @@ public static class ApiServer
             // for a browser client is a post-upgrade handshake, and because this API is
             // loopback/LAN with no request logging of query strings. Header is preferred and
             // checked first — non-browser clients should use it.
+            var isWebSocket = context.Request.Path.StartsWithSegments("/ws");
             var presented = context.Request.Headers.TryGetValue(Constants.ApiKeyHeader, out var header)
                 ? header.ToString()
-                : context.Request.Query["key"].ToString();
+                : (isWebSocket ? context.Request.Query["key"].ToString() : string.Empty);
 
-            if (string.IsNullOrEmpty(presented) || presented != authState.ApiKey)
+            if (string.IsNullOrEmpty(presented) || !ConstantTimeEquals(presented, authState.ApiKey))
             {
                 context.Response.StatusCode = 401;
                 await context.Response.WriteAsJsonAsync(new { error = "Unauthorized" });
@@ -287,10 +288,20 @@ public static class ApiServer
         var generated = Convert.ToBase64String(raw)
             .Replace('+', 'A').Replace('/', 'B').Replace('=', 'C');
 
-        Directory.CreateDirectory(Path.GetDirectoryName(keyFile)!);
-        File.WriteAllText(keyFile, generated);
-        HardenKeyFile(keyFile, log);
+        var dir = Path.GetDirectoryName(keyFile)!;
+        Directory.CreateDirectory(dir);
+        var tmpFile = Path.Combine(dir, $"api-key.{Guid.NewGuid():N}.tmp");
+        File.WriteAllText(tmpFile, generated);
+        HardenKeyFile(tmpFile, log);
+        File.Move(tmpFile, keyFile, overwrite: true);
         return generated;
+    }
+
+    private static bool ConstantTimeEquals(string a, string b)
+    {
+        var aBytes = System.Text.Encoding.UTF8.GetBytes(a);
+        var bBytes = System.Text.Encoding.UTF8.GetBytes(b);
+        return CryptographicOperations.FixedTimeEquals(aBytes, bBytes);
     }
 
     private static void HardenKeyFile(string keyFile, ILogger log) =>
