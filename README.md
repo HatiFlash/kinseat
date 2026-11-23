@@ -6,7 +6,7 @@ Kinseat transforme un PC Windows puissant en console partagée pour la famille o
 
 > Version actuelle : **0.3.18** (préversion). Kinseat est testé sur un laboratoire de machines virtuelles et sur un vrai PC familial ; les limites connues sont listées dans chaque note de version.
 
-![Vue d'ensemble de Kinseat Hôte](docs/images/hote-vue-ensemble.png)
+![Vue d'ensemble de Kinseat Hôte](docs/images/hote-vue-ensemble-0.3.18.png)
 *Kinseat Hôte : cartes de places compactes avec télémétrie, ressources du PC unifiées et alertes en direct. (Capture avec données de démonstration.)*
 
 ---
@@ -51,7 +51,7 @@ PC hôte (Kinseat Hôte — Windows x64)
 
 ### 3. L'hôte crée la place du joueur
 
-![Création d'une place](docs/images/hote-ajouter-place.png)
+![Création d'une place](docs/images/hote-ajouter-place-0.3.18.png)
 *Membre existant ou nouveau membre, code à 4 chiffres ou session sans mot de passe, profil graphique (Éco / Équilibré / Qualité / Personnalisé) et budget VRAM.*
 
 ### 4. L'hôte choisit les jeux autorisés
