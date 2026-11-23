@@ -42,7 +42,7 @@ function Invoke-Fixture([string]$directory, [string]$tail, [bool]$expectReady, [
 foreach ($suffix in @('', '32')) {
     $directory = Join-Path $runRoot $(if ($suffix) { 'x86' } else { 'x64' })
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
-    foreach ($name in @('Kinseat.SteamLauncher.exe', 'Kinseat.SteamLauncher32.exe', "MultiSeat.SteamHook$suffix.dll")) {
+    foreach ($name in @('Kinseat.SteamLauncher.exe', 'Kinseat.SteamLauncher32.exe', "Kinseat.SteamHook$suffix.dll")) {
         Copy-Item -LiteralPath (Join-Path $source $name) -Destination $directory
     }
     # Only the compiled harmless fixture is named steam.exe; installed Steam is never used.
