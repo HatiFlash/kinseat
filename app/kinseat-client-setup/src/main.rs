@@ -53,6 +53,8 @@ struct Setup {
     requested: bool,
     frames: u8,
     pending: bool,
+    #[cfg(windows)]
+    install_rx: Option<std::sync::mpsc::Receiver<(Result<(), String>, Option<String>)>>,
     error: Option<String>,
 }
 impl Setup {
@@ -104,6 +106,8 @@ impl Setup {
             requested: false,
             frames: 0,
             pending: false,
+            #[cfg(windows)]
+            install_rx: None,
             error: None,
         }
     }
@@ -124,24 +128,32 @@ impl Setup {
         .clicked()
     }
     #[cfg(windows)]
-    fn perform(&mut self) {
-        let result = windows::paths().and_then(|p| {
-            if self.uninstall {
-                windows::uninstall(&p, self.erase)
-            } else {
-                windows::install(&p, self.desktop, self.menu)?;
-                if self.firewall {
-                    if let Err(e) = windows::allow_firewall(&p) {
-                        self.notice = Some(e);
+    fn start_perform(&mut self, ctx: egui::Context) {
+        let uninstall = self.uninstall;
+        let erase = self.erase;
+        let desktop = self.desktop;
+        let menu = self.menu;
+        let firewall = self.firewall;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.install_rx = Some(rx);
+        std::thread::spawn(move || {
+            let mut notice = None;
+            let result = windows::paths().and_then(|p| {
+                if uninstall {
+                    windows::uninstall(&p, erase)
+                } else {
+                    windows::install(&p, desktop, menu)?;
+                    if firewall {
+                        if let Err(e) = windows::allow_firewall(&p) {
+                            notice = Some(e);
+                        }
                     }
+                    Ok(())
                 }
-                Ok(())
-            }
+            });
+            let _ = tx.send((result, notice));
+            ctx.request_repaint();
         });
-        if let Err(e) = result {
-            self.error = Some(e);
-        }
-        self.screen = Screen::Fin;
     }
     fn capture(&mut self, ctx: &egui::Context) {
         let Some(path) = &self.screenshot else { return };
@@ -170,11 +182,27 @@ impl Setup {
 }
 impl eframe::App for Setup {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(std::time::Duration::from_millis(80));
         #[cfg(windows)]
-        if self.pending && !self.demo {
-            self.pending = false;
-            self.perform();
+        {
+            if self.pending && !self.demo {
+                self.pending = false;
+                self.start_perform(ctx.clone());
+            }
+            if let Some(rx) = &self.install_rx {
+                if let Ok((result, notice)) = rx.try_recv() {
+                    if let Err(e) = result {
+                        self.error = Some(e);
+                    }
+                    self.notice = notice;
+                    self.install_rx = None;
+                    self.screen = Screen::Fin;
+                } else {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
+                }
+            }
+        }
+        if self.screenshot.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(80));
         }
         egui::SidePanel::left("rail")
             .exact_width(210.0)
@@ -237,8 +265,8 @@ impl eframe::App for Setup {
                             ui.checkbox(&mut self.launch, "Lancer à la fin");
                         }
                     }
-                    Screen::Installation => { Self::label(ui, "FICHIERS  ·  RACCOURCIS  ·  ENREGISTREMENT", 13.0, AMBER); ui.add_space(16.0); Self::label(ui, if self.demo { "Aucune modification en mode démonstration." } else { "Veuillez patienter…" }, 14.0, SUB); }
-                    Screen::Fin => { Self::label(ui, if self.uninstall { "Désinstallation terminée" } else { "Kinseat Client 0.3.4" }, 17.0, TEXT); ui.add_space(12.0); if let Some(e) = &self.error { Self::label(ui, e, 13.0, AMBER); } else { Self::label(ui, if self.demo { "Capture de démonstration · aucun logiciel installé." } else if self.uninstall { "Kinseat Client a été retiré de cette session." } else { "Installation terminée. Ouvrez Kinseat Client, choisissez votre place et saisissez le code sur le PC hôte." }, 13.0, SUB); if let Some(n) = &self.notice { ui.add_space(8.0); Self::label(ui, n, 13.0, AMBER); } } }
+                    Screen::Installation => { Self::label(ui, "FICHIERS  ·  RACCOURCIS  ·  ENREGISTREMENT", 13.0, AMBER); ui.add_space(16.0); ui.horizontal(|ui| { if !self.demo { ui.spinner(); } Self::label(ui, if self.demo { "Aucune modification en mode démonstration." } else { "Veuillez patienter…" }, 14.0, SUB); }); }
+                    Screen::Fin => { Self::label(ui, if self.uninstall { "Désinstallation terminée" } else { concat!("Kinseat Client ", env!("CARGO_PKG_VERSION")) }, 17.0, TEXT); ui.add_space(12.0); if let Some(e) = &self.error { Self::label(ui, e, 13.0, AMBER); } else { Self::label(ui, if self.demo { "Capture de démonstration · aucun logiciel installé." } else if self.uninstall { "Kinseat Client a été retiré de cette session." } else { "Installation terminée. Ouvrez Kinseat Client, choisissez votre place et saisissez le code sur le PC hôte." }, 13.0, SUB); if let Some(n) = &self.notice { ui.add_space(8.0); Self::label(ui, n, 13.0, AMBER); } } }
                 }
             });
             ui.add_space(24.0);

@@ -1,4 +1,4 @@
-use crate::{stream_menu, Client, Screen, STREAM_SHORTCUTS};
+use crate::{stream_menu, theme as t, Client, Screen, STREAM_SHORTCUTS};
 use egui::{Color32, RichText};
 use std::{
     net::{TcpStream, ToSocketAddrs},
@@ -27,7 +27,7 @@ fn draw(
 ) {
     ui.set_width(336.0);
     ui.add_space(24.0);
-    ui.heading(RichText::new("Kinseat · Session").color(Color32::from_rgb(108, 218, 195)));
+    ui.heading(RichText::new("Kinseat · Session").color(t::ACCENT));
     ui.separator();
     for (key, value) in [
         ("Place", &snapshot.name),
@@ -37,8 +37,8 @@ fn draw(
         ("Latence réseau", &snapshot.latency),
         ("Manettes", &snapshot.controllers),
     ] {
-        ui.label(RichText::new(key).color(Color32::GRAY));
-        ui.label(value);
+        ui.label(RichText::new(key).color(t::SECONDARY));
+        ui.label(RichText::new(value).color(t::PRIMARY));
         ui.add_space(8.0);
     }
     ui.separator();
@@ -50,17 +50,25 @@ fn draw(
             let _ = actions.send(action);
         }
     };
-    button(ui, "Reprendre", stream_menu::Action::Resume);
+    if ui
+        .add_sized(
+            [320.0, 32.0],
+            egui::Button::new(RichText::new("Reprendre").color(t::ON_ACCENT)).fill(t::ACCENT),
+        )
+        .clicked()
+    {
+        let _ = actions.send(stream_menu::Action::Resume);
+    }
     ui.add_space(12.0);
     if snapshot.state.confirm_quit {
-        ui.colored_label(Color32::LIGHT_RED, "Quitter ce flux ?");
+        ui.colored_label(t::ERR, "Quitter ce flux ?");
         button(ui, "Confirmer la sortie", stream_menu::Action::Quit);
         button(ui, "Annuler", stream_menu::Action::CancelQuit);
     } else if ui
         .add_sized(
             [320.0, 32.0],
-            egui::Button::new(RichText::new("Quitter le flux").color(Color32::WHITE))
-                .fill(Color32::from_rgb(107, 37, 47)),
+            egui::Button::new(RichText::new("Quitter le flux").color(t::PRIMARY))
+                .fill(Color32::from_rgb(0x6b, 0x26, 0x24)),
         )
         .clicked()
     {
@@ -232,15 +240,15 @@ impl Client {
                     self.close_panel();
                     #[cfg(windows)]
                     if let Some(pid) = self.moonlight_pid {
-                        let ok = if key == b'Z' {
-                            crate::stream_windows::release_mouse(pid)
-                        } else {
-                            crate::stream_windows::send_shortcut(pid, key as u16)
-                        };
-                        if !ok {
-                            self.notice =
-                                Some("Impossible d'envoyer le raccourci à Moonlight".into());
-                        }
+                        // Exécuter hors du thread UI pour éviter de geler l'interface pendant
+                        // la remise du focus et l'injection du raccourci (300 ms à 1,3 s).
+                        std::thread::spawn(move || {
+                            if key == b'Z' {
+                                let _ = crate::stream_windows::release_mouse(pid);
+                            } else {
+                                let _ = crate::stream_windows::send_shortcut(pid, key as u16);
+                            }
+                        });
                     }
                     #[cfg(not(windows))]
                     let _ = key;
@@ -268,7 +276,7 @@ impl Client {
                 .exact_width(360.0)
                 .frame(
                     egui::Frame::new()
-                        .fill(Color32::from_rgb(19, 25, 33))
+                        .fill(t::RAIL)
                         .inner_margin(12.0),
                 )
                 .show(ctx, |ui| {
@@ -304,7 +312,7 @@ impl Client {
                     egui::CentralPanel::default()
                         .frame(
                             egui::Frame::new()
-                                .fill(Color32::from_rgb(19, 25, 33))
+                                .fill(t::RAIL)
                                 .inner_margin(12.0),
                         )
                         .show(child, |ui| {

@@ -332,10 +332,16 @@ impl Panel {
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             ui.label("Rechercher");
-            ui.add(egui::TextEdit::singleline(&mut self.search).desired_width(210.0));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .desired_width(210.0)
+                    .hint_text("Filtrer par nom…"),
+            );
             egui::ComboBox::from_id_salt("library-source")
                 .selected_text(if self.source.is_empty() {
                     "Toutes les sources"
+                } else if self.source.eq_ignore_ascii_case("manual") {
+                    "Manuel"
                 } else {
                     &self.source
                 })
@@ -347,7 +353,12 @@ impl Panel {
                         sources.sort_unstable();
                         sources.dedup();
                         for source in sources {
-                            ui.selectable_value(&mut self.source, source.into(), source);
+                            let label = if source.eq_ignore_ascii_case("manual") {
+                                "Manuel"
+                            } else {
+                                source
+                            };
+                            ui.selectable_value(&mut self.source, source.into(), label);
                         }
                     }
                 });
@@ -383,7 +394,12 @@ impl Panel {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.label(t::title(&game.name, 16.0));
-                    views::badge(ui, &game.source, t::ACCENT);
+                    let source_label = if game.source.eq_ignore_ascii_case("manual") {
+                        "Manuel"
+                    } else {
+                        &game.source
+                    };
+                    views::badge(ui, source_label, t::ACCENT);
                     if let Some(pending) = self.pending.get(&game.id) {
                         progress(ui, pending);
                     } else if game.source.eq_ignore_ascii_case("manual")
