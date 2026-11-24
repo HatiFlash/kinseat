@@ -2936,8 +2936,12 @@ impl Kinseat {
                 }
             }
             self.screenshot_frames = self.screenshot_frames.saturating_add(1);
+            // Laisser finir fondus et dimensionnement des fenêtres avant de capturer.
+            if !self.screenshot_requested && self.screenshot_frames < 40 {
+                ctx.request_repaint_after(Duration::from_millis(25));
+            }
             if !self.screenshot_requested
-                && self.screenshot_frames >= 2
+                && self.screenshot_frames >= 40
                 && !self.pending
                 && (self.health.is_some() || self.fault.is_some())
                 && (!self.capture_preview

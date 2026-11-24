@@ -4,10 +4,10 @@
 
 Kinseat transforme un PC Windows puissant en console partagée pour la famille ou la maison : chaque joueur reçoit sa propre **place**, c'est-à-dire une session Windows à lui, avec son écran virtuel, son son, sa manette et ses jeux. Il y joue depuis un autre appareil (PC portable, mini-PC Windows x64/ARM64, Linux ou Mac) grâce au streaming, pendant que la personne assise devant le PC continue de l'utiliser normalement.
 
-> Version actuelle : **0.3.18** (préversion). Kinseat est testé sur un laboratoire de machines virtuelles et sur un vrai PC familial ; les limites connues sont listées dans chaque note de version.
+> Version actuelle : **0.3.20** (préversion). Kinseat est testé sur un laboratoire de machines virtuelles et sur un vrai PC familial ; les limites connues sont listées dans chaque note de version.
 
-![Vue d'ensemble de Kinseat Hôte](docs/images/hote-vue-ensemble-0.3.18.png)
-*Kinseat Hôte : cartes de places compactes avec télémétrie, ressources du PC unifiées et alertes en direct. (Capture avec données de démonstration.)*
+![Vue d'ensemble de Kinseat Hôte](docs/images/hote-vue-ensemble-0.3.20.png)
+*Kinseat Hôte : cartes de places avec état et télémétrie, préavis de fin annulable directement dans la carte, ressources du PC unifiées et alertes en direct. (Capture avec données de démonstration.)*
 
 ---
 
@@ -46,20 +46,40 @@ PC hôte (Kinseat Hôte — Windows x64)
 
 ### 2. L'hôte reçoit la demande
 
-![Demande d'accès côté hôte](docs/images/hote-demande-acces-0.3.18.png)
+![Demande d'accès côté hôte](docs/images/hote-demande-acces-0.3.20.png)
 *La demande apparaît sur le PC hôte avec choix immédiat de la place, du profil graphique et vérification du budget VRAM.*
 
 ### 3. L'hôte crée la place du joueur
 
-![Création d'une place](docs/images/hote-ajouter-place-0.3.18.png)
+![Création d'une place](docs/images/hote-ajouter-place-0.3.20.png)
 *Membre existant ou nouveau membre, code à 4 chiffres ou session sans mot de passe, profil graphique (Éco / Équilibré / Qualité / Personnalisé) et budget VRAM.*
 
 ### 4. L'hôte choisit les jeux autorisés
 
-![Bibliothèque](docs/images/hote-bibliotheque-0.3.18.png)
+![Bibliothèque](docs/images/hote-bibliotheque-0.3.20.png)
 *La bibliothèque regroupe les jeux détectés ou ajoutés manuellement (panneau repliable `+ Ajouter un jeu`). Pour chaque jeu : joueurs autorisés et option « Partir de la sauvegarde de l'hôte ». (Capture avec jeux fictifs.)*
 
 Le joueur est ensuite appairé et lance sa session depuis le Client. Pendant le jeu, **Alt+K** ouvre un menu latéral harmonisé par-dessus le flux : statistiques en grille compacte, libérer la souris, plein écran ou fenêtré, coller le presse-papiers, réduire, quitter le flux.
+
+## Les autres pages de Kinseat Hôte
+
+### Places
+
+![Places](docs/images/hote-places-0.3.20.png)
+*Liste des places adaptée à la largeur de la fenêtre : état, activité, affichage et session. Le préavis de fin s'affiche sous la place concernée et s'annule en un clic. Les 5 dernières fins de session restent visibles, avec un bouton « Effacer l'historique ».*
+
+### Membres
+
+![Membres](docs/images/hote-membres-0.3.20.png)
+*Chaque membre affiche l'état de sa place, sa résolution et l'appareil associé ; un membre sans place se voit proposer « Créer sa place ».*
+
+### Paramètres
+
+![Paramètres](docs/images/hote-parametres-0.3.20.png)
+*Fréquence d'image commune, réserve de mémoire vidéo du poste principal sur une ligne (« Appliquer » ne s'active que si la valeur change), profil graphique par défaut et confort. Une ombre en haut ou en bas signale le contenu à faire défiler sur les petits écrans.*
+
+Dans toutes les fenêtres de dialogue, **Échap** annule et **Entrée** valide l'action principale (jamais une action destructrice comme Supprimer ou Retirer).
+
 
 ## Installation
 
@@ -109,6 +129,8 @@ En cas de problème, les journaux à joindre sont décrits dans [docs/kinseat/jo
 | `app/kinseat-client` | Kinseat Client multi-plateformes (Rust, egui) et overlay `Alt+K` |
 | `app/kinseat-setup`, `app/kinseat-client-setup` | installateurs Windows autonomes |
 | `installer/`, `packaging/` | assemblage des installateurs Windows et paquets Linux/macOS |
+
+Captures de toutes les pages en mode démonstration : `scripts/ui-screenshots.sh` (aussi produites à chaque CI dans l'artefact `ui-screenshots`).
 
 Contrôles courants : `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets`, `cargo test --workspace` dans `app/`, et `dotnet test src/Kinseat.slnx`. La CI valide automatiquement `.NET 10`, `Rust`, `C++ (x64/x86)` et `PowerShell 5.1/7`.
 
