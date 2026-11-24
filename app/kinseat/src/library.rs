@@ -360,10 +360,12 @@ impl Panel {
             ui.add_space(12.0);
         }
         ui.horizontal(|ui| {
+            ui.spacing_mut().interact_size.y = 30.0;
             ui.label("Rechercher");
-            ui.add(
+            ui.add_sized(
+                [210.0, 30.0],
                 egui::TextEdit::singleline(&mut self.search)
-                    .desired_width(210.0)
+                    .vertical_align(egui::Align::Center)
                     .hint_text("Filtrer par nom…"),
             );
             egui::ComboBox::from_id_salt("library-source")
@@ -422,6 +424,7 @@ impl Panel {
             t::frame().show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
+                    ui.set_min_height(30.0);
                     ui.label(t::title(&game.name, 16.0));
                     let source_label = if game.source.eq_ignore_ascii_case("manual") {
                         "Manuel"
@@ -431,11 +434,16 @@ impl Panel {
                     views::badge(ui, source_label, t::ACCENT);
                     if let Some(pending) = self.pending.get(&game.id) {
                         progress(ui, pending);
-                    } else if game.source.eq_ignore_ascii_case("manual")
-                        && ui.button("Retirer").clicked()
-                        && self.pending.begin(&game.id, PendingAction::Remove)
-                    {
-                        action = Some(Command::LibraryRemove(game.id.clone()));
+                    } else if game.source.eq_ignore_ascii_case("manual") {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(egui::Button::new("Retirer").min_size(egui::vec2(76.0, 30.0)))
+                                .clicked()
+                                && self.pending.begin(&game.id, PendingAction::Remove)
+                            {
+                                action = Some(Command::LibraryRemove(game.id.clone()));
+                            }
+                        });
                     }
                 });
                 ui.label(t::text(&game.install_path, 12.0, t::FAINT));

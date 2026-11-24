@@ -1382,6 +1382,7 @@ impl Kinseat {
         theme::frame().inner_margin(24).show(ui, |ui| {
             ui.set_width(ui.available_width().min(640.0));
             ui.label(theme::title("Graphismes et confort", 19.0));
+            ui.add_space(14.0);
             ui.label(theme::text("Réserve VRAM pour le poste principal (Mo)", 14.0, theme::PRIMARY));
             ui.add(egui::DragValue::new(&mut self.reserve_mb).range(0..=65536).speed(128));
             if ui.button("Appliquer la réserve").clicked() {

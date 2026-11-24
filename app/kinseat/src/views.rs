@@ -19,20 +19,25 @@ pub fn devices(
 ) -> Option<DeviceIntent> {
     let mut intent = None;
     ui.horizontal(|ui| {
+        ui.set_min_height(34.0);
         ui.label(t::text(
             "Appareils associés à chaque place",
             15.0,
             t::SECONDARY,
         ));
-        if ui
-            .add(
-                egui::Button::new(t::text("+ Associer un appareil", 14.0, t::ON_ACCENT))
-                    .fill(t::ACCENT),
-            )
-            .clicked()
-        {
-            intent = Some(DeviceIntent::Associate);
-        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add(
+                    egui::Button::new(t::text("+ Associer un appareil", 14.0, t::ON_ACCENT))
+                        .fill(t::ACCENT)
+                        .corner_radius(6)
+                        .min_size(vec2(170.0, 30.0)),
+                )
+                .clicked()
+            {
+                intent = Some(DeviceIntent::Associate);
+            }
+        });
     });
     if demo {
         ui.label(t::text(
@@ -62,10 +67,16 @@ pub fn devices(
                 }
                 for name in names {
                     ui.horizontal(|ui| {
+                        ui.set_min_height(30.0);
                         ui.label(t::text(name, 14.0, t::PRIMARY));
-                        if ui.button("Retirer").clicked() {
-                            intent = Some(DeviceIntent::Remove(seat.id.clone(), name.clone()));
-                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(egui::Button::new("Retirer").min_size(vec2(76.0, 26.0)))
+                                .clicked()
+                            {
+                                intent = Some(DeviceIntent::Remove(seat.id.clone(), name.clone()));
+                            }
+                        });
                     });
                 }
             } else {
@@ -789,7 +800,7 @@ pub fn seats(
             .iter()
             .find(|n| n.active() && n.notice.seat_id == seat.id);
         let (r, resp) = ui.allocate_exact_size(
-            vec2(width, if notice.is_some() { 84.0 } else { 56.0 }),
+            vec2(width, if notice.is_some() { 94.0 } else { 56.0 }),
             Sense::click(),
         );
         if resp.clicked() {
@@ -891,19 +902,27 @@ pub fn seats(
         if let Some(n) = notice {
             dot_label(
                 p,
-                pos2(r.left() + 16.0, r.top() + 62.0),
+                pos2(r.left() + 16.0, r.top() + 66.0),
                 &n.label(),
                 n.color(),
             );
             if n.notice.phase != NoticePhase::Closing {
                 let cancel = Rect::from_min_size(
-                    pos2(r.right() - 92.0, r.top() + 59.0),
-                    vec2(76.0, 22.0),
+                    pos2(r.right() - 92.0, r.top() + 62.0),
+                    vec2(76.0, 24.0),
                 );
                 let button = egui::Button::new(t::text("Annuler", 12.0, t::PRIMARY))
                     .fill(t::BORDER)
-                    .corner_radius(6);
-                if ui.put(cancel, button).clicked() {
+                    .corner_radius(6)
+                    .small()
+                    .min_size(vec2(76.0, 24.0));
+                let clicked = ui
+                    .scope(|ui| {
+                        ui.spacing_mut().interact_size.y = 24.0;
+                        ui.put(cancel, button).clicked()
+                    })
+                    .inner;
+                if clicked {
                     intent = Some(SeatIntent::Command(Command::Cancel(seat.id.clone())));
                 }
             }
@@ -1145,7 +1164,7 @@ pub fn members(
             &account.username,
             t::title_font(14.0),
             t::PRIMARY,
-            width * 0.4,
+            (((width - 32.0) * 0.2).clamp(130.0, 230.0).max(190.0) - 46.0).max(60.0),
         );
         let (label, color) = if account.has_seat {
             ("A une place", t::OK)
@@ -1154,7 +1173,10 @@ pub fn members(
         };
         dot_label(
             p,
-            pos2(r.left() + width * 0.45, r.center().y - 8.0),
+            pos2(
+                r.left() + 16.0 + ((width - 32.0) * 0.2).clamp(130.0, 230.0).max(190.0),
+                r.center().y - 8.0,
+            ),
             label,
             color,
         );
