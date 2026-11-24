@@ -1192,9 +1192,10 @@ pub fn members(
         }
         ui.scope_builder(
             egui::UiBuilder::new().max_rect(Rect::from_min_size(
-                pos2(r.right() - 35.0, r.top() + 10.0),
-                vec2(32.0, 34.0),
-            )),
+                pos2(r.right() - 52.0, r.center().y - 15.0),
+                vec2(40.0, 30.0),
+            ))
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
             |ui| {
                 ui.menu_button("…", |ui| {
                     if account.deletable && ui.button("Supprimer le membre…").clicked() {
@@ -1212,7 +1213,7 @@ pub fn members(
         );
         if !account.has_seat {
             let b = Rect::from_min_size(
-                pos2(r.right() - 196.0, r.center().y - 15.0),
+                pos2(r.right() - 216.0, r.center().y - 15.0),
                 vec2(150.0, 30.0),
             );
             if ui

@@ -1352,7 +1352,7 @@ impl Kinseat {
                     for interval in &rate.allowed_intervals_ms {
                         let hz = kinseat_ipc::interval_hz(*interval);
                         let label = if *interval == rate.default_interval_ms { format!("{hz} i/s (recommandé)") } else { format!("{hz} i/s") };
-                        if ui.add_enabled(!self.refresh_rate_pending, theme::choice_button(rate.interval_ms == *interval, label)).clicked() && rate.interval_ms != *interval {
+                        if ui.add(theme::choice_button(rate.interval_ms == *interval, label)).clicked() && !self.refresh_rate_pending && rate.interval_ms != *interval {
                             self.refresh_rate_pending = true;
                             self.dispatch(Command::RefreshRateSet(*interval));
                         }

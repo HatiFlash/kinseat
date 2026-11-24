@@ -360,10 +360,10 @@ impl Panel {
             ui.add_space(12.0);
         }
         ui.horizontal(|ui| {
-            ui.spacing_mut().interact_size.y = 30.0;
-            ui.label("Rechercher");
+            ui.spacing_mut().interact_size.y = 32.0;
+            ui.add_sized([80.0, 32.0], egui::Label::new("Rechercher"));
             ui.add_sized(
-                [210.0, 30.0],
+                [210.0, 32.0],
                 egui::TextEdit::singleline(&mut self.search)
                     .vertical_align(egui::Align::Center)
                     .hint_text("Filtrer par nom…"),
