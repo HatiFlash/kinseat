@@ -451,7 +451,7 @@ public sealed class MultiSeatOptions
 
     /// <summary>Absolute path to the supervising x64 launcher; matching hooks live beside it.</summary>
     public string SteamIsolationLauncherPath { get; set; } =
-        @"C:\Program Files\MultiSeat\SteamIsolation\Kinseat.SteamLauncher.exe";
+        @"C:\Program Files\Kinseat\SteamIsolation\Kinseat.SteamLauncher.exe";
 
     /// <summary>Game-file launcher shipped beside the service in the SteamIsolation publication folder.</summary>
     public string GameFilesLauncherPath { get; set; } =
