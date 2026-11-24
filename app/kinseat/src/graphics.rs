@@ -103,10 +103,13 @@ pub fn gauge(
 ) {
     if let Some(budget) = budget {
         ui.label(theme::text(format!("{} : {} Mo libres sur {} Mo attribuables aux places ({} Mo gardés pour le poste principal)", budget.gpu_name, budget.free_mb, budget.usable_mb, budget.host_reserve_mb), 13.0, theme::PRIMARY));
-        let ratio = if budget.usable_mb == 0 {
+        let over = choice.budget_mb() > budget.free_mb;
+        let ratio = if over {
+            1.0
+        } else if budget.free_mb == 0 {
             0.0
         } else {
-            budget.free_mb as f32 / budget.usable_mb as f32
+            choice.budget_mb() as f32 / budget.free_mb as f32
         };
         let target = ratio.clamp(0.0, 1.0);
         let value = if reduced {
@@ -117,9 +120,10 @@ pub fn gauge(
         };
         ui.add(
             egui::ProgressBar::new(value)
-                .fill(theme::ACCENT)
+                .fill(if over { theme::ERR } else { theme::ACCENT })
                 .desired_width(340.0),
-        );
+        )
+        .on_hover_text("Budget demandé par rapport à la VRAM libre");
         if choice.budget_mb() > budget.free_mb {
             ui.label(theme::text("Le budget choisi dépasse la VRAM disponible. Réduisez le profil, libérez une place ou diminuez la réserve du poste principal.", 13.0, theme::WARN));
         }
@@ -130,7 +134,7 @@ pub fn gauge(
             theme::SECONDARY,
         ));
     }
-    ui.label(theme::text("Budget indicatif : Windows ne réserve pas la VRAM. L'utilisation réelle est mesurée et un dépassement est signalé.", 12.0, theme::FAINT));
+    ui.label(theme::text("Windows ne réserve pas la VRAM : le budget est indicatif. L'utilisation réelle est mesurée et un dépassement est signalé.", 12.0, theme::FAINT));
 }
 
 pub fn error_text(error: &str) -> String {

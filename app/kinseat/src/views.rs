@@ -685,6 +685,25 @@ const COLS: [(&str, f32); 5] = [
     ("Session", 0.89),
 ];
 
+/// Colonnes de la liste des places selon la largeur utile : la résolution et la session ont
+/// une largeur fixe (jamais tronquées), la colonne Session disparaît sous 700 px.
+/// Retourne les positions relatives et l'indicateur d'affichage de la colonne Session.
+fn seat_cols(inner: f32) -> ([f32; 5], bool) {
+    let inner = inner.max(1.0);
+    let show_session = inner >= 700.0;
+    let right = inner - 32.0;
+    let session = if show_session { right - 72.0 } else { right };
+    let display = session - 150.0;
+    let member = (inner * 0.2).clamp(130.0, 230.0).min(display * 0.3);
+    let state = member;
+    let activity = state + (inner * 0.12).clamp(110.0, 150.0);
+    let activity = activity.min(display - 60.0);
+    (
+        [0.0, state / inner, activity / inner, display / inner, session / inner],
+        show_session,
+    )
+}
+
 pub enum SeatIntent {
     Add,
     Delete(String),
@@ -723,6 +742,7 @@ pub fn seats(
     }
     let width = ui.available_width();
     ui.horizontal(|ui| {
+        ui.set_min_height(34.0);
         ui.label(t::text(
             "Cliquez sur une place pour voir son détail.",
             12.0,
@@ -746,7 +766,13 @@ pub fn seats(
         vec2(width, if seats.is_empty() { 0.0 } else { 20.0 }),
         Sense::hover(),
     );
-    for (name, x) in COLS.iter().filter(|_| !seats.is_empty()).copied() {
+    let (cols, show_session) = seat_cols(width - 32.0);
+    for (i, (name, _)) in COLS.iter().enumerate().filter(|_| !seats.is_empty()) {
+        if i == 4 && !show_session {
+            continue;
+        }
+        let x = cols[i];
+        let name = *name;
         ui.painter().text(
             pos2(head.left() + 16.0 + x * (width - 32.0), head.top()),
             Align2::LEFT_TOP,
@@ -787,14 +813,14 @@ pub fn seats(
         }
         let cy = if notice.is_some() { r.top() + 28.0 } else { r.center().y };
         let p = ui.painter();
-        let col = |i: usize| r.left() + 16.0 + COLS[i].1 * (width - 32.0);
+        let col = |i: usize| r.left() + 16.0 + cols[i] * (width - 32.0);
         let cw = |i: usize| {
-            let next = if i + 1 < COLS.len() {
-                COLS[i + 1].1
+            let next = if i + 1 < cols.len() {
+                cols[i + 1]
             } else {
                 1.0
             };
-            (next - COLS[i].1) * (width - 32.0) - 12.0
+            (next - cols[i]) * (width - 32.0) - 12.0
         };
         avatar(
             p,
@@ -817,10 +843,18 @@ pub fn seats(
             label,
             t::pulse(ui.ctx(), &seat.status, reduced, color),
         );
+        let activity_text = activity(seat);
+        let act_rect = Rect::from_min_size(
+            pos2(col(2), cy - 12.0),
+            vec2(cw(2).max(10.0), 24.0),
+        );
+        ui.interact(act_rect, id.with("activity"), Sense::hover())
+            .on_hover_text(activity_text.clone());
+        let p = ui.painter();
         line(
             p,
             pos2(col(2), cy - 10.0),
-            &activity(seat),
+            &activity_text,
             FontId::proportional(14.0),
             t::PRIMARY,
             cw(2),
@@ -838,14 +872,16 @@ pub fn seats(
         } else {
             "—".into()
         };
-        line(
-            p,
-            pos2(col(4), cy - 9.0),
-            &session,
-            FontId::proportional(12.0),
-            t::SECONDARY,
-            cw(4) - 16.0,
-        );
+        if show_session {
+            line(
+                p,
+                pos2(col(4), cy - 9.0),
+                &session,
+                FontId::proportional(12.0),
+                t::SECONDARY,
+                cw(4) - 16.0,
+            );
+        }
         // Chevron dessiné (la police n'a pas toujours les flèches).
         let c = pos2(r.right() - 24.0, cy);
         let (a, b) = if open { (-3.0, 3.0) } else { (3.0, -3.0) };
@@ -973,7 +1009,11 @@ pub fn seats(
                         12.0,
                         t::FAINT,
                     ));
-                    ui.label(t::text(&n.notice.message, 12.0, t::SECONDARY));
+                    ui.label(t::text(
+                        format!("Message : « {} »", n.notice.message),
+                        12.0,
+                        t::SECONDARY,
+                    ));
                 });
             });
             ui.add_space(8.0);
