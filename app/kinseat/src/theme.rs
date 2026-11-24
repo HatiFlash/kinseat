@@ -171,8 +171,13 @@ pub struct ModalKeys {
 pub fn modal_keys(ctx: &egui::Context, id: egui::Id, allow_enter: bool) -> ModalKeys {
     let layer = egui::LayerId::new(egui::Order::Middle, id);
     // Un clic sur un voile (scrim) le remonte au-dessus de sa fenêtre : il ne masque pas la modale.
-    let scrims = ["join-request-scrim", "preview-scrim", "add-seat-scrim", "schedule-scrim"]
-        .map(|name| egui::LayerId::new(egui::Order::Middle, egui::Id::new(name)));
+    let scrims = [
+        "join-request-scrim",
+        "preview-scrim",
+        "add-seat-scrim",
+        "schedule-scrim",
+    ]
+    .map(|name| egui::LayerId::new(egui::Order::Middle, egui::Id::new(name)));
     let blocked = ctx.memory(|m| match m.areas().top_layer_id(egui::Order::Middle) {
         Some(top) => top != layer && !scrims.contains(&top),
         None => false,
@@ -183,6 +188,8 @@ pub fn modal_keys(ctx: &egui::Context, id: egui::Id, allow_enter: bool) -> Modal
     let button_focused = ctx.memory(|m| m.focused().is_some()) && !ctx.wants_keyboard_input();
     ctx.input_mut(|i| ModalKeys {
         esc: i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
-        enter: allow_enter && !button_focused && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+        enter: allow_enter
+            && !button_focused
+            && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
     })
 }

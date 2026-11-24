@@ -516,7 +516,11 @@ impl Panel {
         }
         if let Some((game_id, account, folder)) = self.grant_confirm.clone() {
             let (mut cancel, mut confirm) = (false, false);
-            let keys = t::modal_keys(ui.ctx(), egui::Id::new("Donner accès au dossier du jeu ?"), true);
+            let keys = t::modal_keys(
+                ui.ctx(),
+                egui::Id::new("Donner accès au dossier du jeu ?"),
+                true,
+            );
             cancel |= keys.esc;
             let can_confirm = !self.loading && self.pending.get(&game_id).is_none();
             confirm |= keys.enter && can_confirm;

@@ -710,7 +710,13 @@ fn seat_cols(inner: f32) -> ([f32; 5], bool) {
     let activity = state + (inner * 0.12).clamp(110.0, 150.0);
     let activity = activity.min(display - 60.0);
     (
-        [0.0, state / inner, activity / inner, display / inner, session / inner],
+        [
+            0.0,
+            state / inner,
+            activity / inner,
+            display / inner,
+            session / inner,
+        ],
         show_session,
     )
 }
@@ -826,23 +832,18 @@ pub fn seats(
             ui.painter()
                 .rect_stroke(r, 6.0, Stroke::new(2.0_f32, t::ACCENT), StrokeKind::Inside);
         }
-        let cy = if notice.is_some() { r.top() + 28.0 } else { r.center().y };
+        let cy = if notice.is_some() {
+            r.top() + 28.0
+        } else {
+            r.center().y
+        };
         let p = ui.painter();
         let col = |i: usize| r.left() + 16.0 + cols[i] * (width - 32.0);
         let cw = |i: usize| {
-            let next = if i + 1 < cols.len() {
-                cols[i + 1]
-            } else {
-                1.0
-            };
+            let next = if i + 1 < cols.len() { cols[i + 1] } else { 1.0 };
             (next - cols[i]) * (width - 32.0) - 12.0
         };
-        avatar(
-            p,
-            pos2(col(0) + 14.0, cy),
-            14.0,
-            &seat.account_name,
-        );
+        avatar(p, pos2(col(0) + 14.0, cy), 14.0, &seat.account_name);
         line(
             p,
             pos2(col(0) + 38.0, cy - 10.0),
@@ -859,10 +860,7 @@ pub fn seats(
             t::pulse(ui.ctx(), &seat.status, reduced, color),
         );
         let activity_text = activity(seat);
-        let act_rect = Rect::from_min_size(
-            pos2(col(2), cy - 12.0),
-            vec2(cw(2).max(10.0), 24.0),
-        );
+        let act_rect = Rect::from_min_size(pos2(col(2), cy - 12.0), vec2(cw(2).max(10.0), 24.0));
         ui.interact(act_rect, id.with("activity"), Sense::hover())
             .on_hover_text(activity_text.clone());
         let p = ui.painter();
@@ -911,10 +909,8 @@ pub fn seats(
                 n.color(),
             );
             if n.notice.phase != NoticePhase::Closing {
-                let cancel = Rect::from_min_size(
-                    pos2(r.right() - 92.0, r.top() + 62.0),
-                    vec2(76.0, 24.0),
-                );
+                let cancel =
+                    Rect::from_min_size(pos2(r.right() - 92.0, r.top() + 62.0), vec2(76.0, 24.0));
                 let button = egui::Button::new(t::text("Annuler", 12.0, t::PRIMARY))
                     .fill(t::BORDER)
                     .corner_radius(6)
@@ -1051,7 +1047,11 @@ pub fn seats(
                 ui.label(t::text(
                     format!(
                         "{older} {} masquée{}",
-                        if older > 1 { "plus anciennes" } else { "plus ancienne" },
+                        if older > 1 {
+                            "plus anciennes"
+                        } else {
+                            "plus ancienne"
+                        },
                         if older > 1 { "s" } else { "" }
                     ),
                     12.0,
@@ -1243,11 +1243,12 @@ pub fn members(
             ));
         }
         ui.scope_builder(
-            egui::UiBuilder::new().max_rect(Rect::from_min_size(
-                pos2(r.right() - 52.0, r.center().y - 15.0),
-                vec2(40.0, 30.0),
-            ))
-            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            egui::UiBuilder::new()
+                .max_rect(Rect::from_min_size(
+                    pos2(r.right() - 52.0, r.center().y - 15.0),
+                    vec2(40.0, 30.0),
+                ))
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
             |ui| {
                 ui.menu_button("…", |ui| {
                     if account.deletable && ui.button("Supprimer le membre…").clicked() {

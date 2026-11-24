@@ -988,12 +988,12 @@ impl Kinseat {
                 Event::GpuBudget(result) => {
                     self.gpu_reserve_pending = false;
                     match result {
-                    Ok(b) => {
-                        self.reserve_mb = b.host_reserve_mb;
-                        self.gpu_budget = Some(b);
-                        self.gpu_error = None;
-                    }
-                    Err(e) => self.gpu_error = Some(graphics::error_text(&e.to_string())),
+                        Ok(b) => {
+                            self.reserve_mb = b.host_reserve_mb;
+                            self.gpu_budget = Some(b);
+                            self.gpu_error = None;
+                        }
+                        Err(e) => self.gpu_error = Some(graphics::error_text(&e.to_string())),
                     }
                 }
                 Event::LighteningReport(id, result) => {
@@ -1720,7 +1720,8 @@ impl Kinseat {
             .fixed_pos(scrim_rect.min)
             .show(ctx, |ui| {
                 let (rect, _) = ui.allocate_exact_size(scrim_rect.size(), egui::Sense::click());
-                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(145));
+                ui.painter()
+                    .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(145));
             });
         let keys = theme::modal_keys(ctx, egui::Id::new("seat-preview"), true);
         close |= keys.esc;
@@ -1780,7 +1781,9 @@ impl Kinseat {
         let busy = self.seat_pending;
         let screen = ctx.screen_rect().size();
         // Échap ferme ; pas d'action principale unique ici, donc Entrée est ignorée.
-        if theme::modal_keys(ctx, egui::Id::new("seat-settings"), false).esc { open = false; }
+        if theme::modal_keys(ctx, egui::Id::new("seat-settings"), false).esc {
+            open = false;
+        }
         egui::Window::new(format!("Réglages · {}", seat.display_name.as_deref().unwrap_or(&seat.account_name)))
             .id(egui::Id::new("seat-settings"))
             .open(&mut open)
@@ -2241,7 +2244,8 @@ impl Kinseat {
         if let Some(report) = &self.delete_report {
             let mut close = false;
             let mut retry = false;
-            close |= theme::modal_keys(ctx, egui::Id::new("Compte rendu de suppression"), false).esc;
+            close |=
+                theme::modal_keys(ctx, egui::Id::new("Compte rendu de suppression"), false).esc;
             egui::Window::new("Compte rendu de suppression")
                 .collapsible(false)
                 .resizable(false)
@@ -2337,7 +2341,12 @@ impl Kinseat {
         }
         if let Some(report) = &self.member_delete_report {
             let (mut close, mut retry) = (false, false);
-            close |= theme::modal_keys(ctx, egui::Id::new("Compte rendu de suppression du membre"), false).esc;
+            close |= theme::modal_keys(
+                ctx,
+                egui::Id::new("Compte rendu de suppression du membre"),
+                false,
+            )
+            .esc;
             egui::Window::new("Compte rendu de suppression du membre")
                 .collapsible(false)
                 .resizable(false)
@@ -2457,7 +2466,12 @@ impl Kinseat {
     }
     fn modals(&mut self, ctx: &egui::Context) {
         if self.logon_details {
-            let mut open = !theme::modal_keys(ctx, egui::Id::new("Programmes au démarrage des places"), false).esc;
+            let mut open = !theme::modal_keys(
+                ctx,
+                egui::Id::new("Programmes au démarrage des places"),
+                false,
+            )
+            .esc;
             egui::Window::new("Programmes au démarrage des places")
                 .open(&mut open)
                 .collapsible(false)
@@ -2580,7 +2594,12 @@ impl Kinseat {
         }
         if let Some(changes) = self.logon_confirm.clone() {
             let (mut cancel, mut confirm) = (false, false);
-            cancel |= theme::modal_keys(ctx, egui::Id::new("Confirmer la modification des tâches Windows"), false).esc;
+            cancel |= theme::modal_keys(
+                ctx,
+                egui::Id::new("Confirmer la modification des tâches Windows"),
+                false,
+            )
+            .esc;
             egui::Window::new("Confirmer la modification des tâches Windows")
                 .collapsible(false)
                 .resizable(false)
@@ -2739,19 +2758,20 @@ impl Kinseat {
             let mut cancel = false;
             let mut submit = false;
             let scrim_rect = ctx.screen_rect();
-        egui::Area::new(egui::Id::new("schedule-scrim"))
-            .order(egui::Order::Middle)
-            .fixed_pos(scrim_rect.min)
-            .show(ctx, |ui| {
-                let (rect, _) = ui.allocate_exact_size(scrim_rect.size(), egui::Sense::click());
-                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(145));
-            });
+            egui::Area::new(egui::Id::new("schedule-scrim"))
+                .order(egui::Order::Middle)
+                .fixed_pos(scrim_rect.min)
+                .show(ctx, |ui| {
+                    let (rect, _) = ui.allocate_exact_size(scrim_rect.size(), egui::Sense::click());
+                    ui.painter()
+                        .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(145));
+                });
             // Entrée ignorée quand le message (multi-ligne) a le focus.
             let message_focus = ctx.memory(|m| m.has_focus(egui::Id::new("schedule-message")));
             let keys = theme::modal_keys(ctx, egui::Id::new("schedule-modal"), !message_focus);
             cancel |= keys.esc;
             submit |= keys.enter;
-        egui::Window::new("Programmer la fin de session").id(egui::Id::new("schedule-modal"))
+            egui::Window::new("Programmer la fin de session").id(egui::Id::new("schedule-modal"))
                 .frame(egui::Frame::window(&ctx.style()).fill(theme::SURFACE))
                 .collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
@@ -2860,7 +2880,9 @@ impl Kinseat {
         if self.schedule.is_none() && self.confirm_close.is_none() {
             if let Some(error) = self.modal_error.clone() {
                 let esc = theme::modal_keys(ctx, egui::Id::new("Action impossible"), false).esc;
-                if esc { self.modal_error = None; }
+                if esc {
+                    self.modal_error = None;
+                }
                 egui::Window::new("Action impossible")
                     .collapsible(false)
                     .show(ctx, |ui| {
@@ -3438,6 +3460,41 @@ fn main() -> eframe::Result {
     )
 }
 
+/// Dégradés d’ombre en haut/bas d’une zone défilante : indiquent qu’il reste du contenu.
+fn scroll_shadows<T>(ui: &egui::Ui, out: &egui::scroll_area::ScrollAreaOutput<T>) {
+    const H: f32 = 36.0;
+    let rect = out.inner_rect;
+    let offset = out.state.offset.y;
+    let max = (out.content_size.y - rect.height()).max(0.0);
+    if max <= 1.0 {
+        return;
+    }
+    let painter = ui.painter().with_clip_rect(rect);
+    let strip = |top: bool, strength: f32| {
+        let solid = theme::CANVAS.gamma_multiply(0.92 * strength);
+        let clear = egui::Color32::TRANSPARENT;
+        let (y0, y1, c0, c1) = if top {
+            (rect.top(), rect.top() + H, solid, clear)
+        } else {
+            (rect.bottom() - H, rect.bottom(), clear, solid)
+        };
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(egui::pos2(rect.left(), y0), c0);
+        mesh.colored_vertex(egui::pos2(rect.right(), y0), c0);
+        mesh.colored_vertex(egui::pos2(rect.right(), y1), c1);
+        mesh.colored_vertex(egui::pos2(rect.left(), y1), c1);
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        painter.add(egui::Shape::mesh(mesh));
+    };
+    if offset > 1.0 {
+        strip(true, (offset / H).min(1.0));
+    }
+    if max - offset > 1.0 {
+        strip(false, ((max - offset) / H).min(1.0));
+    }
+}
+
 #[cfg(test)]
 mod credential_tests {
     use super::{account_create_error, derive_member_name, CredentialMode};
@@ -3494,40 +3551,5 @@ mod credential_tests {
             account_create_error("not_found: missing"),
             crate::notice::seat_error("not_found: missing")
         );
-    }
-}
-
-/// Dégradés d’ombre en haut/bas d’une zone défilante : indiquent qu’il reste du contenu.
-fn scroll_shadows<T>(ui: &egui::Ui, out: &egui::scroll_area::ScrollAreaOutput<T>) {
-    const H: f32 = 36.0;
-    let rect = out.inner_rect;
-    let offset = out.state.offset.y;
-    let max = (out.content_size.y - rect.height()).max(0.0);
-    if max <= 1.0 {
-        return;
-    }
-    let painter = ui.painter().with_clip_rect(rect);
-    let strip = |top: bool, strength: f32| {
-        let solid = theme::CANVAS.gamma_multiply(0.92 * strength);
-        let clear = egui::Color32::TRANSPARENT;
-        let (y0, y1, c0, c1) = if top {
-            (rect.top(), rect.top() + H, solid, clear)
-        } else {
-            (rect.bottom() - H, rect.bottom(), clear, solid)
-        };
-        let mut mesh = egui::Mesh::default();
-        mesh.colored_vertex(egui::pos2(rect.left(), y0), c0);
-        mesh.colored_vertex(egui::pos2(rect.right(), y0), c0);
-        mesh.colored_vertex(egui::pos2(rect.right(), y1), c1);
-        mesh.colored_vertex(egui::pos2(rect.left(), y1), c1);
-        mesh.add_triangle(0, 1, 2);
-        mesh.add_triangle(0, 2, 3);
-        painter.add(egui::Shape::mesh(mesh));
-    };
-    if offset > 1.0 {
-        strip(true, (offset / H).min(1.0));
-    }
-    if max - offset > 1.0 {
-        strip(false, ((max - offset) / H).min(1.0));
     }
 }
