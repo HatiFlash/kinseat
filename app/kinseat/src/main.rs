@@ -2005,9 +2005,19 @@ impl Kinseat {
                     let free: Vec<String> = self.accounts.as_deref().unwrap_or_default().iter()
                         .filter(|a| a.is_managed && !a.has_seat).map(|a| a.username.clone()).collect();
                     let max_body = (screen.height() - 240.0).max(200.0);
-                    egui::ScrollArea::vertical()
+                    // Hauteur du corps fixée d'emblée (contenu mesuré à l'image précédente, sinon
+                    // maximum) : sans cela la zone défilante grandit de ~50 px par image et les
+                    // boutons du bas restent sans place tant que la fenêtre n'a pas fini de se
+                    // dimensionner.
+                    let body_key = egui::Id::new("add-seat-body-height");
+                    let body_h = ctx
+                        .data(|d| d.get_temp::<f32>(body_key))
+                        .map_or(max_body, |h| h.clamp(80.0, max_body));
+                    let so = egui::ScrollArea::vertical()
                         .id_salt("add-seat-scroll")
-                        .max_height(max_body)
+                        .auto_shrink([false, false])
+                        .min_scrolled_height(body_h)
+                        .max_height(body_h)
                         .show(ui, |ui| {
                     ui.label(theme::text("La place ouvre une session Windows dédiée au membre, diffusée vers son appareil.", 14.0, theme::SECONDARY));
                     ui.add_space(12.0);
@@ -2067,6 +2077,11 @@ impl Kinseat {
                         });
                     }
                     });
+                    let measured = so.content_size.y;
+                    if (measured - body_h).abs() > 0.5 && measured < max_body {
+                        ctx.request_repaint();
+                    }
+                    ctx.data_mut(|d| d.insert_temp(body_key, measured));
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         if ui.add_enabled(!self.seat_pending, egui::Button::new("Annuler")).clicked() { cancel = true; }
