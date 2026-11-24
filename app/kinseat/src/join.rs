@@ -317,6 +317,12 @@ impl Panel {
                     ui.painter()
                         .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(145));
                 });
+            let keys = theme::modal_keys(ctx, egui::Id::new("join-request"), true);
+            if keys.esc {
+                // Échap : replie la demande en bandeau, sans la refuser.
+                self.hidden = true;
+                self.hidden_for = pending.first().map(|r| r.id.clone());
+            }
             egui::Window::new("Demande d'accès")
                 .id(egui::Id::new("join-request"))
                 .collapsible(false)
@@ -398,6 +404,7 @@ impl Panel {
                                     .fill(theme::ACCENT),
                                 )
                                 .clicked()
+                                || keys.enter
                             {
                                 actions.push(Action::Accept {
                                     request_id: request.id.clone(),

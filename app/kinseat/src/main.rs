@@ -335,6 +335,7 @@ struct Kinseat {
     default_profile: String,
     reduced_motion: bool,
     reserve_mb: u64,
+    gpu_reserve_pending: bool,
     lightening_report: Option<kinseat_ipc::LighteningReport>,
     lightening_draft: kinseat_ipc::Lightening,
     desktop_browser: HashMap<String, bool>,
@@ -425,6 +426,7 @@ impl Kinseat {
             default_profile: prefs.default_profile,
             reduced_motion: prefs.reduced_motion,
             reserve_mb: prefs.reserve_mb,
+            gpu_reserve_pending: false,
             lightening_report: None,
             lightening_draft: kinseat_ipc::Lightening::default(),
             desktop_browser: HashMap::new(),
@@ -980,14 +982,17 @@ impl Kinseat {
                         Err(e) => self.modal_error = Some(e.to_string()),
                     }
                 }
-                Event::GpuBudget(result) => match result {
+                Event::GpuBudget(result) => {
+                    self.gpu_reserve_pending = false;
+                    match result {
                     Ok(b) => {
                         self.reserve_mb = b.host_reserve_mb;
                         self.gpu_budget = Some(b);
                         self.gpu_error = None;
                     }
                     Err(e) => self.gpu_error = Some(graphics::error_text(&e.to_string())),
-                },
+                    }
+                }
                 Event::LighteningReport(id, result) => {
                     if self.seat_settings.as_deref() == Some(&id) {
                         match result {
@@ -1384,10 +1389,15 @@ impl Kinseat {
             ui.label(theme::title("Graphismes et confort", 19.0));
             ui.add_space(14.0);
             ui.label(theme::text("Réserve VRAM pour le poste principal (Mo)", 14.0, theme::PRIMARY));
-            ui.add(egui::DragValue::new(&mut self.reserve_mb).range(0..=65536).speed(128));
-            if ui.button("Appliquer la réserve").clicked() {
-                self.dispatch(Command::GpuReserve(self.reserve_mb));
-            }
+            let applied = self.gpu_budget.as_ref().map(|b| b.host_reserve_mb);
+            let changed = applied.is_none_or(|a| a != self.reserve_mb);
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut self.reserve_mb).range(0..=65536).speed(128));
+                if ui.add_enabled(changed && !self.gpu_reserve_pending, egui::Button::new("Appliquer la réserve")).clicked() {
+                    self.gpu_reserve_pending = !self.demo;
+                    self.dispatch(Command::GpuReserve(self.reserve_mb));
+                }
+            });
             if let Some(budget) = &self.gpu_budget {
                 ui.label(theme::text(format!("{} Mo utilisables · {} Mo attribués · {} Mo libres. Budget indicatif, pas de réservation matérielle.", budget.usable_mb, budget.allocated_mb, budget.free_mb), 13.0, theme::SECONDARY));
             }
@@ -1709,6 +1719,9 @@ impl Kinseat {
                 let (rect, _) = ui.allocate_exact_size(scrim_rect.size(), egui::Sense::click());
                 ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(145));
             });
+        let keys = theme::modal_keys(ctx, egui::Id::new("seat-preview"), true);
+        close |= keys.esc;
+        schedule |= keys.enter;
         egui::Window::new("Aperçu de session").id(egui::Id::new("seat-preview"))
             .frame(egui::Frame::window(&ctx.style()).fill(theme::SURFACE))
             .collapsible(false).resizable(true)
@@ -1763,6 +1776,8 @@ impl Kinseat {
         let mut command: Option<(&'static str, serde_json::Value)> = None;
         let busy = self.seat_pending;
         let screen = ctx.screen_rect().size();
+        // Échap ferme ; pas d'action principale unique ici, donc Entrée est ignorée.
+        if theme::modal_keys(ctx, egui::Id::new("seat-settings"), false).esc { open = false; }
         egui::Window::new(format!("Réglages · {}", seat.display_name.as_deref().unwrap_or(&seat.account_name)))
             .id(egui::Id::new("seat-settings"))
             .open(&mut open)
@@ -1971,6 +1986,8 @@ impl Kinseat {
                     ui.painter()
                         .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(145));
                 });
+            let keys = theme::modal_keys(ctx, egui::Id::new("Ajouter une place"), true);
+            cancel |= keys.esc;
             egui::Window::new("Ajouter une place")
                 .collapsible(false).resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -2056,8 +2073,10 @@ impl Kinseat {
                         let label = if self.join_create_stage == Some(JoinCreateStage::RetrySeat) {
                             "Réessayer la création de la place"
                         } else if new_member { "Créer le membre et la place" } else { "Créer la place" };
-                        if ui.add_enabled(!self.seat_pending && ready,
-                            egui::Button::new(theme::text(label, 14.0, theme::ON_ACCENT)).fill(theme::ACCENT)).clicked() { submit = true; }
+                        let can_submit = !self.seat_pending && ready;
+                        if ui.add_enabled(can_submit,
+                            egui::Button::new(theme::text(label, 14.0, theme::ON_ACCENT)).fill(theme::ACCENT)).clicked()
+                            || (keys.enter && can_submit) { submit = true; }
                     });
                 });
             if cancel && !self.seat_pending {
@@ -2121,6 +2140,8 @@ impl Kinseat {
         if self.new_member.is_some() && self.add_seat.is_none() {
             if let Some((mut name, mut mode, mut pw, mut pw2)) = self.new_member.clone() {
                 let (mut cancel, mut submit) = (false, false);
+                let keys = theme::modal_keys(ctx, egui::Id::new("Ajouter un membre"), true);
+                cancel |= keys.esc;
                 egui::Window::new("Ajouter un membre")
                 .collapsible(false).resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -2139,7 +2160,8 @@ impl Kinseat {
                     ui.horizontal(|ui| {
                         if ui.button("Annuler").clicked() { cancel = true; }
                         if ui.add_enabled(!self.seat_pending,
-                            egui::Button::new(theme::text("Créer le membre", 14.0, theme::ON_ACCENT)).fill(theme::ACCENT)).clicked() { submit = true; }
+                            egui::Button::new(theme::text("Créer le membre", 14.0, theme::ON_ACCENT)).fill(theme::ACCENT)).clicked()
+                            || (keys.enter && !self.seat_pending) { submit = true; }
                     });
                 });
                 if cancel {
@@ -2185,6 +2207,8 @@ impl Kinseat {
                 .find(|s| s.id == id)
                 .map(|s| s.account_name.clone())
                 .unwrap_or_default();
+            // Destructif : Échap annule, Entrée ignorée.
+            cancel |= theme::modal_keys(ctx, egui::Id::new("Supprimer cette place ?"), false).esc;
             egui::Window::new("Supprimer cette place ?")
                 .collapsible(false).resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -2214,6 +2238,7 @@ impl Kinseat {
         if let Some(report) = &self.delete_report {
             let mut close = false;
             let mut retry = false;
+            close |= theme::modal_keys(ctx, egui::Id::new("Compte rendu de suppression"), false).esc;
             egui::Window::new("Compte rendu de suppression")
                 .collapsible(false)
                 .resizable(false)
@@ -2267,6 +2292,7 @@ impl Kinseat {
                 accounts.iter().any(|a| a.username == account && a.has_seat)
             }) || self.seats.iter().any(|seat| seat.account_name == account);
             let (mut cancel, mut confirm) = (false, false);
+            cancel |= theme::modal_keys(ctx, egui::Id::new("Supprimer ce membre ?"), false).esc;
             egui::Window::new("Supprimer ce membre ?")
                 .collapsible(false)
                 .resizable(false)
@@ -2308,6 +2334,7 @@ impl Kinseat {
         }
         if let Some(report) = &self.member_delete_report {
             let (mut close, mut retry) = (false, false);
+            close |= theme::modal_keys(ctx, egui::Id::new("Compte rendu de suppression du membre"), false).esc;
             egui::Window::new("Compte rendu de suppression du membre")
                 .collapsible(false)
                 .resizable(false)
@@ -2427,7 +2454,7 @@ impl Kinseat {
     }
     fn modals(&mut self, ctx: &egui::Context) {
         if self.logon_details {
-            let mut open = true;
+            let mut open = !theme::modal_keys(ctx, egui::Id::new("Programmes au démarrage des places"), false).esc;
             egui::Window::new("Programmes au démarrage des places")
                 .open(&mut open)
                 .collapsible(false)
@@ -2550,6 +2577,7 @@ impl Kinseat {
         }
         if let Some(changes) = self.logon_confirm.clone() {
             let (mut cancel, mut confirm) = (false, false);
+            cancel |= theme::modal_keys(ctx, egui::Id::new("Confirmer la modification des tâches Windows"), false).esc;
             egui::Window::new("Confirmer la modification des tâches Windows")
                 .collapsible(false)
                 .resizable(false)
@@ -2607,6 +2635,9 @@ impl Kinseat {
         if self.pairing {
             let mut cancel = false;
             let mut submit = false;
+            let keys = theme::modal_keys(ctx, egui::Id::new("Associer un appareil"), true);
+            cancel |= keys.esc;
+            submit |= keys.enter && !self.pair_pending;
             egui::Window::new("Associer un appareil")
                 .collapsible(false).resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -2676,6 +2707,7 @@ impl Kinseat {
         if let Some((seat, name)) = self.remove_client.clone() {
             let mut cancel = false;
             let mut confirm = false;
+            cancel |= theme::modal_keys(ctx, egui::Id::new("Retirer cet appareil ?"), false).esc;
             egui::Window::new("Retirer cet appareil ?")
                 .collapsible(false).resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -2711,6 +2743,11 @@ impl Kinseat {
                 let (rect, _) = ui.allocate_exact_size(scrim_rect.size(), egui::Sense::click());
                 ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(145));
             });
+            // Entrée ignorée quand le message (multi-ligne) a le focus.
+            let message_focus = ctx.memory(|m| m.has_focus(egui::Id::new("schedule-message")));
+            let keys = theme::modal_keys(ctx, egui::Id::new("schedule-modal"), !message_focus);
+            cancel |= keys.esc;
+            submit |= keys.enter;
         egui::Window::new("Programmer la fin de session").id(egui::Id::new("schedule-modal"))
                 .frame(egui::Frame::window(&ctx.style()).fill(theme::SURFACE))
                 .collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -2723,7 +2760,7 @@ impl Kinseat {
                     ui.horizontal(|ui| { ui.add(egui::TextEdit::singleline(&mut self.minutes).desired_width(64.0)); ui.label("minutes (1 à 120)"); });
                     ui.add_space(12.0);
                     ui.label("Message affiché au joueur");
-                    ui.add(egui::TextEdit::multiline(&mut self.message).desired_width(420.0).desired_rows(3));
+                    ui.add(egui::TextEdit::multiline(&mut self.message).id(egui::Id::new("schedule-message")).desired_width(420.0).desired_rows(3));
                     ui.label(theme::text(format!("{} / 220 caractères", self.message.chars().count()), 12.0, theme::SECONDARY));
                     ui.add_space(12.0);
                     ui.label(theme::text("À zéro, le jeu et toutes les applications de la session se fermeront, même sans sauvegarde.", 14.0, theme::WARN));
@@ -2754,6 +2791,7 @@ impl Kinseat {
             let mut confirm = false;
             let mut warn = false;
             let mut disconnect = false;
+            close |= theme::modal_keys(ctx, egui::Id::new("confirm-close"), false).esc;
             egui::Window::new("Fermer la session ?")
                 .id(egui::Id::new("confirm-close"))
                 .collapsible(false)
@@ -2818,6 +2856,8 @@ impl Kinseat {
         }
         if self.schedule.is_none() && self.confirm_close.is_none() {
             if let Some(error) = self.modal_error.clone() {
+                let esc = theme::modal_keys(ctx, egui::Id::new("Action impossible"), false).esc;
+                if esc { self.modal_error = None; }
                 egui::Window::new("Action impossible")
                     .collapsible(false)
                     .show(ctx, |ui| {

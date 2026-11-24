@@ -156,3 +156,33 @@ pub fn choice_button(selected: bool, label: impl Into<String>) -> egui::Button<'
         egui::Button::new(label)
     }
 }
+
+/// Touches clavier d'une modale : `esc` = annuler/fermer, `enter` = action principale.
+#[derive(Clone, Copy, Default)]
+pub struct ModalKeys {
+    pub esc: bool,
+    pub enter: bool,
+}
+
+/// Lit Échap/Entrée une seule fois par frame, uniquement pour la modale au premier plan
+/// (fenêtre `id`). Entrée est ignorée si un bouton a le focus clavier (il gère déjà Entrée)
+/// ou si `allow_enter` est faux (action destructrice, champ multi-ligne actif).
+/// L'appelant doit en plus vérifier que le bouton principal est actif.
+pub fn modal_keys(ctx: &egui::Context, id: egui::Id, allow_enter: bool) -> ModalKeys {
+    let layer = egui::LayerId::new(egui::Order::Middle, id);
+    // Un clic sur un voile (scrim) le remonte au-dessus de sa fenêtre : il ne masque pas la modale.
+    let scrims = ["join-request-scrim", "preview-scrim", "add-seat-scrim", "schedule-scrim"]
+        .map(|name| egui::LayerId::new(egui::Order::Middle, egui::Id::new(name)));
+    let blocked = ctx.memory(|m| match m.areas().top_layer_id(egui::Order::Middle) {
+        Some(top) => top != layer && !scrims.contains(&top),
+        None => false,
+    });
+    if blocked || egui::Popup::is_any_open(ctx) {
+        return ModalKeys::default();
+    }
+    let button_focused = ctx.memory(|m| m.focused().is_some()) && !ctx.wants_keyboard_input();
+    ctx.input_mut(|i| ModalKeys {
+        esc: i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+        enter: allow_enter && !button_focused && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+    })
+}
