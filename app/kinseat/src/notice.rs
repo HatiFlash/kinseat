@@ -86,7 +86,7 @@ pub fn seat_error(error: &str) -> String {
         "conflict" => "Ce membre a déjà une place, la limite de places est atteinte, ou la place est occupée".into(),
         "not_found" => "Compte ou place introuvable : actualisez la liste".into(),
         "invalid_params" => "Nom ou mot de passe refusé (lettres sans accent, chiffres, - ou _ ; mot de passe non vide)".into(),
-        "unavailable" => "Le service n’a pas pu terminer l’opération : consultez le journal (Paramètres → Assistance)".into(),
+        "unavailable" => "Le service n’a pas pu terminer l’opération : consultez le journal (Paramètres › Assistance)".into(),
         _ => service_error(error),
     }
 }

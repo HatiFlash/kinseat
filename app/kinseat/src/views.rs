@@ -763,7 +763,7 @@ pub fn seats(
             .iter()
             .find(|n| n.active() && n.notice.seat_id == seat.id);
         let (r, resp) = ui.allocate_exact_size(
-            vec2(width, if notice.is_some() { 78.0 } else { 56.0 }),
+            vec2(width, if notice.is_some() { 84.0 } else { 56.0 }),
             Sense::click(),
         );
         if resp.clicked() {
@@ -785,6 +785,7 @@ pub fn seats(
             ui.painter()
                 .rect_stroke(r, 6.0, Stroke::new(2.0_f32, t::ACCENT), StrokeKind::Inside);
         }
+        let cy = if notice.is_some() { r.top() + 28.0 } else { r.center().y };
         let p = ui.painter();
         let col = |i: usize| r.left() + 16.0 + COLS[i].1 * (width - 32.0);
         let cw = |i: usize| {
@@ -797,13 +798,13 @@ pub fn seats(
         };
         avatar(
             p,
-            pos2(col(0) + 14.0, r.center().y),
+            pos2(col(0) + 14.0, cy),
             14.0,
             &seat.account_name,
         );
         line(
             p,
-            pos2(col(0) + 38.0, r.center().y - 10.0),
+            pos2(col(0) + 38.0, cy - 10.0),
             &seat.account_name,
             t::title_font(14.0),
             t::PRIMARY,
@@ -812,13 +813,13 @@ pub fn seats(
         let (label, color) = status(&seat.status);
         dot_label(
             p,
-            pos2(col(1), r.center().y - 8.0),
+            pos2(col(1), cy - 8.0),
             label,
             t::pulse(ui.ctx(), &seat.status, reduced, color),
         );
         line(
             p,
-            pos2(col(2), r.center().y - 10.0),
+            pos2(col(2), cy - 10.0),
             &activity(seat),
             FontId::proportional(14.0),
             t::PRIMARY,
@@ -826,7 +827,7 @@ pub fn seats(
         );
         line(
             p,
-            pos2(col(3), r.center().y - 9.0),
+            pos2(col(3), cy - 9.0),
             &format!("{}×{} · {} i/s", seat.width, seat.height, seat.fps),
             FontId::proportional(12.0),
             t::SECONDARY,
@@ -839,14 +840,14 @@ pub fn seats(
         };
         line(
             p,
-            pos2(col(4), r.center().y - 9.0),
+            pos2(col(4), cy - 9.0),
             &session,
             FontId::proportional(12.0),
             t::SECONDARY,
             cw(4) - 16.0,
         );
         // Chevron dessiné (la police n'a pas toujours les flèches).
-        let c = pos2(r.right() - 24.0, r.center().y);
+        let c = pos2(r.right() - 24.0, cy);
         let (a, b) = if open { (-3.0, 3.0) } else { (3.0, -3.0) };
         let s = Stroke::new(1.5_f32, t::SECONDARY);
         p.line_segment([pos2(c.x - 5.0, c.y - a), pos2(c.x, c.y - b)], s);
@@ -854,14 +855,14 @@ pub fn seats(
         if let Some(n) = notice {
             dot_label(
                 p,
-                pos2(r.left() + 16.0, r.bottom() - 22.0),
+                pos2(r.left() + 16.0, r.top() + 62.0),
                 &n.label(),
                 n.color(),
             );
             if n.notice.phase != NoticePhase::Closing {
                 let cancel = Rect::from_min_size(
-                    pos2(r.right() - 120.0, r.bottom() - 32.0),
-                    vec2(76.0, 26.0),
+                    pos2(r.right() - 92.0, r.top() + 59.0),
+                    vec2(76.0, 22.0),
                 );
                 let button = egui::Button::new(t::text("Annuler", 12.0, t::PRIMARY))
                     .fill(t::BORDER)

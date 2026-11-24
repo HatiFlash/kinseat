@@ -1352,7 +1352,7 @@ impl Kinseat {
                     for interval in &rate.allowed_intervals_ms {
                         let hz = kinseat_ipc::interval_hz(*interval);
                         let label = if *interval == rate.default_interval_ms { format!("{hz} i/s (recommandé)") } else { format!("{hz} i/s") };
-                        if ui.add_enabled(!self.refresh_rate_pending, egui::Button::selectable(rate.interval_ms == *interval, label)).clicked() && rate.interval_ms != *interval {
+                        if ui.add_enabled(!self.refresh_rate_pending, theme::choice_button(rate.interval_ms == *interval, label)).clicked() && rate.interval_ms != *interval {
                             self.refresh_rate_pending = true;
                             self.dispatch(Command::RefreshRateSet(*interval));
                         }
@@ -1366,7 +1366,7 @@ impl Kinseat {
                 ui.label(theme::text("Chargement du réglage…", 14.0, theme::SECONDARY));
             }
             ui.add_space(8.0);
-            ui.label(theme::text("La qualité d’image, la résolution et le démarrage automatique se règlent par place : Places → menu de la place → Réglages de la place.", 13.0, theme::SECONDARY));
+            ui.label(theme::text("La qualité d’image, la résolution et le démarrage automatique se règlent par place : Places › menu de la place › Réglages de la place.", 13.0, theme::SECONDARY));
         });
         ui.add_space(16.0);
         if self.logon_tasks.is_some() {
@@ -1700,7 +1700,16 @@ impl Kinseat {
             .map(|s| s.account_name.as_str())
             .unwrap_or("Membre inconnu");
         let screen = ctx.screen_rect().size();
+        let scrim_rect = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("preview-scrim"))
+            .order(egui::Order::Middle)
+            .fixed_pos(scrim_rect.min)
+            .show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(scrim_rect.size(), egui::Sense::click());
+                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(145));
+            });
         egui::Window::new("Aperçu de session").id(egui::Id::new("seat-preview"))
+            .frame(egui::Frame::window(&ctx.style()).fill(theme::SURFACE))
             .collapsible(false).resizable(true)
             .default_size([(screen.x - 80.0).min(740.0), (screen.y - 60.0).min(570.0)])
             .max_size([screen.x - 40.0, screen.y - 40.0])
@@ -2693,7 +2702,16 @@ impl Kinseat {
                 .unwrap_or_else(|| "Membre inconnu".into());
             let mut cancel = false;
             let mut submit = false;
-            egui::Window::new("Programmer la fin de session").id(egui::Id::new("schedule-modal"))
+            let scrim_rect = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("schedule-scrim"))
+            .order(egui::Order::Middle)
+            .fixed_pos(scrim_rect.min)
+            .show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(scrim_rect.size(), egui::Sense::click());
+                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(145));
+            });
+        egui::Window::new("Programmer la fin de session").id(egui::Id::new("schedule-modal"))
+                .frame(egui::Frame::window(&ctx.style()).fill(theme::SURFACE))
                 .collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.set_min_width(440.0);

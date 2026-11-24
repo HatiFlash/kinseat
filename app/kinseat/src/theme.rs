@@ -146,3 +146,13 @@ pub fn install(ctx: &egui::Context) {
     }
     ctx.set_style_of(egui::Theme::Dark, style);
 }
+
+/// Pastille de choix : sélectionnée = texte sombre sur ACCENT plein (contraste élevé).
+pub fn choice_button(selected: bool, label: impl Into<String>) -> egui::Button<'static> {
+    let label: String = label.into();
+    if selected {
+        egui::Button::new(egui::RichText::new(label).color(ON_ACCENT)).fill(ACCENT)
+    } else {
+        egui::Button::new(label)
+    }
+}
