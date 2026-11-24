@@ -167,3 +167,30 @@ jobs:
 
       - name: Format check
         run: cargo fmt --all -- --check
+
+  ui-screenshots:
+    name: Captures de l'application Hôte (démo)
+    # Toutes les pages, trois tailles/zooms, en données fictives. Les PNG sont publiés en
+    # artefact pour relire l'affichage (chevauchements, textes coupés) avant une version.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Dépendances d'affichage
+        run: sudo apt-get update && sudo apt-get install -y xvfb libgl1-mesa-dri libegl1 libxkbcommon-x11-0
+
+      - name: Build
+        working-directory: app
+        run: cargo build --release -p kinseat
+
+      - name: Captures
+        run: bash scripts/ui-screenshots.sh app/target/release/kinseat ui-screenshots
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-screenshots
+          path: ui-screenshots/
+          retention-days: 30
