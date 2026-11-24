@@ -1378,8 +1378,10 @@ impl Kinseat {
         });
         ui.add_space(16.0);
         if self.logon_tasks.is_some() {
-            theme::frame().show(ui, |ui| {
+            theme::frame().inner_margin(24).show(ui, |ui| {
+                ui.set_width(ui.available_width().min(640.0));
                 ui.label(theme::title("Programmes au démarrage des places", 19.0));
+                ui.add_space(14.0);
                 if ui.button("Détails…").clicked() {
                     self.logon_details = true;
                     self.dispatch(Command::LogonTasksList);
