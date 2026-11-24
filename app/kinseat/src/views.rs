@@ -723,7 +723,10 @@ pub enum SeatIntent {
     Schedule(String),
     ConfirmClose(String),
     Command(Command),
+    ClearHistory(Vec<String>),
 }
+
+const RECENT_NOTICES_SHOWN: usize = 5;
 
 pub fn seats(
     ui: &mut egui::Ui,
@@ -732,6 +735,7 @@ pub fn seats(
     reduced: bool,
     highlight: Option<&str>,
     actions_pending: &std::collections::HashMap<String, &'static str>,
+    hidden_notices: &std::collections::HashSet<String>,
 ) -> Option<SeatIntent> {
     let mut intent = None;
     let add = |ui: &mut egui::Ui| {
@@ -1016,9 +1020,13 @@ pub fn seats(
         }
         ui.add_space(8.0);
     }
-    if notices.iter().any(|n| !n.active()) {
+    let finished: Vec<&TimedNotice> = notices
+        .iter()
+        .filter(|n| !n.active() && !hidden_notices.contains(&n.notice.id))
+        .collect();
+    if !finished.is_empty() {
         section(ui, "Fins de session récentes", None);
-        for n in notices.iter().filter(|n| !n.active()) {
+        for n in finished.iter().take(RECENT_NOTICES_SHOWN) {
             t::frame().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(t::title(&n.notice.account_name, 14.0));
@@ -1037,6 +1045,26 @@ pub fn seats(
             });
             ui.add_space(8.0);
         }
+        ui.horizontal(|ui| {
+            let older = finished.len().saturating_sub(RECENT_NOTICES_SHOWN);
+            if older > 0 {
+                ui.label(t::text(
+                    format!(
+                        "{older} {} masquée{}",
+                        if older > 1 { "plus anciennes" } else { "plus ancienne" },
+                        if older > 1 { "s" } else { "" }
+                    ),
+                    12.0,
+                    t::FAINT,
+                ));
+            }
+            if ui.button("Effacer l’historique").clicked() {
+                intent = Some(SeatIntent::ClearHistory(
+                    finished.iter().map(|n| n.notice.id.clone()).collect(),
+                ));
+            }
+        });
+        ui.add_space(8.0);
     }
     intent
 }
@@ -1109,6 +1137,8 @@ pub fn member_not_deletable(reason: Option<&str>) -> &'static str {
 pub fn members(
     ui: &mut egui::Ui,
     accounts: Option<&[kinseat_ipc::Account]>,
+    seats: &[Seat],
+    clients: &std::collections::HashMap<String, Vec<String>>,
     error: Option<&str>,
 ) -> Option<MemberIntent> {
     let mut intent = None;
@@ -1171,15 +1201,37 @@ pub fn members(
         } else {
             ("Sans place", t::SECONDARY)
         };
-        dot_label(
-            p,
-            pos2(
-                r.left() + 16.0 + ((width - 32.0) * 0.2).clamp(130.0, 230.0).max(190.0),
-                r.center().y - 8.0,
-            ),
-            label,
-            color,
-        );
+        let state_x = r.left() + 16.0 + ((width - 32.0) * 0.2).clamp(130.0, 230.0).max(190.0);
+        dot_label(p, pos2(state_x, r.center().y - 8.0), label, color);
+        // Détail de la place et appareils associés : données déjà en mémoire (aucun appel IPC).
+        if let Some(seat) = seats.iter().find(|s| s.account_name == account.username) {
+            let (st, st_color) = status(&seat.status);
+            let detail_x = state_x + 120.0;
+            let detail_w = (r.right() - 226.0 - detail_x).max(10.0);
+            let dw = dot_label(p, pos2(detail_x, r.center().y - 17.0), st, st_color);
+            line(
+                p,
+                pos2(detail_x + dw + 8.0, r.center().y - 17.0),
+                &format!("{}×{} · {} i/s", seat.width, seat.height, seat.fps),
+                FontId::proportional(12.0),
+                t::SECONDARY,
+                (detail_w - dw - 8.0).max(10.0),
+            );
+            let devices = clients.get(&seat.id).map(Vec::as_slice).unwrap_or(&[]);
+            let text = match devices {
+                [] => "Aucun appareil associé".to_owned(),
+                [one] => format!("Appareil : {one}"),
+                many => format!("{} appareils : {}", many.len(), many.join(", ")),
+            };
+            line(
+                p,
+                pos2(detail_x, r.center().y + 1.0),
+                &text,
+                FontId::proportional(12.0),
+                t::FAINT,
+                detail_w,
+            );
+        }
         if !account.deletable {
             ui.interact(
                 Rect::from_min_size(pos2(r.left() + 54.0, r.top()), vec2(width * 0.35, 56.0)),

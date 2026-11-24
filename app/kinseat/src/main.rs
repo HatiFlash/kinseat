@@ -298,6 +298,8 @@ struct Kinseat {
     new_member: Option<(String, CredentialMode, String, String)>,
     seat_pending: bool,
     seat_actions_pending: HashMap<String, &'static str>,
+    /// Fins de session masquées localement (« Effacer l’historique »), en mémoire seulement.
+    hidden_notices: std::collections::HashSet<String>,
     accounts_requested: bool,
     refresh_rate: Option<kinseat_ipc::RefreshRate>,
     refresh_rate_error: Option<String>,
@@ -490,6 +492,7 @@ impl Kinseat {
             new_member: None,
             seat_pending: false,
             seat_actions_pending: HashMap::new(),
+            hidden_notices: std::collections::HashSet::new(),
             accounts_requested: false,
             refresh_rate: None,
             refresh_rate_error: None,
@@ -2977,7 +2980,7 @@ impl eframe::App for Kinseat {
                         ui.add_space(12.0 * (1.0 - progress));
                     }
                 }
-                egui::ScrollArea::vertical()
+                let scroll = egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         if self.fault.is_some() && self.page != Page::Settings {
@@ -3032,8 +3035,12 @@ impl eframe::App for Kinseat {
                                         (at.elapsed().as_secs() < 3).then_some(id.as_str())
                                     }),
                                     &self.seat_actions_pending,
+                                    &self.hidden_notices,
                                 ) {
                                     match intent {
+                                        views::SeatIntent::ClearHistory(ids) => {
+                                            self.hidden_notices.extend(ids)
+                                        }
                                         views::SeatIntent::Add => self.open_add_seat(None),
                                         views::SeatIntent::Delete(id) => {
                                             self.purge_account = self
@@ -3096,7 +3103,13 @@ impl eframe::App for Kinseat {
                             Page::Members => {
                                 self.request_accounts();
                                 let error = self.members_error.clone();
-                                match views::members(ui, self.accounts.as_deref(), error.as_deref())
+                                match views::members(
+                                    ui,
+                                    self.accounts.as_deref(),
+                                    &self.seats,
+                                    &self.clients,
+                                    error.as_deref(),
+                                )
                                 {
                                     Some(views::MemberIntent::Refresh) => {
                                         self.accounts = None;
@@ -3181,6 +3194,7 @@ impl eframe::App for Kinseat {
                             }
                         }
                     });
+                scroll_shadows(ui, &scroll);
             });
         self.preview_panel(ctx);
         self.modals(ctx);
@@ -3480,5 +3494,40 @@ mod credential_tests {
             account_create_error("not_found: missing"),
             crate::notice::seat_error("not_found: missing")
         );
+    }
+}
+
+/// Dégradés d’ombre en haut/bas d’une zone défilante : indiquent qu’il reste du contenu.
+fn scroll_shadows<T>(ui: &egui::Ui, out: &egui::scroll_area::ScrollAreaOutput<T>) {
+    const H: f32 = 36.0;
+    let rect = out.inner_rect;
+    let offset = out.state.offset.y;
+    let max = (out.content_size.y - rect.height()).max(0.0);
+    if max <= 1.0 {
+        return;
+    }
+    let painter = ui.painter().with_clip_rect(rect);
+    let strip = |top: bool, strength: f32| {
+        let solid = theme::CANVAS.gamma_multiply(0.92 * strength);
+        let clear = egui::Color32::TRANSPARENT;
+        let (y0, y1, c0, c1) = if top {
+            (rect.top(), rect.top() + H, solid, clear)
+        } else {
+            (rect.bottom() - H, rect.bottom(), clear, solid)
+        };
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(egui::pos2(rect.left(), y0), c0);
+        mesh.colored_vertex(egui::pos2(rect.right(), y0), c0);
+        mesh.colored_vertex(egui::pos2(rect.right(), y1), c1);
+        mesh.colored_vertex(egui::pos2(rect.left(), y1), c1);
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        painter.add(egui::Shape::mesh(mesh));
+    };
+    if offset > 1.0 {
+        strip(true, (offset / H).min(1.0));
+    }
+    if max - offset > 1.0 {
+        strip(false, ((max - offset) / H).min(1.0));
     }
 }
