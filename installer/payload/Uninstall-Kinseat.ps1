@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 param([switch]$KeepData,[Parameter(Mandatory=$true)][string]$Log,[Parameter(Mandatory=$true)][string]$Progress)
 $ErrorActionPreference='Stop'
 $install=Join-Path $env:ProgramFiles 'Kinseat'

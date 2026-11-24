@@ -360,6 +360,33 @@ mod tests {
         }
     }
 
+    /// Windows PowerShell 5.1 lit un .ps1 UTF-8 sans BOM en ANSI : « Kinseat HÃ´te » dans
+    /// Programmes et messages mal accentués (0.3.18). Tout script accentué doit garder son BOM.
+    #[test]
+    fn payload_scripts_keep_utf8_bom() {
+        for (name, bytes) in [
+            (
+                "Install-Kinseat.ps1",
+                &include_bytes!("../../../installer/payload/Install-Kinseat.ps1")[..],
+            ),
+            (
+                "Uninstall-Kinseat.ps1",
+                &include_bytes!("../../../installer/payload/Uninstall-Kinseat.ps1")[..],
+            ),
+            (
+                "MultiSession-Kinseat.ps1",
+                &include_bytes!("../../../installer/payload/MultiSession-Kinseat.ps1")[..],
+            ),
+        ] {
+            if bytes.iter().any(|b| *b > 0x7f) {
+                assert!(
+                    bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
+                    "{name} contient des accents sans BOM UTF-8"
+                );
+            }
+        }
+    }
+
     #[test]
     fn corrupted_payload_is_refused() {
         let exe = std::env::current_exe().unwrap();

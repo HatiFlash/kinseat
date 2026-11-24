@@ -1,4 +1,4 @@
-# Tests Pester 5 : uniquement les fonctions pures du script, sans installation Windows.
+﻿# Tests Pester 5 : uniquement les fonctions pures du script, sans installation Windows.
 $scriptPath = Join-Path $PSScriptRoot '../payload/MultiSession-Kinseat.ps1'
 $source = [IO.File]::ReadAllText((Resolve-Path $scriptPath))
 $helpers = [regex]::Match($source, '(?s)function Ini-Section\(.*?(?=\r?\nfunction Restart-TermService)').Value

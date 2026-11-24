@@ -1,11 +1,11 @@
 {
-  "version": "0.3.18",
+  "version": "0.3.19",
   "artifacts": [
-    {"id":"service", "version":"0.3.18", "file":"service/Kinseat.Service.exe", "sha256":"A_RENSEIGNER", "required":true},
-    {"id":"kinseat", "version":"0.3.18", "file":"kinseat.exe", "sha256":"A_RENSEIGNER", "required":true},
-    {"id":"kinseat-agent", "version":"0.3.18", "file":"kinseat-agent.exe", "sha256":"A_RENSEIGNER", "required":true},
-    {"id":"gamefiles64", "version":"0.3.18", "file":"service/SteamIsolation/Kinseat.GameFiles.dll", "sha256":"A_RENSEIGNER", "required":true},
-    {"id":"gamefiles32", "version":"0.3.18", "file":"service/SteamIsolation/Kinseat.GameFiles32.dll", "sha256":"A_RENSEIGNER", "required":true},
+    {"id":"service", "version":"0.3.19", "file":"service/Kinseat.Service.exe", "sha256":"A_RENSEIGNER", "required":true},
+    {"id":"kinseat", "version":"0.3.19", "file":"kinseat.exe", "sha256":"A_RENSEIGNER", "required":true},
+    {"id":"kinseat-agent", "version":"0.3.19", "file":"kinseat-agent.exe", "sha256":"A_RENSEIGNER", "required":true},
+    {"id":"gamefiles64", "version":"0.3.19", "file":"service/SteamIsolation/Kinseat.GameFiles.dll", "sha256":"A_RENSEIGNER", "required":true},
+    {"id":"gamefiles32", "version":"0.3.19", "file":"service/SteamIsolation/Kinseat.GameFiles32.dll", "sha256":"A_RENSEIGNER", "required":true},
     {"id":"apollo", "version":"v2026.6.1-ms8", "file":"ApolloVibe.zip", "sha256":"A_RENSEIGNER", "required":false},
     {"id":"vigem", "version":"1.22.0", "file":"ViGEmBus_1.22.0_x64_x86_arm64.exe", "sha256":"A_RENSEIGNER", "required":false},
     {"id":"hidhide", "version":"1.5.230.0", "file":"HidHide_1.5.230_kinseat.zip", "sha256":"A_RENSEIGNER", "required":false},

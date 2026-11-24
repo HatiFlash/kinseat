@@ -87,6 +87,26 @@ jobs:
         working-directory: app
         run: cargo build --release -p kinseat -p kinseat-agent
 
+      # Apollo (streaming) and HidHide (controller isolation) are required for a fresh install.
+      # They come from the pinned "thirdparty-v1" release of this repository and are checked
+      # against fixed SHA-256 values; build-release.ps1 refuses to build a Host setup without them.
+      - name: Download qualified third-party components
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force thirdparty-host | Out-Null
+          gh release download thirdparty-v1 -R $env:GITHUB_REPOSITORY -D thirdparty-host -p ApolloVibe.zip -p HidHide_1.5.230_kinseat.zip
+          $expected = @{
+            'ApolloVibe.zip' = 'aa1261dc47205d1046a90e220efe7851d618583b755ae973bd26ab8e2ccec038'
+            'HidHide_1.5.230_kinseat.zip' = '64982b8b44349cbf244c22ccc0ee6d896234b4b445637028b88c8a54b134abfb'
+          }
+          foreach ($name in $expected.Keys) {
+            $actual = (Get-FileHash (Join-Path thirdparty-host $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $expected[$name]) { throw "SHA-256 mismatch for ${name}: $actual" }
+            Write-Host "Verified $name"
+          }
+
       - name: Assemble Host payload zip
         shell: pwsh
         run: |
@@ -95,7 +115,8 @@ jobs:
             -ServicePublishDir (Resolve-Path publish/MultiSeat).Path `
             -HostExe (Resolve-Path app/target/release/kinseat.exe).Path `
             -AgentExe (Resolve-Path app/target/release/kinseat-agent.exe).Path `
-            -OutDir (Resolve-Path dist/host).Path
+            -OutDir (Resolve-Path dist/host).Path `
+            -ThirdPartyDir (Resolve-Path thirdparty-host).Path
 
       - name: Build Kinseat-Host-Setup.exe
         working-directory: app
@@ -317,31 +338,12 @@ jobs:
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release (draft, published after lab qualification)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: Kinseat ${{ steps.ver.outputs.version }} — Refonte UI, Sécurité & Clients Multi-plateformes
+          name: Kinseat ${{ steps.ver.outputs.version }}
+          draft: true
           files: release-assets/*
-          body: |
-            ## Kinseat ${{ steps.ver.outputs.version }}
-
-            ### Nouveautés & améliorations
-            - **Refonte visuelle Hôte & Client** : cartes de places compactes avec pills d'état/télémétrie, carte `Place libre` cliquable, panneau Ressources du PC unifié, formulaire « Ajouter un jeu » repliable dans la Bibliothèque, modales avec voile d'assombrissement et corps scrollable, écrans Client centrés avec **animations radar & appairage**, et overlay `Alt+K` harmonisé en grille 2×2.
-            - **Sécurité** : correction de la LPE `SYSTEM` (`SharedLibraryProvisioner`), suppression de la fuite de clé API dans `appsettings*.json`, comparaison en temps constant `FixedTimeEquals`, DPAPI `CurrentUser` (SYSTEM) pour `kinseat-web.secret`, blocage des symlinks dans les diagnostics, et fail-closed dans `ConsoleCallerCheck`.
-            - **Stabilité C++ (`GameFiles`) & .NET** : protection anti-UAF au teardown CRT, wildcards DOS (`*.sav`), visibilité des sauvegardes supprimées puis recréées, fast-path lock-free sur `NtClose`, blocage Windows 11 Famille (`Core`), et suppression des freezes UI.
-            - **Clients multi-plateformes** : Windows x64, Windows ARM64, Linux x64 (`.deb` & `.tar.gz`), et macOS (Apple Silicon & Intel `.app`).
-
-            ### Fichiers inclus
-            | Fichier | Plateforme |
-            |---|---|
-            | `Kinseat-Host-Setup-${{ steps.ver.outputs.version }}.exe` | PC hôte — Windows 10/11 x64 |
-            | `Kinseat-Client-Setup-${{ steps.ver.outputs.version }}.exe` | Client — Windows x64 (Moonlight inclus) |
-            | `Kinseat-Client-Setup-${{ steps.ver.outputs.version }}-arm64.exe` | Client — Windows ARM64 (installateur) |
-            | `Kinseat-Client-${{ steps.ver.outputs.version }}-windows-arm64.zip` | Client — Windows ARM64 (portable) |
-            | `kinseat-client_${{ steps.ver.outputs.version }}_amd64.deb` | Client — Linux Debian/Ubuntu x64 |
-            | `kinseat-client_${{ steps.ver.outputs.version }}_linux-x64.tar.gz` | Client — Linux x64 (portable) |
-            | `Kinseat-Client-${{ steps.ver.outputs.version }}-macos-arm64.tar.gz` | Client — macOS Apple Silicon (`.app`) |
-            | `Kinseat-Client-${{ steps.ver.outputs.version }}-macos-x64.tar.gz` | Client — macOS Intel (`.app`) |
-            | `SHA256SUMS` | Empreintes SHA-256 de tous les fichiers |
+          body_path: docs/release-notes/${{ steps.ver.outputs.version }}.md
