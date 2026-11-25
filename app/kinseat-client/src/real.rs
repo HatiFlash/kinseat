@@ -28,6 +28,7 @@ fn field(
     space(ui, 10.0);
     response
 }
+const MOONLIGHT_MISSING: &str = "Moonlight est introuvable : installe-le (Flatpak com.moonlight_stream.Moonlight ou AppImage) ou indique son chemin dans Paramètres.";
 fn entered(ui: &egui::Ui, response: &egui::Response) -> bool {
     response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
 }
@@ -52,8 +53,7 @@ impl Client {
             return;
         }
         let Some(engine) = self.engine() else {
-            self.notice =
-                Some("Moteur Moonlight introuvable : indiquez son chemin dans Paramètres.".into());
+            self.notice = Some(MOONLIGHT_MISSING.into());
             return;
         };
         if profile::ensure_device_id(&mut self.settings) {
@@ -198,8 +198,12 @@ impl Client {
                                     _ => self.screen = Screen::Search,
                                 }
                                 if let Some(notice) = &self.notice {
-                                    space(ui, 10.0);
-                                    text(ui, notice, 13.0, t::ACCENT);
+                                    if !(self.screen == Screen::Search
+                                        && notice == MOONLIGHT_MISSING)
+                                    {
+                                        space(ui, 10.0);
+                                        text(ui, notice, 13.0, t::ACCENT);
+                                    }
                                 }
                             });
                         });
@@ -220,7 +224,11 @@ impl Client {
             15.0,
             t::SECONDARY,
         );
-        space(ui, 24.0);
+        space(ui, 16.0);
+        if self.notice.as_deref() == Some(MOONLIGHT_MISSING) {
+            feedback(ui, &Some((false, MOONLIGHT_MISSING.to_string())));
+        }
+        space(ui, 8.0);
         let col = ((ui.available_width() - 24.0) / 2.0).clamp(300.0, 430.0);
         ui.horizontal_top(|ui| {
             radar(ui, col, !self.join.hosts.is_empty());
@@ -966,5 +974,25 @@ impl Client {
         if self.settings != before {
             self.persist();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Session;
+    #[test]
+    fn demande_sans_moonlight_laisse_une_erreur_visible() {
+        let ctx = egui::Context::default();
+        let mut c = Client::new(Screen::Search, 0, None, Session::Available, false, &ctx);
+        c.settings.engine_path = "/introuvable/moonlight".into();
+        let avant = c.screen;
+        c.request_access(HostInfo {
+            name: "PC".into(),
+            address: "127.0.0.1".into(),
+            version: "0".into(),
+        });
+        assert_eq!(c.notice.as_deref(), Some(MOONLIGHT_MISSING));
+        assert_eq!(c.screen, avant);
     }
 }

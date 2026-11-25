@@ -32,7 +32,7 @@ for size in 16 24 32 48 64 128 256; do
 done
 install -m644 "$ROOT/packaging/client/kinseat-client.desktop" "$STAGE/usr/share/applications/kinseat-client.desktop"
 install -m644 "$ROOT/packaging/client/kinseat-client.desktop" "$PORTABLE/kinseat-client.desktop"
-printf 'Package: kinseat-client\nVersion: %s\nArchitecture: amd64\nMaintainer: Kinseat <hatiflash@users.noreply.github.com>\nDepends: libc6 (>= %s), libgl1, libxkbcommon0, libwayland-client0\nRecommends: moonlight-qt\nSection: games\nPriority: optional\nDescription: Kinseat Client - jouer sur une place du PC Kinseat\n Trouve les places du PC hôte Kinseat, les associe par code et lance le streaming\n avec Moonlight (moonlight-qt, Flatpak com.moonlight_stream.Moonlight ou AppImage).\n' "$VERSION" "$GLIBC_NEEDED" > "$STAGE/DEBIAN/control"
+printf 'Package: kinseat-client\nVersion: %s\nArchitecture: amd64\nMaintainer: Kinseat <hatiflash@users.noreply.github.com>\nDepends: libc6 (>= %s), libgl1, libegl1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libx11-6, libxcursor1, libxi6, libxrandr2\nRecommends: moonlight-qt, libvulkan1, mesa-vulkan-drivers\nSection: games\nPriority: optional\nDescription: Kinseat Client - jouer sur une place du PC Kinseat\n Trouve les places du PC hôte Kinseat, les associe par code et lance le streaming\n avec Moonlight (moonlight-qt, Flatpak com.moonlight_stream.Moonlight ou AppImage).\n' "$VERSION" "$GLIBC_NEEDED" > "$STAGE/DEBIAN/control"
 install -m755 "$ROOT/packaging/client/install.sh" "$ROOT/packaging/client/uninstall.sh" "$PORTABLE/"
 mkdir -p "$STAGE/usr/share/doc/kinseat-client"
 install -m644 "$ROOT/LICENSE" "$STAGE/usr/share/doc/kinseat-client/copyright"
