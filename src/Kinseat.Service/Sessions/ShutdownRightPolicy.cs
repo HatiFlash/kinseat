@@ -528,7 +528,9 @@ internal static class ShutdownRightPolicy
     private sealed class LsaPolicy : ILsaPolicy
     {
         private nint _handle;
-        private const int PolicyAccess = 0x00000810;
+        // POLICY_LOOKUP_NAMES | POLICY_CREATE_ACCOUNT | POLICY_VIEW_LOCAL_INFORMATION;
+        // LsaEnumerateAccountsWithUserRight requires both LOOKUP_NAMES and VIEW_LOCAL_INFORMATION.
+        private const int PolicyAccess = 0x00000811;
         private const int ObjectNameNotFound = unchecked((int)0xC0000034);
         private const int NoMoreEntries = unchecked((int)0x8000001A);
         [StructLayout(LayoutKind.Sequential)]
