@@ -365,7 +365,42 @@ try {
         }
     }
     Remove-Item 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Kinseat' -Recurse -Force -ErrorAction SilentlyContinue
-    # Aucun raccourci public n'est supprimé ici : sans inventaire prouvant l'appartenance, un fichier restauré ou tiers serait perdu.
+    # Retrait des seuls raccourcis publics prouvés créés par cette installation, APRÈS la restauration du manifeste v2
+    # (un échec de restauration lève avant ce point). Preuve : nom Kinseat, racine publique, aucun lien, cible dans le dossier
+    # d'installation réel et empreinte SHA-256 identique à l'inventaire. Inventaire absent (ancienne version) : rien n'est supprimé.
+    $kinseatShortcutNames=@($allowedShortcutNames[0],$allowedShortcutNames[1])
+    $ownedInventory=@()
+    if($state.PSObject.Properties['shortcuts'] -and $state.shortcuts){$ownedInventory=@($state.shortcuts)}
+    if($ownedInventory.Count -eq 0){Emit 'shortcuts' 'ok' 'Aucun inventaire de raccourcis Kinseat : raccourcis publics conservés' 63}
+    else{
+        $installReal=$null
+        if((Test-Path -LiteralPath $install -PathType Container) -and -not (Test-IsReparse $install)){$installReal=(Resolve-Path -LiteralPath $install).Path.TrimEnd('\')}
+        $keptInventory=New-Object Collections.Generic.List[object]
+        $wsh=$null
+        foreach($owned in $ownedInventory){
+            $keep=$true
+            try{
+                $p=Resolve-ShortcutOriginal ([string]$owned.path)
+                if(-not $p -or [IO.Path]::GetFileName($p) -notin $kinseatShortcutNames){Emit 'shortcuts' 'warning' "Inventaire ignoré (hors périmètre) : $($owned.path)" 63}
+                elseif(-not $installReal){Emit 'shortcuts' 'warning' "Dossier d'installation introuvable ou redirigé, raccourci conservé : $p" 63}
+                elseif(-not (Test-ItemExists $p)){$keep=$false}
+                elseif(Test-IsReparse $p){Emit 'shortcuts' 'warning' "Raccourci redirigé conservé : $p" 63}
+                else{
+                    if(-not $wsh){$wsh=New-Object -ComObject WScript.Shell}
+                    $target=[string]$wsh.CreateShortcut($p).TargetPath
+                    $hash=(Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash
+                    $targetOk=$target -and [IO.Path]::IsPathRooted($target) -and (Test-PathUnder $installReal ([IO.Path]::GetFullPath($target))) -and [string]::Equals([IO.Path]::GetFileName($target),'kinseat.exe',[StringComparison]::OrdinalIgnoreCase)
+                    if($targetOk -and [string]::Equals($hash,[string]$owned.sha256,[StringComparison]::OrdinalIgnoreCase)){
+                        Remove-Item -LiteralPath $p -Force
+                        Emit 'shortcuts' 'ok' "Raccourci Kinseat créé par l'installation supprimé : $p" 63
+                        $keep=$false
+                    } else {Emit 'shortcuts' 'warning' "Raccourci modifié ou cible non Kinseat, conservé : $p" 63}
+                }
+            }catch{Emit 'shortcuts' 'warning' "Raccourci conservé (vérification impossible) : $($owned.path) : $($_.Exception.Message)" 63}
+            if($keep){$keptInventory.Add($owned)}
+        }
+        $state | Add-Member -NotePropertyName shortcuts -NotePropertyValue @($keptInventory.ToArray()) -Force
+    }
     # setup.exe runs from this directory: Windows may hold the image open until it exits.
     if (Test-Path $install) {
         $prefix=(Resolve-Path -LiteralPath $install).Path.TrimEnd('\') + '\'

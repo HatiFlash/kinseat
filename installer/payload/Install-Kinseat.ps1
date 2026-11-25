@@ -7,7 +7,8 @@ $install=Join-Path $env:ProgramFiles 'Kinseat'
 $data=Join-Path $env:ProgramData 'Kinseat'
 $stateFile=Join-Path $data 'install-state.json'
 $rule='Kinseat - bloquer RDP réseau'
-$state=[ordered]@{ schema=1; status='applying'; multisessionError=$null; previous=@{}; done=@(); backup=$null; serviceExisted=$false; serviceRunning=$false; thirdParty=@(); firewallOwned=$false; defenderOwned=$false; filesReplaced=$false }
+$script:createdShortcuts=@()
+$state=[ordered]@{ schema=1; status='applying'; multisessionError=$null; previous=@{}; done=@(); backup=$null; serviceExisted=$false; serviceRunning=$false; thirdParty=@(); shortcuts=@(); firewallOwned=$false; defenderOwned=$false; filesReplaced=$false }
 function Emit($step,$status,$message,$pct) {
     $row=[ordered]@{ step=$step; status=$status; message=$message; pct=$pct; utc=[DateTime]::UtcNow.ToString('o') }
     $bytes=[Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -Compress -InputObject $row)+"`r`n")
@@ -116,6 +117,10 @@ try {
             $state.firewallOwned=[bool]$prior.firewallOwned
             $state.defenderOwned=[bool]$prior.defenderOwned
             $state.thirdParty=@($prior.thirdParty)
+            # Inventaire de propriété des raccourcis publics : conservé tel quel (absent sur les anciennes versions).
+            if ($prior.PSObject.Properties['shortcuts'] -and $prior.shortcuts) {
+                $state.shortcuts=@(@($prior.shortcuts) | ForEach-Object { [ordered]@{ path=[string]$_.path; target=[string]$_.target; sha256=[string]$_.sha256 } })
+            }
         }
     }
     New-Item -ItemType Directory -Path $data -Force | Out-Null
@@ -309,11 +314,38 @@ try {
     }
     Step 'registration' 95 {
         $shell=New-Object -ComObject WScript.Shell
-        $start=Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Kinseat Hôte.lnk'
         $hostExe=Join-Path $install 'kinseat.exe'
-        $link=$shell.CreateShortcut($start); $link.TargetPath=$hostExe; $link.WorkingDirectory=$install; $link.IconLocation=$hostExe+',0'; $link.Save()
-        $desk=Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'Kinseat Hôte.lnk'
-        $link=$shell.CreateShortcut($desk); $link.TargetPath=$hostExe; $link.WorkingDirectory=$install; $link.IconLocation=$hostExe+',0'; $link.Save()
+        $lnkName='Kinseat H'+[char]0x00F4+'te.lnk'
+        # Dossiers publics (corrects aussi sous SYSTEM) ; repli ProgramData pour le menu Démarrer.
+        $programs=[Environment]::GetFolderPath('CommonPrograms')
+        if([string]::IsNullOrWhiteSpace($programs)){$programs=Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'}
+        $start=Join-Path $programs $lnkName
+        $desk=Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) $lnkName
+        $script:createdShortcuts=@()
+        $inventory=New-Object Collections.Generic.List[object]
+        foreach($entry in @($state.shortcuts)){ $inventory.Add($entry) }
+        foreach($lnkPath in @($start,$desk)){
+            $full=[IO.Path]::GetFullPath($lnkPath)
+            $known=@($inventory | Where-Object { [string]::Equals($_.path,$full,[StringComparison]::OrdinalIgnoreCase) }) | Select-Object -First 1
+            if(Test-Path -LiteralPath $full){
+                $item=Get-Item -LiteralPath $full -Force
+                $currentHash=(Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash
+                $owned=($known -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -and [string]::Equals($currentHash,[string]$known.sha256,[StringComparison]::OrdinalIgnoreCase))
+                if(-not $owned){
+                    # Raccourci existant non prouvé comme créé par Kinseat : ni écrasé ni revendiqué.
+                    if($known){[void]$inventory.Remove($known)}
+                    Emit 'registration' 'warning' "Raccourci existant conservé, propriété non revendiquée : $full" 95
+                    continue
+                }
+                [void]$inventory.Remove($known)
+            }
+            elseif($known){ [void]$inventory.Remove($known) }
+            $link=$shell.CreateShortcut($full); $link.TargetPath=$hostExe; $link.WorkingDirectory=$install; $link.IconLocation=$hostExe+',0'; $link.Save()
+            $created=[ordered]@{ path=$full; target=[string]$shell.CreateShortcut($full).TargetPath; sha256=(Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash }
+            $inventory.Add($created)
+            $script:createdShortcuts+=,$created
+        }
+        $state.shortcuts=@($inventory.ToArray()); Save-State
         $uninstall='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Kinseat'
         New-Item $uninstall -Force | Out-Null
         $values=@{DisplayName='Kinseat Hôte';DisplayVersion='0.3.21';Publisher='Kinseat';DisplayIcon=((Join-Path $install 'kinseat.exe')+',0');InstallLocation=$install;UninstallString=('"'+(Join-Path $install 'setup.exe')+'" --uninstall')}
@@ -335,8 +367,10 @@ try {
             switch($id) {
                 'registration' {
                     Remove-Item 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Kinseat' -Recurse -Force -ErrorAction SilentlyContinue
-                    Remove-Item (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Kinseat Hôte.lnk') -Force -ErrorAction SilentlyContinue
-                    Remove-Item (Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'Kinseat Hôte.lnk') -Force -ErrorAction SilentlyContinue
+                    # Seuls les raccourcis créés par cette tentative (et inchangés) sont retirés.
+                    foreach($made in @($script:createdShortcuts)){
+                        if($made -and (Test-Path -LiteralPath $made.path) -and (Get-FileHash -LiteralPath $made.path -Algorithm SHA256).Hash -eq $made.sha256){ Remove-Item -LiteralPath $made.path -Force -ErrorAction SilentlyContinue }
+                    }
                 }
                 'service' { Stop-Service MultiSeatService -Force -ErrorAction SilentlyContinue; if(-not $state.serviceExisted){ & sc.exe delete MultiSeatService | Out-Null } }
                 'firewall' { if($state.firewallOwned){Get-NetFirewallRule -DisplayName $rule -ErrorAction SilentlyContinue | Remove-NetFirewallRule} }
