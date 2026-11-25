@@ -1,4 +1,4 @@
-use egui::{pos2, vec2, Color32, CornerRadius, FontFamily, FontId, Rect, Stroke, Style, Visuals};
+use egui::{vec2, Color32, CornerRadius, FontFamily, FontId, Rect, Stroke, Style, Visuals};
 
 pub const CANVAS: Color32 = Color32::from_rgb(0x13, 0x12, 0x11);
 pub const RAIL: Color32 = Color32::from_rgb(0x19, 0x18, 0x16);
