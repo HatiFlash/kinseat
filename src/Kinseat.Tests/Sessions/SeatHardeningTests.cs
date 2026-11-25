@@ -394,6 +394,7 @@ public sealed class SeatHardeningTests
         internal readonly List<(string Path, string[] Sids)> StrippedBeforeMove = [];
         internal readonly List<(string Path, string? Sddl)> RestoredAcls = [];
         internal string CapturedSddl { get; set; } = "D:AI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)";
+        internal Func<string, bool>? FailRestrictPredicate { get; set; }
 
         public void EnsureRestrictedDirectory(string directoryPath)
         {
@@ -407,7 +408,12 @@ public sealed class SeatHardeningTests
             return CapturedSddl;
         }
 
-        public void RestrictBackupFile(string backupPath) => RestrictedFiles.Add(backupPath);
+        public void RestrictBackupFile(string backupPath)
+        {
+            RestrictedFiles.Add(backupPath);
+            if (FailRestrictPredicate?.Invoke(backupPath) == true)
+                throw new UnauthorizedAccessException($"ACL restriction failed for {backupPath}");
+        }
 
         public void RestoreFileAcl(string filePath, string? originalSddl, ILogger logger) =>
             RestoredAcls.Add((filePath, originalSddl));
@@ -577,7 +583,7 @@ public sealed class SeatHardeningTests
 
         // 1) Crash after recording PendingMove, before File.Move happened.
         var orig1 = Path.Combine(sandbox.Desktop, "Kinseat Hôte.lnk");
-        var bak1 = Path.Combine(sandbox.BackupDir, "1111_Kinseat Hôte.lnk");
+        var bak1 = SeatShortcutPolicy.BuildBackupPath(sandbox.BackupDir, orig1);
         File.WriteAllText(orig1, "pending-before-move");
         var manifest1 = new SeatShortcutPolicy.ShortcutManifest(SeatShortcutPolicy.ManifestVersion, [
             new SeatShortcutPolicy.RelocatedShortcutEntry(orig1, bak1, SeatShortcutPolicy.StatePendingMove, acl.CapturedSddl)
@@ -688,5 +694,200 @@ public sealed class SeatHardeningTests
         Assert.True(File.Exists(outsideTarget));
         Assert.False(File.Exists(sandbox.ManifestPath));
         Assert.Empty(SeatShortcutPolicy.DiscoverTargetShortcuts(sandbox.Paths.PublicRoots, logger));
+    }
+
+    [Fact]
+    public void ShortcutPendingMoveConflictPreservesBothFilesWithoutOverwrite()
+    {
+        // 1) Active seats (ReconcileExistingEntries): PendingMove with both original and backup must keep both.
+        using (var sandbox = new TempShortcutSandbox())
+        {
+            var acl = new FakeShortcutAclHandler();
+            var logger = new CapturingLogger();
+            Directory.CreateDirectory(sandbox.BackupDir);
+
+            var orig = Path.Combine(sandbox.Desktop, "Kinseat Hôte.lnk");
+            var bak = SeatShortcutPolicy.BuildBackupPath(sandbox.BackupDir, orig);
+            File.WriteAllText(orig, "original-newer");
+            File.WriteAllText(bak, "backup-older");
+
+            var manifest = new SeatShortcutPolicy.ShortcutManifest(SeatShortcutPolicy.ManifestVersion, [
+                new SeatShortcutPolicy.RelocatedShortcutEntry(orig, bak, SeatShortcutPolicy.StatePendingMove, acl.CapturedSddl)
+            ]);
+            File.WriteAllText(sandbox.ManifestPath, JsonSerializer.Serialize(manifest));
+
+            SeatShortcutPolicy.ApplyCore(sandbox.Paths, true, [Seat], logger, acl);
+
+            Assert.Equal("original-newer", File.ReadAllText(orig));
+            Assert.Equal("backup-older", File.ReadAllText(bak));
+            var updated = JsonSerializer.Deserialize<SeatShortcutPolicy.ShortcutManifest>(File.ReadAllText(sandbox.ManifestPath));
+            Assert.Single(updated!.Entries);
+            Assert.Equal(SeatShortcutPolicy.StateRestoreConflict, updated.Entries[0].State);
+            Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("Conflit"));
+        }
+
+        // 2) No managed seats (RestoreAll): PendingMove with both original and backup must keep both.
+        using (var sandbox = new TempShortcutSandbox())
+        {
+            var acl = new FakeShortcutAclHandler();
+            var logger = new CapturingLogger();
+            Directory.CreateDirectory(sandbox.BackupDir);
+
+            var orig = Path.Combine(sandbox.Desktop, "HidHide Configurator.lnk");
+            var bak = SeatShortcutPolicy.BuildBackupPath(sandbox.BackupDir, orig);
+            File.WriteAllText(orig, "original-restore");
+            File.WriteAllText(bak, "backup-restore");
+
+            var manifest = new SeatShortcutPolicy.ShortcutManifest(SeatShortcutPolicy.ManifestVersion, [
+                new SeatShortcutPolicy.RelocatedShortcutEntry(orig, bak, SeatShortcutPolicy.StatePendingMove, acl.CapturedSddl)
+            ]);
+            File.WriteAllText(sandbox.ManifestPath, JsonSerializer.Serialize(manifest));
+
+            SeatShortcutPolicy.ApplyCore(sandbox.Paths, false, [], logger, acl);
+
+            Assert.Equal("original-restore", File.ReadAllText(orig));
+            Assert.Equal("backup-restore", File.ReadAllText(bak));
+            var updated = JsonSerializer.Deserialize<SeatShortcutPolicy.ShortcutManifest>(File.ReadAllText(sandbox.ManifestPath));
+            Assert.Single(updated!.Entries);
+            Assert.Equal(SeatShortcutPolicy.StateRestoreConflict, updated.Entries[0].State);
+            Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("Conflit"));
+        }
+    }
+
+    [Fact]
+    public void ShortcutNormalRelocationNeverOverwritesExistingBackup()
+    {
+        // Case A: Existing Relocated entry + recreated public file -> no overwrite, RestoreConflict.
+        using (var sandbox = new TempShortcutSandbox())
+        {
+            var acl = new FakeShortcutAclHandler();
+            var logger = new CapturingLogger();
+            var orig = Path.Combine(sandbox.Desktop, "Kinseat Hôte.lnk");
+            File.WriteAllText(orig, "original-v1");
+
+            SeatShortcutPolicy.ApplyCore(sandbox.Paths, true, [Seat], logger, acl);
+            var bak = SeatShortcutPolicy.BuildBackupPath(sandbox.BackupDir, orig);
+            Assert.False(File.Exists(orig));
+            Assert.Equal("original-v1", File.ReadAllText(bak));
+
+            // Recreate public shortcut while backup already exists.
+            File.WriteAllText(orig, "recreated-v2");
+            SeatShortcutPolicy.ApplyCore(sandbox.Paths, true, [Seat], logger, acl);
+
+            Assert.Equal("recreated-v2", File.ReadAllText(orig));
+            Assert.Equal("original-v1", File.ReadAllText(bak));
+            var manifest = JsonSerializer.Deserialize<SeatShortcutPolicy.ShortcutManifest>(File.ReadAllText(sandbox.ManifestPath));
+            Assert.Single(manifest!.Entries);
+            Assert.Equal(SeatShortcutPolicy.StateRestoreConflict, manifest.Entries[0].State);
+            Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("Conflit"));
+        }
+
+        // Case B: No manifest entry, orphan backup already exists at deterministic path -> no overwrite, RestoreConflict.
+        using (var sandbox = new TempShortcutSandbox())
+        {
+            var acl = new FakeShortcutAclHandler();
+            var logger = new CapturingLogger();
+            Directory.CreateDirectory(sandbox.BackupDir);
+            var orig = Path.Combine(sandbox.Desktop, "HidHide Configuration Client.lnk");
+            var bak = SeatShortcutPolicy.BuildBackupPath(sandbox.BackupDir, orig);
+            File.WriteAllText(orig, "public-file");
+            File.WriteAllText(bak, "orphan-backup");
+
+            SeatShortcutPolicy.ApplyCore(sandbox.Paths, true, [Seat], logger, acl);
+
+            Assert.Equal("public-file", File.ReadAllText(orig));
+            Assert.Equal("orphan-backup", File.ReadAllText(bak));
+            var manifest = JsonSerializer.Deserialize<SeatShortcutPolicy.ShortcutManifest>(File.ReadAllText(sandbox.ManifestPath));
+            Assert.Single(manifest!.Entries);
+            Assert.Equal(SeatShortcutPolicy.StateRestoreConflict, manifest.Entries[0].State);
+            Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("Conflit"));
+        }
+    }
+
+    [Fact]
+    public void ShortcutAclRestrictionFailureRollsBackToOriginalAndPreservesState()
+    {
+        using var sandbox = new TempShortcutSandbox();
+        var acl = new FakeShortcutAclHandler
+        {
+            FailRestrictPredicate = p => p.StartsWith(sandbox.BackupDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+        };
+        var logger = new CapturingLogger();
+
+        var orig = Path.Combine(sandbox.Desktop, "Kinseat Hôte.lnk");
+        var expectedBak = SeatShortcutPolicy.BuildBackupPath(sandbox.BackupDir, orig);
+        File.WriteAllText(orig, "kinseat-acl-rollback");
+
+        SeatShortcutPolicy.ApplyCore(sandbox.Paths, true, [Seat], logger, acl);
+
+        // ACL restriction was attempted on a temp file inside BackupDir before renaming to final backup name.
+        Assert.Contains(acl.RestrictedFiles, p =>
+            p.StartsWith(sandbox.BackupDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) &&
+            p.EndsWith(".tmp", StringComparison.Ordinal) &&
+            !string.Equals(p, expectedBak, StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(expectedBak, acl.RestrictedFiles);
+
+        // Rollback restored the original file, left no final backup or temp file, and preserved PendingMove state.
+        Assert.Equal("kinseat-acl-rollback", File.ReadAllText(orig));
+        Assert.False(File.Exists(expectedBak));
+        Assert.Empty(Directory.GetFiles(sandbox.BackupDir));
+        var manifest = JsonSerializer.Deserialize<SeatShortcutPolicy.ShortcutManifest>(File.ReadAllText(sandbox.ManifestPath));
+        Assert.Single(manifest!.Entries);
+        Assert.Equal(SeatShortcutPolicy.StatePendingMove, manifest.Entries[0].State);
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning);
+
+        // Subsequent run once ACL restriction succeeds completes PendingMove cleanly.
+        acl.FailRestrictPredicate = null;
+        SeatShortcutPolicy.ApplyCore(sandbox.Paths, true, [Seat], logger, acl);
+        Assert.False(File.Exists(orig));
+        Assert.Equal("kinseat-acl-rollback", File.ReadAllText(expectedBak));
+        var after = JsonSerializer.Deserialize<SeatShortcutPolicy.ShortcutManifest>(File.ReadAllText(sandbox.ManifestPath));
+        Assert.Single(after!.Entries);
+        Assert.Equal(SeatShortcutPolicy.StateRelocated, after.Entries[0].State);
+    }
+
+    [Fact]
+    public void ShortcutManifestWithMismatchedBackupHashIsRejectedWithoutMutation()
+    {
+        using var sandbox = new TempShortcutSandbox();
+        var acl = new FakeShortcutAclHandler();
+        var logger = new CapturingLogger();
+        Directory.CreateDirectory(sandbox.BackupDir);
+
+        var orig = Path.Combine(sandbox.Desktop, "Kinseat Hôte.lnk");
+        var otherOrig = Path.Combine(sandbox.Programs, "Kinseat Hôte.lnk");
+        var validBak = SeatShortcutPolicy.BuildBackupPath(sandbox.BackupDir, orig);
+        var otherHashBak = SeatShortcutPolicy.BuildBackupPath(sandbox.BackupDir, otherOrig);
+        var bogusHashBak = Path.Combine(sandbox.BackupDir, "0000000000000000_Kinseat Hôte.lnk");
+
+        Assert.True(SeatShortcutPolicy.ValidateBackupPath(sandbox.BackupDir, orig, validBak, out _));
+        Assert.False(SeatShortcutPolicy.ValidateBackupPath(sandbox.BackupDir, orig, otherHashBak, out _));
+        Assert.False(SeatShortcutPolicy.ValidateBackupPath(sandbox.BackupDir, orig, bogusHashBak, out _));
+        Assert.False(SeatShortcutPolicy.ValidateBackupPath(sandbox.BackupDir, orig, Path.Combine(sandbox.BackupDir, "1111_Kinseat Hôte.lnk"), out _));
+
+        File.WriteAllText(orig, "orig-untouched");
+        File.WriteAllText(otherHashBak, "other-hash-backup");
+
+        var crafted = new SeatShortcutPolicy.ShortcutManifest(SeatShortcutPolicy.ManifestVersion, [
+            new SeatShortcutPolicy.RelocatedShortcutEntry(orig, otherHashBak, SeatShortcutPolicy.StatePendingMove, acl.CapturedSddl)
+        ]);
+        var craftedJson = JsonSerializer.Serialize(crafted);
+        File.WriteAllText(sandbox.ManifestPath, craftedJson);
+
+        // Active seats: rejected without mutating original, backup, or manifest.
+        SeatShortcutPolicy.ApplyCore(sandbox.Paths, true, [Seat], logger, acl);
+        Assert.Equal("orig-untouched", File.ReadAllText(orig));
+        Assert.Equal("other-hash-backup", File.ReadAllText(otherHashBak));
+        Assert.False(File.Exists(validBak));
+        Assert.Equal(craftedJson, File.ReadAllText(sandbox.ManifestPath));
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning);
+
+        // Restore pass: also rejected without mutating original, backup, or manifest.
+        logger.Entries.Clear();
+        SeatShortcutPolicy.ApplyCore(sandbox.Paths, false, [], logger, acl);
+        Assert.Equal("orig-untouched", File.ReadAllText(orig));
+        Assert.Equal("other-hash-backup", File.ReadAllText(otherHashBak));
+        Assert.Equal(craftedJson, File.ReadAllText(sandbox.ManifestPath));
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning);
     }
 }

@@ -126,12 +126,14 @@ internal static class SeatShortcutPolicy
         }
 
         var manifestDirty = migratedFromV1;
-        ReconcileExistingEntries(paths, manifest, ref manifestDirty, logger, aclHandler);
+        var skippedOriginals = new HashSet<string>(StringComparer.FromComparison(PathComparison));
+        ReconcileExistingEntries(paths, manifest, ref manifestDirty, skippedOriginals, logger, aclHandler);
 
         var discovered = DiscoverTargetShortcuts(paths.PublicRoots, logger);
         foreach (var originalPath in discovered)
         {
             if (!ValidateOriginalPath(paths.PublicRoots, originalPath, out var normalizedOriginal)) continue;
+            if (skippedOriginals.Contains(normalizedOriginal)) continue;
             if (HasReparsePointInSubpath(paths.PublicRoots, normalizedOriginal))
             {
                 logger.LogWarning("Raccourci ignoré (reparse point détecté) : {Path}", normalizedOriginal);
@@ -147,10 +149,23 @@ internal static class SeatShortcutPolicy
                     ? manifest.Entries[existingIndex].BackupPath
                     : BuildBackupPath(paths.BackupDirectory, normalizedOriginal);
 
-                if (!ValidateBackupPath(paths.BackupDirectory, backupPath, out var normalizedBackup) ||
-                    HasReparsePointInSubpath([paths.BackupDirectory], normalizedBackup))
+                if (!ValidateBackupPath(paths.BackupDirectory, normalizedOriginal, backupPath, out var normalizedBackup))
                 {
                     logger.LogWarning("Chemin de sauvegarde invalide pour {OriginalPath} : {BackupPath}", normalizedOriginal, backupPath);
+                    continue;
+                }
+
+                if (File.Exists(normalizedBackup))
+                {
+                    logger.LogWarning("Conflit de relocalisation du raccourci : {OriginalPath} et la sauvegarde {BackupPath} existent déjà ; les deux fichiers sont conservés sans écrasement",
+                        normalizedOriginal, normalizedBackup);
+                    var conflictEntry = existingIndex >= 0
+                        ? manifest.Entries[existingIndex] with { OriginalPath = normalizedOriginal, BackupPath = normalizedBackup, State = StateRestoreConflict }
+                        : new RelocatedShortcutEntry(normalizedOriginal, normalizedBackup, StateRestoreConflict);
+                    if (existingIndex >= 0) manifest.Entries[existingIndex] = conflictEntry;
+                    else manifest.Entries.Add(conflictEntry);
+                    SaveManifest(paths, manifest, aclHandler);
+                    manifestDirty = false;
                     continue;
                 }
 
@@ -166,8 +181,7 @@ internal static class SeatShortcutPolicy
                 SaveManifest(paths, manifest, aclHandler);
                 manifestDirty = false;
 
-                File.Move(normalizedOriginal, normalizedBackup, overwrite: existingIndex >= 0 && File.Exists(normalizedBackup));
-                aclHandler.RestrictBackupFile(normalizedBackup);
+                MoveToProtectedBackup(normalizedOriginal, normalizedBackup, aclHandler, logger);
 
                 var relocated = pending with { State = StateRelocated };
                 var idx = manifest.Entries.FindIndex(e =>
@@ -261,6 +275,7 @@ internal static class SeatShortcutPolicy
         PolicyPaths paths,
         ShortcutManifest manifest,
         ref bool manifestDirty,
+        HashSet<string> skippedOriginals,
         ILogger logger,
         IShortcutAclHandler aclHandler)
     {
@@ -269,7 +284,9 @@ internal static class SeatShortcutPolicy
             var entry = manifest.Entries[i];
             if (!ValidateEntry(paths, entry, out var normalizedOriginal, out var normalizedBackup))
             {
-                logger.LogWarning("Entrée de manifeste refusée (chemin hors périmètre ou reparse point) : {Original} -> {Backup}",
+                if (ValidateOriginalPath(paths.PublicRoots, entry.OriginalPath, out var rejectedOriginal))
+                    skippedOriginals.Add(rejectedOriginal);
+                logger.LogWarning("Entrée de manifeste refusée (chemin hors périmètre, hash invalide ou reparse point) : {Original} -> {Backup}",
                     entry.OriginalPath, entry.BackupPath);
                 continue;
             }
@@ -291,20 +308,19 @@ internal static class SeatShortcutPolicy
                     else if (origExists && !bakExists)
                     {
                         EnsureStorageReady(paths, aclHandler);
-                        File.Move(normalizedOriginal, normalizedBackup, overwrite: false);
-                        aclHandler.RestrictBackupFile(normalizedBackup);
+                        MoveToProtectedBackup(normalizedOriginal, normalizedBackup, aclHandler, logger);
                         manifest.Entries[i] = entry with { OriginalPath = normalizedOriginal, BackupPath = normalizedBackup, State = StateRelocated };
                         SaveManifest(paths, manifest, aclHandler);
                         manifestDirty = false;
                     }
                     else if (origExists && bakExists)
                     {
-                        File.Delete(normalizedBackup);
-                        File.Move(normalizedOriginal, normalizedBackup, overwrite: false);
-                        aclHandler.RestrictBackupFile(normalizedBackup);
-                        manifest.Entries[i] = entry with { OriginalPath = normalizedOriginal, BackupPath = normalizedBackup, State = StateRelocated };
+                        logger.LogWarning("Conflit PendingMove du raccourci : {OriginalPath} et la sauvegarde {BackupPath} existent tous les deux ; les deux fichiers sont conservés sans écrasement",
+                            normalizedOriginal, normalizedBackup);
+                        manifest.Entries[i] = entry with { OriginalPath = normalizedOriginal, BackupPath = normalizedBackup, State = StateRestoreConflict };
                         SaveManifest(paths, manifest, aclHandler);
                         manifestDirty = false;
+                        skippedOriginals.Add(normalizedOriginal);
                     }
                     else
                     {
@@ -335,6 +351,18 @@ internal static class SeatShortcutPolicy
                         SaveManifest(paths, manifest, aclHandler);
                         manifestDirty = false;
                     }
+                    else
+                    {
+                        logger.LogWarning("Conflit conservé pour le raccourci : {OriginalPath} et {BackupPath} existent tous les deux ; aucun écrasement effectué",
+                            normalizedOriginal, normalizedBackup);
+                        if (entry.State != StateRestoreConflict)
+                        {
+                            manifest.Entries[i] = entry with { OriginalPath = normalizedOriginal, BackupPath = normalizedBackup, State = StateRestoreConflict };
+                            SaveManifest(paths, manifest, aclHandler);
+                            manifestDirty = false;
+                        }
+                        skippedOriginals.Add(normalizedOriginal);
+                    }
                 }
                 else if (entry.State == StateRelocated && !bakExists && !origExists)
                 {
@@ -346,6 +374,7 @@ internal static class SeatShortcutPolicy
             }
             catch (Exception ex)
             {
+                skippedOriginals.Add(normalizedOriginal);
                 logger.LogWarning(ex, "Reprise d'état du raccourci impossible : {Original}", normalizedOriginal);
             }
         }
@@ -390,9 +419,10 @@ internal static class SeatShortcutPolicy
                     }
                     if (origExists && bakExists)
                     {
-                        File.Delete(normalizedBackup);
-                        manifest.Entries.RemoveAt(i);
-                        SaveOrDeleteManifest(paths, manifest, aclHandler);
+                        logger.LogWarning("Conflit PendingMove lors de la restauration : {OriginalPath} et la sauvegarde {BackupPath} existent tous les deux ; les deux fichiers sont conservés sans écrasement",
+                            normalizedOriginal, normalizedBackup);
+                        manifest.Entries[i] = entry with { OriginalPath = normalizedOriginal, BackupPath = normalizedBackup, State = StateRestoreConflict };
+                        SaveManifest(paths, manifest, aclHandler);
                         continue;
                     }
                     if (!origExists && !bakExists)
@@ -524,9 +554,8 @@ internal static class SeatShortcutPolicy
         normalizedOriginal = string.Empty;
         normalizedBackup = string.Empty;
         if (!ValidateOriginalPath(paths.PublicRoots, entry.OriginalPath, out normalizedOriginal)) return false;
-        if (!ValidateBackupPath(paths.BackupDirectory, entry.BackupPath, out normalizedBackup)) return false;
+        if (!ValidateBackupPath(paths.BackupDirectory, normalizedOriginal, entry.BackupPath, out normalizedBackup)) return false;
         if (HasReparsePointInSubpath(paths.PublicRoots, normalizedOriginal)) return false;
-        if (HasReparsePointInSubpath([paths.BackupDirectory], normalizedBackup)) return false;
         return true;
     }
 
@@ -548,10 +577,17 @@ internal static class SeatShortcutPolicy
         }
     }
 
-    internal static bool ValidateBackupPath(string backupDirectory, string? path, out string normalized)
+    internal static bool ValidateBackupPath(
+        string backupDirectory,
+        string normalizedOriginalPath,
+        string? path,
+        out string normalized)
     {
         normalized = string.Empty;
-        if (string.IsNullOrWhiteSpace(backupDirectory) || string.IsNullOrWhiteSpace(path) || !Path.IsPathRooted(path))
+        if (string.IsNullOrWhiteSpace(backupDirectory) ||
+            string.IsNullOrWhiteSpace(normalizedOriginalPath) ||
+            string.IsNullOrWhiteSpace(path) ||
+            !Path.IsPathRooted(path))
             return false;
         try
         {
@@ -560,6 +596,19 @@ internal static class SeatShortcutPolicy
             if (!IsStrictlyUnderRoot(fullDir, full)) return false;
             if (!string.Equals(Path.GetDirectoryName(full)?.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), fullDir, PathComparison))
                 return false;
+
+            var expected = BuildBackupPath(fullDir, normalizedOriginalPath);
+            var expectedFileName = Path.GetFileName(expected);
+            var actualFileName = Path.GetFileName(full);
+            if (actualFileName.Length != expectedFileName.Length || actualFileName.Length <= 17 || actualFileName[16] != '_')
+                return false;
+            if (!string.Equals(actualFileName[..16], expectedFileName[..16], StringComparison.OrdinalIgnoreCase))
+                return false;
+            if (!string.Equals(actualFileName[17..], expectedFileName[17..], PathComparison))
+                return false;
+            if (HasReparsePointInSubpath([fullDir], full))
+                return false;
+
             normalized = full;
             return true;
         }
@@ -569,11 +618,62 @@ internal static class SeatShortcutPolicy
         }
     }
 
-    private static string BuildBackupPath(string backupDirectory, string normalizedOriginalPath)
+    /// <summary>
+    /// Construit le chemin déterministe de sauvegarde :
+    /// SHA-256 UTF-8 de <c>Path.GetFullPath(originalPath).ToUpperInvariant()</c> (canonicalisation Windows insensible à la casse),
+    /// 16 premiers caractères hexadécimaux majuscules + '_' + nom de fichier d'origine, directement sous <paramref name="backupDirectory"/>.
+    /// </summary>
+    internal static string BuildBackupPath(string backupDirectory, string normalizedOriginalPath)
     {
-        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalizedOriginalPath.ToUpperInvariant())))[..16];
+        var canonicalOriginal = Path.GetFullPath(normalizedOriginalPath).ToUpperInvariant();
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonicalOriginal)))[..16];
         var fileName = $"{hash}_{Path.GetFileName(normalizedOriginalPath)}";
         return Path.Combine(Path.GetFullPath(backupDirectory), fileName);
+    }
+
+    private static void MoveToProtectedBackup(
+        string normalizedOriginal,
+        string normalizedBackup,
+        IShortcutAclHandler aclHandler,
+        ILogger logger)
+    {
+        if (File.Exists(normalizedBackup))
+            throw new IOException($"La sauvegarde existe déjà : {normalizedBackup}");
+
+        var backupDir = Path.GetDirectoryName(normalizedBackup)!;
+        var tempBackup = Path.Combine(backupDir, $".{Guid.NewGuid():N}.tmp");
+        File.Move(normalizedOriginal, tempBackup, overwrite: false);
+        try
+        {
+            aclHandler.RestrictBackupFile(tempBackup);
+            File.Move(tempBackup, normalizedBackup, overwrite: false);
+        }
+        catch (Exception ex)
+        {
+            if (File.Exists(tempBackup))
+            {
+                if (!File.Exists(normalizedOriginal))
+                {
+                    try
+                    {
+                        File.Move(tempBackup, normalizedOriginal, overwrite: false);
+                    }
+                    catch (Exception rollbackEx)
+                    {
+                        logger.LogWarning(rollbackEx,
+                            "Retour arrière impossible après échec de sécurisation de la sauvegarde ; fichier temporaire conservé : {TempPath}",
+                            tempBackup);
+                    }
+                }
+                else
+                {
+                    logger.LogWarning(
+                        "Retour arrière impossible sans écrasement car {OriginalPath} existe déjà ; fichier temporaire conservé : {TempPath}",
+                        normalizedOriginal, tempBackup);
+                }
+            }
+            throw new IOException($"Sécurisation ou déplacement final de la sauvegarde impossible pour {normalizedOriginal}", ex);
+        }
     }
 
     private static bool IsStrictlyUnderAnyRoot(IEnumerable<string> roots, string fullPath)
@@ -670,6 +770,7 @@ internal static class SeatShortcutPolicy
         aclHandler.EnsureRestrictedDirectory(manifestDir);
         var tmp = paths.ManifestPath + ".tmp";
         File.WriteAllText(tmp, JsonSerializer.Serialize(manifest));
+        aclHandler.RestrictBackupFile(tmp);
         File.Move(tmp, paths.ManifestPath, overwrite: true);
         aclHandler.RestrictBackupFile(paths.ManifestPath);
     }
