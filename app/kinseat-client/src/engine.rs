@@ -69,9 +69,71 @@ impl Engine {
                 })
         }
     }
+    /// Whether this engine is the Flatpak launcher (`flatpak run <app>`).
+    fn is_flatpak(&self) -> bool {
+        self.prefix.first().map(String::as_str) == Some("run")
+            && self
+                .prefix
+                .iter()
+                .any(|a| a.starts_with("com.moonlight_stream"))
+    }
+
+    /// Argument vector (before the Moonlight arguments) and environment giving Moonlight a
+    /// profile private to Kinseat on Linux/macOS. Without it Moonlight uses the user's global
+    /// profile, where its mDNS discovery adds every other place of the same PC (same IP, other
+    /// port, other certificate) and mixes their pairing state ("Out of order call to
+    /// getservercert", "Server certificate mismatch"). Windows isolates through its portable
+    /// working directory instead and gets nothing here.
+    fn profile_isolation(&self, dir: &std::path::Path) -> (Vec<String>, Vec<(String, String)>) {
+        if cfg!(windows) {
+            return (vec![], vec![]);
+        }
+        let cfg = dir.join("xdg-config").to_string_lossy().into_owned();
+        let cache = dir.join("xdg-cache").to_string_lossy().into_owned();
+        let data = dir.join("xdg-data").to_string_lossy().into_owned();
+        if self.is_flatpak() {
+            // `flatpak run` options must come right after `run`, before the application id.
+            let opts = vec![
+                format!("--filesystem={}", dir.to_string_lossy()),
+                format!("--env=XDG_CONFIG_HOME={cfg}"),
+                format!("--env=XDG_CACHE_HOME={cache}"),
+                format!("--env=XDG_DATA_HOME={data}"),
+            ];
+            return (opts, vec![]);
+        }
+        (
+            vec![],
+            vec![
+                ("XDG_CONFIG_HOME".into(), cfg),
+                ("XDG_CACHE_HOME".into(), cache),
+                ("XDG_DATA_HOME".into(), data),
+            ],
+        )
+    }
+
     pub fn command(&self, args: &[String]) -> Command {
         let mut cmd = Command::new(&self.program);
-        cmd.args(&self.prefix).args(args);
+        let isolation = data_dir().map(|dir| self.profile_isolation(&dir));
+        let (opts, env) = isolation.unwrap_or_default();
+        match self.prefix.split_first() {
+            Some((run, rest)) if !opts.is_empty() => {
+                cmd.arg(run).args(&opts).args(rest);
+            }
+            _ => {
+                cmd.args(&self.prefix);
+            }
+        }
+        cmd.args(args);
+        if !opts.is_empty() || !env.is_empty() {
+            if let Some(dir) = data_dir() {
+                for sub in ["xdg-config", "xdg-cache", "xdg-data"] {
+                    let _ = fs::create_dir_all(dir.join(sub));
+                }
+            }
+        }
+        for (key, value) in &env {
+            cmd.env(key, value);
+        }
         // The bundled Windows build is portable (`portable.dat`): it keeps its settings, including
         // the pairing certificates, in its *working directory*. Pin that to a per-user writable
         // folder, never Program Files or wherever the client happened to be started from.
@@ -129,24 +191,19 @@ fn settings_files() -> Vec<PathBuf> {
     let mut files = Vec::new();
     if let Some(dir) = data_dir() {
         files.push(dir.join(MOONLIGHT_ORG).join("Moonlight.ini"));
-    }
-    #[cfg(not(windows))]
-    {
-        let config = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
-        if let Some(config) = config {
-            files.push(config.join(MOONLIGHT_ORG).join("Moonlight.conf"));
-        }
-        if let Some(home) = std::env::var_os("HOME") {
+        // Isolated Linux/macOS profile (see `Engine::profile_isolation`).
+        #[cfg(not(windows))]
+        {
+            files.clear();
             files.push(
-                PathBuf::from(home)
-                    .join(".var/app/com.moonlight_stream.Moonlight/config")
+                dir.join("xdg-config")
                     .join(MOONLIGHT_ORG)
                     .join("Moonlight.conf"),
             );
         }
     }
+    // The user's global Moonlight profile is no longer the one Kinseat drives: reading it would
+    // report a pairing the isolated profile does not have.
     files
 }
 
@@ -867,6 +924,54 @@ pub fn stream(engine: Engine, place: Place, args: Vec<String>, tx: Sender<Event>
 mod tests {
     use super::*;
 
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_profile_is_isolated_per_kinseat() {
+        let dir = std::path::Path::new("/data/moonlight");
+        let native = Engine {
+            program: "/usr/bin/moonlight".into(),
+            prefix: vec![],
+        };
+        let (opts, env) = native.profile_isolation(dir);
+        assert!(opts.is_empty());
+        assert!(env.contains(&(
+            "XDG_CONFIG_HOME".into(),
+            "/data/moonlight/xdg-config".into()
+        )));
+        assert!(env.iter().any(|(k, _)| k == "XDG_CACHE_HOME"));
+
+        let flatpak = Engine {
+            program: "/usr/bin/flatpak".into(),
+            prefix: vec!["run".into(), "com.moonlight_stream.Moonlight".into()],
+        };
+        let (opts, env) = flatpak.profile_isolation(dir);
+        assert!(env.is_empty());
+        assert!(opts.contains(&"--filesystem=/data/moonlight".to_string()));
+        assert!(opts.contains(&"--env=XDG_CONFIG_HOME=/data/moonlight/xdg-config".to_string()));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn flatpak_options_precede_app_id() {
+        let e = Engine {
+            program: "/usr/bin/flatpak".into(),
+            prefix: vec!["run".into(), "com.moonlight_stream.Moonlight".into()],
+        };
+        let args: Vec<String> = e
+            .command(&["stream".into(), "h:1".into()])
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        if args.iter().any(|a| a.starts_with("--filesystem=")) {
+            let app = args
+                .iter()
+                .position(|a| a.starts_with("com.moonlight"))
+                .unwrap();
+            assert_eq!(args[0], "run");
+            assert!(args[1..app].iter().all(|a| a.starts_with("--")));
+            assert_eq!(&args[app + 1..], ["stream", "h:1"]);
+        }
+    }
     #[test]
     fn retry_only_on_early_failure() {
         assert!(should_retry(1, false, false, false, "error 10055"));
