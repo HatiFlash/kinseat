@@ -199,23 +199,162 @@ try {
         elseif($id -eq 'vdd'){Emit 'vdd' 'warning' 'Pilote SudoVDA : désinstallation automatique non sûre ; retirer manuellement' 60}
     }
     $shortcuts=Join-Path $data 'shutdown-rights\shortcuts.json'
-    if(Test-Path -LiteralPath $shortcuts){
-        foreach($entry in @(Get-Content -LiteralPath $shortcuts -Raw | ConvertFrom-Json)){
-            if($entry.Sid -notmatch '^S-1-5-21-(\d+-){3}\d+$' -or
-                [IO.Path]::GetFileName($entry.Path) -notin @('Kinseat Hôte.lnk','HidHide Configurator.lnk')){
-                throw 'Inventaire de raccourcis invalide : désinstallation refusée'
-            }
-            if(Test-Path -LiteralPath $entry.Path){
-                $acl=Get-Acl -LiteralPath $entry.Path
-                $rule=[Security.AccessControl.FileSystemAccessRule]::new(
-                    [Security.Principal.SecurityIdentifier]::new($entry.Sid),
-                    [Security.AccessControl.FileSystemRights]::Read,
-                    [Security.AccessControl.AccessControlType]::Deny)
-                $acl.RemoveAccessRuleSpecific($rule)
-                Set-Acl -LiteralPath $entry.Path -AclObject $acl
-            }
+    $shortcutBackupDir=Join-Path $data 'shutdown-rights\shortcuts-backup'
+    $shortcutRoots=@(@([Environment]::GetFolderPath('CommonDesktopDirectory'),[Environment]::GetFolderPath('CommonPrograms')) | Where-Object { $_ } | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') })
+    # Noms autorisés : identiques à SeatShortcutPolicy (y compris la variante mojibake historique).
+    $allowedShortcutNames=@('Kinseat Hôte.lnk',('Kinseat H'+[char]0x00C3+[char]0x00B4+'te.lnk'),'HidHide Configurator.lnk','HidHide Configuration Client.lnk')
+    function Test-PathUnder($root,$full) {
+        $prefix=$root.TrimEnd('\')+'\'
+        return ($full.Length -gt $prefix.Length -and $full.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase))
+    }
+    function Test-ItemExists($p) { return [bool](Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue) }
+    function Test-IsReparse($p) {
+        $item=Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+        if(-not $item){return $false}
+        return [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
+    }
+    # $true si la racine ou un segment existant du chemin est un lien/point d'analyse (aucun lien n'est suivi).
+    function Test-ReparseChain($root,$full) {
+        $root=$root.TrimEnd('\')
+        if(Test-IsReparse $root){return $true}
+        $current=$root
+        foreach($segment in $full.Substring($root.Length).Split('\',[StringSplitOptions]::RemoveEmptyEntries)){
+            $current=Join-Path $current $segment
+            if(Test-IsReparse $current){return $true}
         }
-        Remove-Item -LiteralPath $shortcuts -Force
+        return $false
+    }
+    function Resolve-ShortcutOriginal($path) {
+        if([string]::IsNullOrWhiteSpace($path) -or -not [IO.Path]::IsPathRooted($path)){return $null}
+        try{$full=[IO.Path]::GetFullPath($path)}catch{return $null}
+        if([IO.Path]::GetFileName($full) -notin $allowedShortcutNames){return $null}
+        foreach($root in $shortcutRoots){
+            if((Test-PathUnder $root $full) -and -not (Test-ReparseChain $root $full)){return $full}
+        }
+        return $null
+    }
+    function Resolve-ShortcutBackup($path,$originalPath) {
+        if([string]::IsNullOrWhiteSpace($path) -or -not [IO.Path]::IsPathRooted($path)){return $null}
+        try{$full=[IO.Path]::GetFullPath($path)}catch{return $null}
+        $dir=[IO.Path]::GetFullPath($shortcutBackupDir).TrimEnd('\')
+        if(-not (Test-PathUnder $dir $full)){return $null}
+        if(-not [string]::Equals([IO.Path]::GetDirectoryName($full).TrimEnd('\'),$dir,[StringComparison]::OrdinalIgnoreCase)){return $null}
+        $leaf=[IO.Path]::GetFileName($full)
+        if($leaf -notmatch '^[0-9A-Fa-f]{16}_' -or $leaf.Substring(17) -ne [IO.Path]::GetFileName($originalPath)){return $null}
+        if(Test-ReparseChain $dir $full){return $null}
+        return $full
+    }
+    function Get-NormalizedSddl($sddl) {
+        return ([Security.AccessControl.RawSecurityDescriptor]::new($sddl)).GetSddlForm([Security.AccessControl.AccessControlSections]::Access)
+    }
+    function Restore-ShortcutAcl($path,$sddl) {
+        $acl=Get-Acl -LiteralPath $path
+        if(-not [string]::IsNullOrWhiteSpace($sddl)){
+            $acl.SetSecurityDescriptorSddlForm($sddl,[Security.AccessControl.AccessControlSections]::Access)
+            Set-Acl -LiteralPath $path -AclObject $acl
+            $actual=(Get-Acl -LiteralPath $path).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access)
+            if((Get-NormalizedSddl $actual) -ne (Get-NormalizedSddl $sddl)){throw "ACL restaurée différente de l'ACL d'origine : $path"}
+        } else {
+            # Repli de SeatShortcutPolicy : héritage réactivé, règles explicites retirées.
+            $acl.SetAccessRuleProtection($false,$false)
+            foreach($rule in @($acl.GetAccessRules($true,$false,[Security.Principal.SecurityIdentifier]))){[void]$acl.RemoveAccessRuleSpecific($rule)}
+            Set-Acl -LiteralPath $path -AclObject $acl
+        }
+    }
+    function Write-ShortcutManifest($entries) {
+        $manifest=[ordered]@{Version=2;Entries=@($entries)}
+        $tmp=$shortcuts+'.tmp'
+        [IO.File]::WriteAllText($tmp,(ConvertTo-Json -InputObject $manifest -Depth 6),(New-Object Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $shortcuts -Force
+    }
+    if(Test-Path -LiteralPath $shortcuts){
+        $rawShortcuts=(Get-Content -LiteralPath $shortcuts -Raw -Encoding UTF8).Trim()
+        if($rawShortcuts.StartsWith('[')){
+            # Manifeste v1 (anciennes ACE Deny Read) : seules ces ACE historiques sont retirées.
+            foreach($entry in @($rawShortcuts | ConvertFrom-Json)){
+                if($entry.Sid -notmatch '^S-1-5-21-(\d+-){3}\d+$' -or
+                    [IO.Path]::GetFileName($entry.Path) -notin $allowedShortcutNames){
+                    throw 'Inventaire de raccourcis invalide : désinstallation refusée'
+                }
+                $v1Path=Resolve-ShortcutOriginal $entry.Path
+                if(-not $v1Path){Emit 'shortcuts' 'warning' "Entrée v1 ignorée (hors périmètre ou lien) : $($entry.Path)" 62; continue}
+                if(Test-Path -LiteralPath $v1Path){
+                    $acl=Get-Acl -LiteralPath $v1Path
+                    $rule=[Security.AccessControl.FileSystemAccessRule]::new(
+                        [Security.Principal.SecurityIdentifier]::new($entry.Sid),
+                        [Security.AccessControl.FileSystemRights]::Read,
+                        [Security.AccessControl.AccessControlType]::Deny)
+                    [void]$acl.RemoveAccessRuleSpecific($rule)
+                    Set-Acl -LiteralPath $v1Path -AclObject $acl
+                }
+            }
+            Remove-Item -LiteralPath $shortcuts -Force
+        } else {
+            # Manifeste v2 : relocalisation des .lnk vers shortcuts-backup ; chaque fichier doit être rendu à son OriginalPath.
+            $manifest=$rawShortcuts | ConvertFrom-Json
+            if($manifest.Version -ne 2 -or $null -eq $manifest.Entries){throw 'Manifeste de raccourcis invalide : désinstallation refusée, sauvegarde conservée'}
+            $remaining=New-Object Collections.Generic.List[object]
+            $failures=New-Object Collections.Generic.List[string]
+            foreach($entry in @($manifest.Entries)){
+                $orig=Resolve-ShortcutOriginal $entry.OriginalPath
+                $bak=$null
+                if($orig){$bak=Resolve-ShortcutBackup $entry.BackupPath $orig}
+                if(-not $orig -or -not $bak){
+                    $failures.Add("Entrée refusée (chemin hors périmètre ou lien) : $($entry.OriginalPath)")
+                    $remaining.Add($entry); continue
+                }
+                if($entry.State -notin @('PendingMove','Relocated','PendingRestore','RestoreConflict')){
+                    $failures.Add("État de raccourci inconnu '$($entry.State)' : $orig"); $remaining.Add($entry); continue
+                }
+                try{
+                    $origExists=Test-ItemExists $orig
+                    $bakExists=Test-ItemExists $bak
+                    if($entry.State -eq 'PendingMove' -and -not $bakExists){
+                        # Déplacement jamais effectué (ou rien à restaurer) : aucune sauvegarde à perdre.
+                        continue
+                    }
+                    if(-not $bakExists){
+                        if($origExists){Restore-ShortcutAcl $orig $entry.OriginalSddl}
+                        else{Emit 'shortcuts' 'warning' "Sauvegarde absente, raccourci non récupérable : $orig" 62}
+                        continue
+                    }
+                    if($origExists){
+                        $failures.Add("Conflit : $orig existe déjà ; fichier conservé, sauvegarde maintenue : $bak")
+                        $remaining.Add($entry); continue
+                    }
+                    $parent=[IO.Path]::GetDirectoryName($orig)
+                    if(-not (Test-Path -LiteralPath $parent -PathType Container)){[void](New-Item -ItemType Directory -Path $parent)}
+                    if(Test-ReparseChain ($shortcutRoots | Where-Object { Test-PathUnder $_ $orig } | Select-Object -First 1) $orig){throw "Répertoire parent redirigé : $parent"}
+                    # File.Move n'écrase jamais : échec si le raccourci a été recréé entre-temps.
+                    [IO.File]::Move($bak,$orig)
+                    try{ Restore-ShortcutAcl $orig $entry.OriginalSddl }
+                    catch{
+                        $aclError=$_.Exception.Message
+                        try{ [IO.File]::Move($orig,$bak) }catch{ $aclError+=" ; retour arrière impossible, fichier laissé à $orig" }
+                        throw $aclError
+                    }
+                    if(-not (Test-ItemExists $orig) -or (Test-ItemExists $bak)){throw "Restauration non vérifiée : $orig"}
+                    Emit 'shortcuts' 'ok' "Raccourci restauré : $orig" 62
+                } catch {
+                    $failures.Add("Restauration impossible pour $orig : $($_.Exception.Message)")
+                    $remaining.Add($entry)
+                }
+            }
+            if($failures.Count -gt 0){
+                Write-ShortcutManifest $remaining
+                throw ('Raccourcis non restaurés, manifeste et sauvegarde conservés : ' + ($failures -join ' | '))
+            }
+            $leftovers=@()
+            if(Test-Path -LiteralPath $shortcutBackupDir){
+                if(Test-IsReparse $shortcutBackupDir){throw 'Répertoire de sauvegarde redirigé : désinstallation refusée'}
+                $leftovers=@(Get-ChildItem -LiteralPath $shortcutBackupDir -Force)
+            }
+            if($leftovers.Count -gt 0){throw "Fichiers inattendus dans shortcuts-backup, conservés : $($leftovers.Count)"}
+            # Restauration complète et vérifiée : le manifeste puis le répertoire de sauvegarde (vide) peuvent être supprimés.
+            Remove-Item -LiteralPath $shortcuts -Force
+            Remove-Item -LiteralPath ($shortcuts+'.tmp') -Force -ErrorAction SilentlyContinue
+            if(Test-Path -LiteralPath $shortcutBackupDir){Remove-Item -LiteralPath $shortcutBackupDir -Force}
+        }
     }
     Remove-Item 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Kinseat' -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Kinseat Hôte.lnk') -Force -ErrorAction SilentlyContinue
