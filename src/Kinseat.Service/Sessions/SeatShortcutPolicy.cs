@@ -1,98 +1,808 @@
 using System.Security.AccessControl;
+using System.Security.Cryptography;
 using System.Security.Principal;
+using System.Text;
 using System.Text.Json;
 using MultiSeat.Service.Accounts;
 
 namespace MultiSeat.Service.Sessions;
 
-/// <summary>Only the host tools' public shortcuts are hidden from managed seat identities.</summary>
+/// <summary>Relocates host-tool public shortcuts out of public folders while managed seats exist.</summary>
 internal static class SeatShortcutPolicy
 {
-    private static readonly string[] Names = ["Kinseat Hôte.lnk", "HidHide Configurator.lnk"];
-    internal sealed record ShortcutEntry(string Path, string Sid);
+    internal const int ManifestVersion = 2;
+    internal const string StatePendingMove = "PendingMove";
+    internal const string StateRelocated = "Relocated";
+    internal const string StatePendingRestore = "PendingRestore";
+    internal const string StateRestoreConflict = "RestoreConflict";
+
+    private static readonly string[] AllowedNames =
+    [
+        "Kinseat Hôte.lnk",
+        "Kinseat HÃ´te.lnk",
+        "HidHide Configurator.lnk",
+        "HidHide Configuration Client.lnk"
+    ];
+
+    private static readonly HashSet<string> AllowedNameSet = new(AllowedNames, StringComparer.OrdinalIgnoreCase);
+    private static readonly StringComparison PathComparison = OperatingSystem.IsWindows()
+        ? StringComparison.OrdinalIgnoreCase
+        : StringComparison.Ordinal;
+
+    internal sealed record LegacyShortcutEntry(string Path, string Sid);
+
+    internal sealed record RelocatedShortcutEntry(
+        string OriginalPath,
+        string BackupPath,
+        string State,
+        string? OriginalSddl = null);
+
+    internal sealed record ShortcutManifest(int Version, List<RelocatedShortcutEntry> Entries);
+
+    internal sealed record PolicyPaths(string[] PublicRoots, string ManifestPath, string BackupDirectory);
+
+    internal interface IShortcutAclHandler
+    {
+        void EnsureRestrictedDirectory(string directoryPath);
+        string? CaptureAclAndStripLegacyDeny(string filePath, IReadOnlyCollection<string> legacyDenySids, ILogger logger);
+        void RestrictBackupFile(string backupPath);
+        void RestoreFileAcl(string filePath, string? originalSddl, ILogger logger);
+        void RemoveLegacyDenyAce(string filePath, string sid, ILogger logger);
+    }
+
     internal static readonly string InventoryPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
         "Kinseat", "shutdown-rights", "shortcuts.json");
+
+    internal static readonly string BackupDirectoryPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+        "Kinseat", "shutdown-rights", "shortcuts-backup");
+
     private static readonly object Gate = new();
 
-    private static FileSystemAccessRule Rule(string sid) =>
-        new(new SecurityIdentifier(sid), FileSystemRights.Read, AccessControlType.Deny);
+    private static PolicyPaths DefaultPaths => new(
+        new[]
+        {
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory),
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms)
+        }.Where(p => !string.IsNullOrWhiteSpace(p)).ToArray(),
+        InventoryPath,
+        BackupDirectoryPath);
 
-    private static bool OwnRule(FileSystemAccessRule r, string sid) =>
-        !r.IsInherited && string.Equals(r.IdentityReference.Value, sid, StringComparison.OrdinalIgnoreCase) &&
-        r.AccessControlType == AccessControlType.Deny && r.FileSystemRights == FileSystemRights.Read;
-
-    private static List<ShortcutEntry> Load() => File.Exists(InventoryPath)
-        ? JsonSerializer.Deserialize<List<ShortcutEntry>>(File.ReadAllText(InventoryPath))
-            ?? throw new InvalidDataException("Inventaire des raccourcis invalide")
-        : [];
-
-    private static void Save(List<ShortcutEntry> entries)
-    {
-        ShutdownRightPolicy.SecureDirectory(InventoryPath);
-        var tmp = InventoryPath + ".tmp";
-        File.WriteAllText(tmp, JsonSerializer.Serialize(entries));
-        File.Move(tmp, InventoryPath, true);
-    }
+    internal static bool IsAllowedShortcutName(string? fileName) =>
+        !string.IsNullOrWhiteSpace(fileName) && AllowedNameSet.Contains(fileName);
 
     internal static string[] SelectShortcuts(IEnumerable<string> paths) => paths
-        .Where(path => Names.Contains(Path.GetFileName(path), StringComparer.OrdinalIgnoreCase))
-        .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        .Where(path => IsAllowedShortcutName(Path.GetFileName(path)))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
 
     internal static void Apply(AccountManager accounts, ILogger logger)
     {
         if (!OperatingSystem.IsWindows()) return;
         lock (Gate)
         {
-            var desktop = Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory);
-            var programs = Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms);
-            var paths = SelectShortcuts(new[] { desktop, programs }
-                .Where(Directory.Exists).SelectMany(dir => Directory.EnumerateFiles(dir, "*.lnk")));
-            var eligible = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var account in accounts.ListManagedAccounts().Where(a => a.IsManaged))
+            var managedAccounts = accounts.ListManagedAccounts().Where(a => a.IsManaged).ToArray();
+            var eligibleSids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var hasManagedSeats = false;
+            foreach (var account in managedAccounts)
             {
                 if (!accounts.IsManagedSeatAccount(account.Username)) continue;
+                hasManagedSeats = true;
                 var sid = AccountManager.TryResolveSid(account.Username, logger);
-                if (sid is not null) eligible.Add(sid);
+                if (sid is not null) eligibleSids.Add(sid);
             }
-            var entries = Load();
-            foreach (var old in entries.ToArray())
+            ApplyCore(DefaultPaths, hasManagedSeats, eligibleSids, logger, WindowsAclHandler.Instance);
+        }
+    }
+
+    internal static void ApplyCore(
+        PolicyPaths paths,
+        bool hasManagedSeats,
+        IReadOnlyCollection<string> managedSeatSids,
+        ILogger logger,
+        IShortcutAclHandler? aclHandler = null)
+    {
+        aclHandler ??= OperatingSystem.IsWindows() ? WindowsAclHandler.Instance : NoOpAclHandler.Instance;
+
+        if (IsReparsePoint(paths.ManifestPath))
+        {
+            logger.LogWarning("Manifeste des raccourcis ignoré (lien symbolique/reparse point) : {Path}", paths.ManifestPath);
+            return;
+        }
+        if (IsReparsePoint(paths.BackupDirectory))
+        {
+            logger.LogWarning("Répertoire de sauvegarde des raccourcis ignoré (lien symbolique/reparse point) : {Path}", paths.BackupDirectory);
+            return;
+        }
+
+        var (manifest, migratedFromV1) = LoadOrMigrateManifest(paths, logger, aclHandler);
+        if (manifest is null) return;
+
+        if (!hasManagedSeats)
+        {
+            RestoreAll(paths, manifest, migratedFromV1, logger, aclHandler);
+            return;
+        }
+
+        var manifestDirty = migratedFromV1;
+        ReconcileExistingEntries(paths, manifest, ref manifestDirty, logger, aclHandler);
+
+        var discovered = DiscoverTargetShortcuts(paths.PublicRoots, logger);
+        foreach (var originalPath in discovered)
+        {
+            if (!ValidateOriginalPath(paths.PublicRoots, originalPath, out var normalizedOriginal)) continue;
+            if (HasReparsePointInSubpath(paths.PublicRoots, normalizedOriginal))
             {
-                if (eligible.Contains(old.Sid) && paths.Contains(old.Path, StringComparer.OrdinalIgnoreCase)) continue;
-                try
+                logger.LogWarning("Raccourci ignoré (reparse point détecté) : {Path}", normalizedOriginal);
+                continue;
+            }
+
+            var existingIndex = manifest.Entries.FindIndex(e =>
+                string.Equals(e.OriginalPath, normalizedOriginal, PathComparison));
+            try
+            {
+                EnsureStorageReady(paths, aclHandler);
+                var backupPath = existingIndex >= 0
+                    ? manifest.Entries[existingIndex].BackupPath
+                    : BuildBackupPath(paths.BackupDirectory, normalizedOriginal);
+
+                if (!ValidateBackupPath(paths.BackupDirectory, backupPath, out var normalizedBackup) ||
+                    HasReparsePointInSubpath([paths.BackupDirectory], normalizedBackup))
                 {
-                    if (File.Exists(old.Path))
-                    {
-                        var file = new FileInfo(old.Path);
-                        var acl = file.GetAccessControl();
-                        acl.RemoveAccessRuleSpecific(Rule(old.Sid));
-                        file.SetAccessControl(acl);
-                    }
-                    entries.Remove(old);
-                    Save(entries);
+                    logger.LogWarning("Chemin de sauvegarde invalide pour {OriginalPath} : {BackupPath}", normalizedOriginal, backupPath);
+                    continue;
                 }
-                catch (Exception ex) { logger.LogWarning(ex, "Nettoyage ACL du raccourci impossible : {Path}", old.Path); }
+
+                var originalSddl = aclHandler.CaptureAclAndStripLegacyDeny(normalizedOriginal, managedSeatSids, logger);
+                var pending = new RelocatedShortcutEntry(
+                    normalizedOriginal,
+                    normalizedBackup,
+                    StatePendingMove,
+                    originalSddl ?? (existingIndex >= 0 ? manifest.Entries[existingIndex].OriginalSddl : null));
+
+                if (existingIndex >= 0) manifest.Entries[existingIndex] = pending;
+                else manifest.Entries.Add(pending);
+                SaveManifest(paths, manifest, aclHandler);
+                manifestDirty = false;
+
+                File.Move(normalizedOriginal, normalizedBackup, overwrite: existingIndex >= 0 && File.Exists(normalizedBackup));
+                aclHandler.RestrictBackupFile(normalizedBackup);
+
+                var relocated = pending with { State = StateRelocated };
+                var idx = manifest.Entries.FindIndex(e =>
+                    string.Equals(e.OriginalPath, normalizedOriginal, PathComparison));
+                if (idx >= 0) manifest.Entries[idx] = relocated;
+                SaveManifest(paths, manifest, aclHandler);
+                logger.LogInformation("Raccourci public relocalisé : {OriginalPath} -> {BackupPath}", normalizedOriginal, normalizedBackup);
             }
-            foreach (var sid in eligible)
-            foreach (var path in paths)
+            catch (Exception ex)
             {
-                var owned = entries.Any(e => e.Sid.Equals(sid, StringComparison.OrdinalIgnoreCase) &&
-                    e.Path.Equals(path, StringComparison.OrdinalIgnoreCase));
+                logger.LogWarning(ex, "Relocalisation du raccourci impossible : {Path}", normalizedOriginal);
+            }
+        }
+
+        if (manifestDirty)
+        {
+            if (manifest.Entries.Count == 0)
+                DeleteManifestIfExists(paths.ManifestPath);
+            else
+                SaveManifest(paths, manifest, aclHandler);
+        }
+    }
+
+    private static (ShortcutManifest? Manifest, bool MigratedFromV1) LoadOrMigrateManifest(
+        PolicyPaths paths,
+        ILogger logger,
+        IShortcutAclHandler aclHandler)
+    {
+        if (!File.Exists(paths.ManifestPath))
+            return (new ShortcutManifest(ManifestVersion, []), false);
+
+        string raw;
+        try
+        {
+            raw = File.ReadAllText(paths.ManifestPath).Trim();
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Lecture du manifeste des raccourcis impossible : {Path}", paths.ManifestPath);
+            return (null, false);
+        }
+
+        if (raw.StartsWith('['))
+        {
+            List<LegacyShortcutEntry>? legacy;
+            try
+            {
+                legacy = JsonSerializer.Deserialize<List<LegacyShortcutEntry>>(raw);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Manifeste v1 des raccourcis invalide : {Path}", paths.ManifestPath);
+                return (null, false);
+            }
+
+            if (legacy is not null)
+            {
+                foreach (var item in legacy)
+                {
+                    if (!ValidateOriginalPath(paths.PublicRoots, item.Path, out var normalizedPath) ||
+                        HasReparsePointInSubpath(paths.PublicRoots, normalizedPath))
+                    {
+                        logger.LogWarning("Entrée v1 ignorée (chemin hors périmètre ou lien symbolique) : {Path}", item.Path);
+                        continue;
+                    }
+                    if (File.Exists(normalizedPath))
+                        aclHandler.RemoveLegacyDenyAce(normalizedPath, item.Sid, logger);
+                }
+            }
+            return (new ShortcutManifest(ManifestVersion, []), true);
+        }
+
+        try
+        {
+            var manifest = JsonSerializer.Deserialize<ShortcutManifest>(raw);
+            if (manifest is null || manifest.Version != ManifestVersion || manifest.Entries is null)
+            {
+                logger.LogWarning("Manifeste des raccourcis invalide : {Path}", paths.ManifestPath);
+                return (null, false);
+            }
+            return (manifest, false);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Désérialisation du manifeste des raccourcis impossible : {Path}", paths.ManifestPath);
+            return (null, false);
+        }
+    }
+
+    private static void ReconcileExistingEntries(
+        PolicyPaths paths,
+        ShortcutManifest manifest,
+        ref bool manifestDirty,
+        ILogger logger,
+        IShortcutAclHandler aclHandler)
+    {
+        for (var i = manifest.Entries.Count - 1; i >= 0; i--)
+        {
+            var entry = manifest.Entries[i];
+            if (!ValidateEntry(paths, entry, out var normalizedOriginal, out var normalizedBackup))
+            {
+                logger.LogWarning("Entrée de manifeste refusée (chemin hors périmètre ou reparse point) : {Original} -> {Backup}",
+                    entry.OriginalPath, entry.BackupPath);
+                continue;
+            }
+
+            var origExists = File.Exists(normalizedOriginal);
+            var bakExists = File.Exists(normalizedBackup);
+
+            try
+            {
+                if (entry.State == StatePendingMove)
+                {
+                    if (!origExists && bakExists)
+                    {
+                        aclHandler.RestrictBackupFile(normalizedBackup);
+                        manifest.Entries[i] = entry with { OriginalPath = normalizedOriginal, BackupPath = normalizedBackup, State = StateRelocated };
+                        SaveManifest(paths, manifest, aclHandler);
+                        manifestDirty = false;
+                    }
+                    else if (origExists && !bakExists)
+                    {
+                        EnsureStorageReady(paths, aclHandler);
+                        File.Move(normalizedOriginal, normalizedBackup, overwrite: false);
+                        aclHandler.RestrictBackupFile(normalizedBackup);
+                        manifest.Entries[i] = entry with { OriginalPath = normalizedOriginal, BackupPath = normalizedBackup, State = StateRelocated };
+                        SaveManifest(paths, manifest, aclHandler);
+                        manifestDirty = false;
+                    }
+                    else if (origExists && bakExists)
+                    {
+                        File.Delete(normalizedBackup);
+                        File.Move(normalizedOriginal, normalizedBackup, overwrite: false);
+                        aclHandler.RestrictBackupFile(normalizedBackup);
+                        manifest.Entries[i] = entry with { OriginalPath = normalizedOriginal, BackupPath = normalizedBackup, State = StateRelocated };
+                        SaveManifest(paths, manifest, aclHandler);
+                        manifestDirty = false;
+                    }
+                    else
+                    {
+                        logger.LogWarning("Entrée PendingMove orpheline nettoyée : {Original}", normalizedOriginal);
+                        manifest.Entries.RemoveAt(i);
+                        SaveManifest(paths, manifest, aclHandler);
+                        manifestDirty = false;
+                    }
+                }
+                else if (entry.State == StatePendingRestore || entry.State == StateRestoreConflict)
+                {
+                    if (bakExists && !origExists)
+                    {
+                        aclHandler.RestrictBackupFile(normalizedBackup);
+                        manifest.Entries[i] = entry with { OriginalPath = normalizedOriginal, BackupPath = normalizedBackup, State = StateRelocated };
+                        SaveManifest(paths, manifest, aclHandler);
+                        manifestDirty = false;
+                    }
+                    else if (!bakExists && origExists)
+                    {
+                        manifest.Entries.RemoveAt(i);
+                        SaveManifest(paths, manifest, aclHandler);
+                        manifestDirty = false;
+                    }
+                    else if (!bakExists && !origExists)
+                    {
+                        manifest.Entries.RemoveAt(i);
+                        SaveManifest(paths, manifest, aclHandler);
+                        manifestDirty = false;
+                    }
+                }
+                else if (entry.State == StateRelocated && !bakExists && !origExists)
+                {
+                    logger.LogWarning("Sauvegarde de raccourci introuvable ; entrée nettoyée : {Backup}", normalizedBackup);
+                    manifest.Entries.RemoveAt(i);
+                    SaveManifest(paths, manifest, aclHandler);
+                    manifestDirty = false;
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Reprise d'état du raccourci impossible : {Original}", normalizedOriginal);
+            }
+        }
+    }
+
+    private static void RestoreAll(
+        PolicyPaths paths,
+        ShortcutManifest manifest,
+        bool migratedFromV1,
+        ILogger logger,
+        IShortcutAclHandler aclHandler)
+    {
+        if (manifest.Entries.Count == 0)
+        {
+            if (migratedFromV1 || File.Exists(paths.ManifestPath))
+                DeleteManifestIfExists(paths.ManifestPath);
+            return;
+        }
+
+        for (var i = manifest.Entries.Count - 1; i >= 0; i--)
+        {
+            var entry = manifest.Entries[i];
+            if (!ValidateEntry(paths, entry, out var normalizedOriginal, out var normalizedBackup))
+            {
+                logger.LogWarning("Restauration refusée (chemin hors périmètre ou reparse point) : {Original} -> {Backup}",
+                    entry.OriginalPath, entry.BackupPath);
+                continue;
+            }
+
+            var origExists = File.Exists(normalizedOriginal);
+            var bakExists = File.Exists(normalizedBackup);
+
+            try
+            {
+                if (entry.State == StatePendingMove)
+                {
+                    if (origExists && !bakExists)
+                    {
+                        manifest.Entries.RemoveAt(i);
+                        SaveOrDeleteManifest(paths, manifest, aclHandler);
+                        continue;
+                    }
+                    if (origExists && bakExists)
+                    {
+                        File.Delete(normalizedBackup);
+                        manifest.Entries.RemoveAt(i);
+                        SaveOrDeleteManifest(paths, manifest, aclHandler);
+                        continue;
+                    }
+                    if (!origExists && !bakExists)
+                    {
+                        manifest.Entries.RemoveAt(i);
+                        SaveOrDeleteManifest(paths, manifest, aclHandler);
+                        continue;
+                    }
+                }
+
+                if (entry.State != StatePendingRestore && entry.State != StateRestoreConflict)
+                {
+                    manifest.Entries[i] = entry with { OriginalPath = normalizedOriginal, BackupPath = normalizedBackup, State = StatePendingRestore };
+                    SaveManifest(paths, manifest, aclHandler);
+                }
+
+                if (!bakExists)
+                {
+                    if (origExists)
+                    {
+                        aclHandler.RestoreFileAcl(normalizedOriginal, entry.OriginalSddl, logger);
+                    }
+                    else
+                    {
+                        logger.LogWarning("Sauvegarde absente lors de la restauration : {Backup}", normalizedBackup);
+                    }
+                    manifest.Entries.RemoveAt(i);
+                    SaveOrDeleteManifest(paths, manifest, aclHandler);
+                    continue;
+                }
+
+                if (origExists)
+                {
+                    logger.LogWarning("Conflit de restauration du raccourci : {OriginalPath} existe déjà ; fichier conservé et sauvegarde maintenue dans {BackupPath}",
+                        normalizedOriginal, normalizedBackup);
+                    if (entry.State != StateRestoreConflict)
+                    {
+                        manifest.Entries[i] = entry with { OriginalPath = normalizedOriginal, BackupPath = normalizedBackup, State = StateRestoreConflict };
+                        SaveManifest(paths, manifest, aclHandler);
+                    }
+                    continue;
+                }
+
+                var parentDir = Path.GetDirectoryName(normalizedOriginal)!;
+                if (!EnsureDirectoryWithoutReparse(paths.PublicRoots, parentDir))
+                {
+                    logger.LogWarning("Restauration refusée (répertoire parent redirigé) : {Dir}", parentDir);
+                    continue;
+                }
+
+                File.Move(normalizedBackup, normalizedOriginal, overwrite: false);
+                aclHandler.RestoreFileAcl(normalizedOriginal, entry.OriginalSddl, logger);
+                manifest.Entries.RemoveAt(i);
+                SaveOrDeleteManifest(paths, manifest, aclHandler);
+                logger.LogInformation("Raccourci public restauré : {OriginalPath}", normalizedOriginal);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Restauration du raccourci impossible : {OriginalPath}", normalizedOriginal);
+            }
+        }
+
+        if (manifest.Entries.Count == 0)
+            DeleteManifestIfExists(paths.ManifestPath);
+    }
+
+    internal static string[] DiscoverTargetShortcuts(IEnumerable<string> publicRoots, ILogger logger)
+    {
+        var results = new List<string>();
+        foreach (var root in publicRoots)
+        {
+            if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root)) continue;
+            if (IsReparsePoint(root))
+            {
+                logger.LogWarning("Racine publique ignorée (reparse point) : {Root}", root);
+                continue;
+            }
+
+            var pending = new Stack<string>();
+            pending.Push(Path.GetFullPath(root));
+            while (pending.Count > 0)
+            {
+                var current = pending.Pop();
+                IEnumerable<string> files;
+                IEnumerable<string> subdirs;
                 try
                 {
-                    var file = new FileInfo(path);
-                    var acl = file.GetAccessControl();
-                    if (acl.GetAccessRules(true, false, typeof(SecurityIdentifier))
-                        .OfType<FileSystemAccessRule>().Any(r => OwnRule(r, sid))) continue;
-                    if (!owned)
+                    var fileOptions = new EnumerationOptions { MatchCasing = MatchCasing.CaseInsensitive, RecurseSubdirectories = false };
+                    files = Directory.EnumerateFiles(current, "*.lnk", fileOptions);
+                    subdirs = Directory.EnumerateDirectories(current, "*", SearchOption.TopDirectoryOnly);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "Parcours du répertoire public impossible : {Dir}", current);
+                    continue;
+                }
+
+                foreach (var file in files)
+                {
+                    if (!IsAllowedShortcutName(Path.GetFileName(file))) continue;
+                    if (IsReparsePoint(file))
                     {
-                        entries.Add(new ShortcutEntry(path, sid));
-                        Save(entries); // Write intent before the ACL; recovery and uninstall can undo it.
+                        logger.LogWarning("Raccourci ignoré (reparse point) : {File}", file);
+                        continue;
                     }
-                    acl.AddAccessRule(Rule(sid));
+                    results.Add(Path.GetFullPath(file));
+                }
+
+                foreach (var subdir in subdirs)
+                {
+                    if (IsReparsePoint(subdir))
+                    {
+                        logger.LogWarning("Sous-répertoire public ignoré (reparse point) : {Dir}", subdir);
+                        continue;
+                    }
+                    pending.Push(Path.GetFullPath(subdir));
+                }
+            }
+        }
+        return SelectShortcuts(results);
+    }
+
+    internal static bool ValidateEntry(
+        PolicyPaths paths,
+        RelocatedShortcutEntry entry,
+        out string normalizedOriginal,
+        out string normalizedBackup)
+    {
+        normalizedOriginal = string.Empty;
+        normalizedBackup = string.Empty;
+        if (!ValidateOriginalPath(paths.PublicRoots, entry.OriginalPath, out normalizedOriginal)) return false;
+        if (!ValidateBackupPath(paths.BackupDirectory, entry.BackupPath, out normalizedBackup)) return false;
+        if (HasReparsePointInSubpath(paths.PublicRoots, normalizedOriginal)) return false;
+        if (HasReparsePointInSubpath([paths.BackupDirectory], normalizedBackup)) return false;
+        return true;
+    }
+
+    internal static bool ValidateOriginalPath(IEnumerable<string> publicRoots, string? path, out string normalized)
+    {
+        normalized = string.Empty;
+        if (string.IsNullOrWhiteSpace(path) || !Path.IsPathRooted(path)) return false;
+        try
+        {
+            var full = Path.GetFullPath(path);
+            if (!IsAllowedShortcutName(Path.GetFileName(full))) return false;
+            if (!IsStrictlyUnderAnyRoot(publicRoots, full)) return false;
+            normalized = full;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    internal static bool ValidateBackupPath(string backupDirectory, string? path, out string normalized)
+    {
+        normalized = string.Empty;
+        if (string.IsNullOrWhiteSpace(backupDirectory) || string.IsNullOrWhiteSpace(path) || !Path.IsPathRooted(path))
+            return false;
+        try
+        {
+            var fullDir = Path.GetFullPath(backupDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var full = Path.GetFullPath(path);
+            if (!IsStrictlyUnderRoot(fullDir, full)) return false;
+            if (!string.Equals(Path.GetDirectoryName(full)?.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), fullDir, PathComparison))
+                return false;
+            normalized = full;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string BuildBackupPath(string backupDirectory, string normalizedOriginalPath)
+    {
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalizedOriginalPath.ToUpperInvariant())))[..16];
+        var fileName = $"{hash}_{Path.GetFileName(normalizedOriginalPath)}";
+        return Path.Combine(Path.GetFullPath(backupDirectory), fileName);
+    }
+
+    private static bool IsStrictlyUnderAnyRoot(IEnumerable<string> roots, string fullPath)
+    {
+        foreach (var root in roots)
+        {
+            if (string.IsNullOrWhiteSpace(root)) continue;
+            var fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            if (IsStrictlyUnderRoot(fullRoot, fullPath)) return true;
+        }
+        return false;
+    }
+
+    private static bool IsStrictlyUnderRoot(string normalizedRoot, string fullPath)
+    {
+        var prefix = normalizedRoot + Path.DirectorySeparatorChar;
+        return fullPath.StartsWith(prefix, PathComparison) && fullPath.Length > prefix.Length;
+    }
+
+    private static bool HasReparsePointInSubpath(IEnumerable<string> roots, string fullTarget)
+    {
+        foreach (var root in roots)
+        {
+            if (string.IsNullOrWhiteSpace(root)) continue;
+            var fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            if (!IsStrictlyUnderRoot(fullRoot, fullTarget)) continue;
+            if (IsReparsePoint(fullRoot)) return true;
+            var relative = Path.GetRelativePath(fullRoot, fullTarget);
+            var current = fullRoot;
+            foreach (var segment in relative.Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries))
+            {
+                current = Path.Combine(current, segment);
+                if (IsReparsePoint(current)) return true;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    private static bool EnsureDirectoryWithoutReparse(IEnumerable<string> roots, string directoryPath)
+    {
+        var fullDir = Path.GetFullPath(directoryPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        foreach (var root in roots)
+        {
+            if (string.IsNullOrWhiteSpace(root)) continue;
+            var fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            if (string.Equals(fullDir, fullRoot, PathComparison))
+            {
+                if (IsReparsePoint(fullRoot)) return false;
+                Directory.CreateDirectory(fullRoot);
+                return !IsReparsePoint(fullRoot);
+            }
+            if (!IsStrictlyUnderRoot(fullRoot, fullDir)) continue;
+            if (IsReparsePoint(fullRoot)) return false;
+            var relative = Path.GetRelativePath(fullRoot, fullDir);
+            var current = fullRoot;
+            foreach (var segment in relative.Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries))
+            {
+                current = Path.Combine(current, segment);
+                if (IsReparsePoint(current)) return false;
+                if (!Directory.Exists(current)) Directory.CreateDirectory(current);
+                if (IsReparsePoint(current)) return false;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    private static bool IsReparsePoint(string path)
+    {
+        try
+        {
+            var fi = new FileInfo(path);
+            if (fi.LinkTarget is not null) return true;
+            var di = new DirectoryInfo(path);
+            if (di.LinkTarget is not null) return true;
+            if (!fi.Exists && !di.Exists) return false;
+            return (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0;
+        }
+        catch (FileNotFoundException) { return false; }
+        catch (DirectoryNotFoundException) { return false; }
+    }
+
+    private static void EnsureStorageReady(PolicyPaths paths, IShortcutAclHandler aclHandler)
+    {
+        var manifestDir = Path.GetDirectoryName(paths.ManifestPath)!;
+        aclHandler.EnsureRestrictedDirectory(manifestDir);
+        aclHandler.EnsureRestrictedDirectory(paths.BackupDirectory);
+    }
+
+    private static void SaveManifest(PolicyPaths paths, ShortcutManifest manifest, IShortcutAclHandler aclHandler)
+    {
+        var manifestDir = Path.GetDirectoryName(paths.ManifestPath)!;
+        aclHandler.EnsureRestrictedDirectory(manifestDir);
+        var tmp = paths.ManifestPath + ".tmp";
+        File.WriteAllText(tmp, JsonSerializer.Serialize(manifest));
+        File.Move(tmp, paths.ManifestPath, overwrite: true);
+        aclHandler.RestrictBackupFile(paths.ManifestPath);
+    }
+
+    private static void SaveOrDeleteManifest(PolicyPaths paths, ShortcutManifest manifest, IShortcutAclHandler aclHandler)
+    {
+        if (manifest.Entries.Count == 0)
+            DeleteManifestIfExists(paths.ManifestPath);
+        else
+            SaveManifest(paths, manifest, aclHandler);
+    }
+
+    private static void DeleteManifestIfExists(string manifestPath)
+    {
+        if (File.Exists(manifestPath)) File.Delete(manifestPath);
+        var tmp = manifestPath + ".tmp";
+        if (File.Exists(tmp)) File.Delete(tmp);
+    }
+
+    private sealed class NoOpAclHandler : IShortcutAclHandler
+    {
+        internal static readonly NoOpAclHandler Instance = new();
+        public void EnsureRestrictedDirectory(string directoryPath) => Directory.CreateDirectory(directoryPath);
+        public string? CaptureAclAndStripLegacyDeny(string filePath, IReadOnlyCollection<string> legacyDenySids, ILogger logger) => null;
+        public void RestrictBackupFile(string backupPath) { }
+        public void RestoreFileAcl(string filePath, string? originalSddl, ILogger logger) { }
+        public void RemoveLegacyDenyAce(string filePath, string sid, ILogger logger) { }
+    }
+
+    private sealed class WindowsAclHandler : IShortcutAclHandler
+    {
+        internal static readonly WindowsAclHandler Instance = new();
+
+        public void EnsureRestrictedDirectory(string directoryPath)
+        {
+            var dir = new DirectoryInfo(directoryPath);
+            dir.Create();
+            if ((dir.Attributes & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("Répertoire de sauvegarde redirigé");
+            if (!OperatingSystem.IsWindows()) return;
+            var acl = dir.GetAccessControl();
+            acl.SetAccessRuleProtection(true, false);
+            foreach (FileSystemAccessRule rule in acl.GetAccessRules(true, false, typeof(SecurityIdentifier)))
+                acl.RemoveAccessRuleSpecific(rule);
+            foreach (var principal in new[] { ShutdownRightPolicy.AdminsSid, "S-1-5-18" })
+                acl.AddAccessRule(new FileSystemAccessRule(
+                    new SecurityIdentifier(principal),
+                    FileSystemRights.FullControl,
+                    InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+                    PropagationFlags.None,
+                    AccessControlType.Allow));
+            dir.SetAccessControl(acl);
+        }
+
+        public string? CaptureAclAndStripLegacyDeny(string filePath, IReadOnlyCollection<string> legacyDenySids, ILogger logger)
+        {
+            if (!OperatingSystem.IsWindows()) return null;
+            var file = new FileInfo(filePath);
+            var acl = file.GetAccessControl();
+            var changed = false;
+            if (legacyDenySids.Count > 0)
+            {
+                var sidSet = legacyDenySids.ToHashSet(StringComparer.OrdinalIgnoreCase);
+                foreach (var rule in acl.GetAccessRules(true, false, typeof(SecurityIdentifier))
+                    .OfType<FileSystemAccessRule>()
+                    .Where(r => !r.IsInherited &&
+                        r.AccessControlType == AccessControlType.Deny &&
+                        r.FileSystemRights == FileSystemRights.Read &&
+                        sidSet.Contains(r.IdentityReference.Value))
+                    .ToArray())
+                {
+                    acl.RemoveAccessRuleSpecific(rule);
+                    changed = true;
+                }
+                if (changed) file.SetAccessControl(acl);
+            }
+            return acl.GetSecurityDescriptorSddlForm(AccessControlSections.Access);
+        }
+
+        public void RestrictBackupFile(string backupPath)
+        {
+            if (!OperatingSystem.IsWindows()) return;
+            var file = new FileInfo(backupPath);
+            var acl = file.GetAccessControl();
+            acl.SetAccessRuleProtection(true, false);
+            foreach (FileSystemAccessRule rule in acl.GetAccessRules(true, false, typeof(SecurityIdentifier)))
+                acl.RemoveAccessRuleSpecific(rule);
+            foreach (var principal in new[] { ShutdownRightPolicy.AdminsSid, "S-1-5-18" })
+                acl.AddAccessRule(new FileSystemAccessRule(
+                    new SecurityIdentifier(principal),
+                    FileSystemRights.FullControl,
+                    AccessControlType.Allow));
+            file.SetAccessControl(acl);
+        }
+
+        public void RestoreFileAcl(string filePath, string? originalSddl, ILogger logger)
+        {
+            if (!OperatingSystem.IsWindows()) return;
+            var file = new FileInfo(filePath);
+            var acl = file.GetAccessControl();
+            if (!string.IsNullOrWhiteSpace(originalSddl))
+            {
+                try
+                {
+                    acl.SetSecurityDescriptorSddlForm(originalSddl, AccessControlSections.Access);
                     file.SetAccessControl(acl);
+                    return;
                 }
-                catch (Exception ex) { logger.LogWarning(ex, "Masquage de {Shortcut} impossible pour {Sid}", path, sid); }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "Restauration ACL SDDL impossible pour {Path}, réactivation de l'héritage", filePath);
+                }
+            }
+            acl.SetAccessRuleProtection(false, false);
+            foreach (FileSystemAccessRule rule in acl.GetAccessRules(true, false, typeof(SecurityIdentifier)))
+                acl.RemoveAccessRuleSpecific(rule);
+            file.SetAccessControl(acl);
+        }
+
+        public void RemoveLegacyDenyAce(string filePath, string sid, ILogger logger)
+        {
+            if (!OperatingSystem.IsWindows()) return;
+            try
+            {
+                var file = new FileInfo(filePath);
+                var acl = file.GetAccessControl();
+                acl.RemoveAccessRuleSpecific(new FileSystemAccessRule(
+                    new SecurityIdentifier(sid), FileSystemRights.Read, AccessControlType.Deny));
+                file.SetAccessControl(acl);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Nettoyage ACL v1 du raccourci impossible : {Path}", filePath);
             }
         }
     }

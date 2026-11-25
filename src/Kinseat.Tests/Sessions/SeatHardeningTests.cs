@@ -386,21 +386,307 @@ public sealed class SeatHardeningTests
         Assert.False(ShutdownRightPolicy.IsNonLocalProfileSid("S-1-5-21-9-8-7-501", prefix));
     }
 
+    private sealed class FakeShortcutAclHandler : SeatShortcutPolicy.IShortcutAclHandler
+    {
+        internal readonly List<string> RestrictedDirectories = [];
+        internal readonly List<string> RestrictedFiles = [];
+        internal readonly List<(string Path, string Sid)> RemovedLegacyDenyAces = [];
+        internal readonly List<(string Path, string[] Sids)> StrippedBeforeMove = [];
+        internal readonly List<(string Path, string? Sddl)> RestoredAcls = [];
+        internal string CapturedSddl { get; set; } = "D:AI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)";
+
+        public void EnsureRestrictedDirectory(string directoryPath)
+        {
+            Directory.CreateDirectory(directoryPath);
+            RestrictedDirectories.Add(directoryPath);
+        }
+
+        public string? CaptureAclAndStripLegacyDeny(string filePath, IReadOnlyCollection<string> legacyDenySids, ILogger logger)
+        {
+            StrippedBeforeMove.Add((filePath, legacyDenySids.ToArray()));
+            return CapturedSddl;
+        }
+
+        public void RestrictBackupFile(string backupPath) => RestrictedFiles.Add(backupPath);
+
+        public void RestoreFileAcl(string filePath, string? originalSddl, ILogger logger) =>
+            RestoredAcls.Add((filePath, originalSddl));
+
+        public void RemoveLegacyDenyAce(string filePath, string sid, ILogger logger) =>
+            RemovedLegacyDenyAces.Add((filePath, sid));
+    }
+
+    private sealed class TempShortcutSandbox : IDisposable
+    {
+        internal string Root { get; } = Path.Combine(Path.GetTempPath(), $"kinseat-shortcuts-{Guid.NewGuid():N}");
+        internal string Desktop { get; }
+        internal string Programs { get; }
+        internal string Outside { get; }
+        internal string Store { get; }
+        internal string ManifestPath { get; }
+        internal string BackupDir { get; }
+        internal SeatShortcutPolicy.PolicyPaths Paths { get; }
+
+        internal TempShortcutSandbox()
+        {
+            Desktop = Path.Combine(Root, "PublicDesktop");
+            Programs = Path.Combine(Root, "CommonPrograms");
+            Outside = Path.Combine(Root, "Outside");
+            Store = Path.Combine(Root, "shutdown-rights");
+            ManifestPath = Path.Combine(Store, "shortcuts.json");
+            BackupDir = Path.Combine(Store, "shortcuts-backup");
+            Directory.CreateDirectory(Desktop);
+            Directory.CreateDirectory(Programs);
+            Directory.CreateDirectory(Outside);
+            Paths = new SeatShortcutPolicy.PolicyPaths([Desktop, Programs], ManifestPath, BackupDir);
+        }
+
+        public void Dispose()
+        {
+            try { if (Directory.Exists(Root)) Directory.Delete(Root, recursive: true); }
+            catch { }
+        }
+    }
+
     [Fact]
-    public void ShortcutSelectionLeavesGamesAloneAndDeduplicates()
+    public void ShortcutSelectionMatchesOnlyExactSafeNamesAndDeduplicates()
     {
         var selected = SeatShortcutPolicy.SelectShortcuts([
             @"C:\Users\Public\Desktop\Kinseat Hôte.lnk",
+            @"C:\Users\Public\Desktop\Kinseat HÃ´te.lnk",
             @"C:\Users\Public\Desktop\HidHide Configurator.lnk",
+            @"C:\Users\Public\Desktop\HidHide Configuration Client.lnk",
             @"C:\Users\Public\Desktop\Jeu.lnk",
+            @"C:\Users\Public\Desktop\Kinseat Hôte 2.lnk",
+            @"C:\Users\Public\Desktop\HidHide.lnk",
             @"C:\Users\Public\Desktop\KINSEAT HÔTE.LNK"
         ]);
         var native = SeatShortcutPolicy.SelectShortcuts([
-            Path.Combine("Desktop", "Kinseat Hôte.lnk"), Path.Combine("Desktop", "HidHide Configurator.lnk"),
-            Path.Combine("Desktop", "Jeu.lnk"), Path.Combine("Desktop", "KINSEAT HÔTE.LNK")
+            Path.Combine("Desktop", "Kinseat Hôte.lnk"),
+            Path.Combine("Desktop", "Kinseat HÃ´te.lnk"),
+            Path.Combine("Programs", "HidHide", "HidHide Configurator.lnk"),
+            Path.Combine("Programs", "HidHide", "HidHide Configuration Client.lnk"),
+            Path.Combine("Desktop", "Jeu.lnk"),
+            Path.Combine("Desktop", "Kinseat Hôte Custom.lnk"),
+            Path.Combine("Desktop", "HidHide Extra.lnk"),
+            Path.Combine("Desktop", "KINSEAT HÔTE.LNK")
         ]);
-        Assert.Equal(2, native.Length);
+        Assert.Equal(4, native.Length);
         Assert.All(native, name => Assert.DoesNotContain("Jeu", name));
-        if (OperatingSystem.IsWindows()) Assert.Equal(2, selected.Length);
+        Assert.All(native, name => Assert.DoesNotContain("Custom", name));
+        Assert.All(native, name => Assert.DoesNotContain("Extra", name));
+        if (OperatingSystem.IsWindows()) Assert.Equal(4, selected.Length);
+    }
+
+    [Fact]
+    public void ShortcutRelocationIsIdempotentIncludesSubdirsAndRestoresCleanly()
+    {
+        using var sandbox = new TempShortcutSandbox();
+        var acl = new FakeShortcutAclHandler();
+        var logger = new CapturingLogger();
+
+        var kinseat = Path.Combine(sandbox.Desktop, "Kinseat Hôte.lnk");
+        var mojibake = Path.Combine(sandbox.Desktop, "Kinseat HÃ´te.lnk");
+        var hidHideDir = Path.Combine(sandbox.Programs, "Nefarius", "HidHide");
+        Directory.CreateDirectory(hidHideDir);
+        var hidConfig = Path.Combine(hidHideDir, "HidHide Configurator.lnk");
+        var hidClient = Path.Combine(hidHideDir, "HidHide Configuration Client.lnk");
+        var game = Path.Combine(sandbox.Desktop, "Jeu.lnk");
+        var prefixed = Path.Combine(sandbox.Desktop, "Kinseat Hôte Perso.lnk");
+
+        File.WriteAllText(kinseat, "kinseat-lnk");
+        File.WriteAllText(mojibake, "mojibake-lnk");
+        File.WriteAllText(hidConfig, "hid-config-lnk");
+        File.WriteAllText(hidClient, "hid-client-lnk");
+        File.WriteAllText(game, "game-lnk");
+        File.WriteAllText(prefixed, "perso-lnk");
+
+        SeatShortcutPolicy.ApplyCore(sandbox.Paths, true, [Seat], logger, acl);
+
+        Assert.False(File.Exists(kinseat));
+        Assert.False(File.Exists(mojibake));
+        Assert.False(File.Exists(hidConfig));
+        Assert.False(File.Exists(hidClient));
+        Assert.True(File.Exists(game));
+        Assert.True(File.Exists(prefixed));
+        Assert.True(File.Exists(sandbox.ManifestPath));
+
+        var manifest = JsonSerializer.Deserialize<SeatShortcutPolicy.ShortcutManifest>(File.ReadAllText(sandbox.ManifestPath));
+        Assert.NotNull(manifest);
+        Assert.Equal(SeatShortcutPolicy.ManifestVersion, manifest!.Version);
+        Assert.Equal(4, manifest.Entries.Count);
+        Assert.All(manifest.Entries, e =>
+        {
+            Assert.Equal(SeatShortcutPolicy.StateRelocated, e.State);
+            Assert.True(File.Exists(e.BackupPath));
+            Assert.Equal(acl.CapturedSddl, e.OriginalSddl);
+        });
+        Assert.Contains(sandbox.BackupDir, acl.RestrictedDirectories);
+        Assert.Contains(sandbox.ManifestPath, acl.RestrictedFiles);
+
+        // Idempotent second run with active seats.
+        SeatShortcutPolicy.ApplyCore(sandbox.Paths, true, [Seat], logger, acl);
+        var manifestAfterSecond = JsonSerializer.Deserialize<SeatShortcutPolicy.ShortcutManifest>(File.ReadAllText(sandbox.ManifestPath));
+        Assert.Equal(4, manifestAfterSecond!.Entries.Count);
+        Assert.False(File.Exists(kinseat));
+
+        // Restore when no managed seats remain.
+        SeatShortcutPolicy.ApplyCore(sandbox.Paths, false, [], logger, acl);
+        Assert.Equal("kinseat-lnk", File.ReadAllText(kinseat));
+        Assert.Equal("mojibake-lnk", File.ReadAllText(mojibake));
+        Assert.Equal("hid-config-lnk", File.ReadAllText(hidConfig));
+        Assert.Equal("hid-client-lnk", File.ReadAllText(hidClient));
+        Assert.False(File.Exists(sandbox.ManifestPath));
+        Assert.Empty(Directory.GetFiles(sandbox.BackupDir));
+        Assert.Equal(4, acl.RestoredAcls.Count);
+        Assert.All(acl.RestoredAcls, r => Assert.Equal(acl.CapturedSddl, r.Sddl));
+    }
+
+    [Fact]
+    public void ShortcutMigrationFromV1RemovesLegacyDenyAcesBeforeRelocating()
+    {
+        using var sandbox = new TempShortcutSandbox();
+        var acl = new FakeShortcutAclHandler();
+        var logger = new CapturingLogger();
+        var kinseat = Path.Combine(sandbox.Desktop, "Kinseat Hôte.lnk");
+        File.WriteAllText(kinseat, "kinseat-v1");
+
+        Directory.CreateDirectory(sandbox.Store);
+        var legacy = new[] { new SeatShortcutPolicy.LegacyShortcutEntry(kinseat, Seat) };
+        File.WriteAllText(sandbox.ManifestPath, JsonSerializer.Serialize(legacy));
+
+        SeatShortcutPolicy.ApplyCore(sandbox.Paths, true, [Seat], logger, acl);
+
+        Assert.Contains((kinseat, Seat), acl.RemovedLegacyDenyAces);
+        Assert.Contains(acl.StrippedBeforeMove, x => x.Path == kinseat && x.Sids.Contains(Seat));
+        Assert.False(File.Exists(kinseat));
+        var manifest = JsonSerializer.Deserialize<SeatShortcutPolicy.ShortcutManifest>(File.ReadAllText(sandbox.ManifestPath));
+        Assert.NotNull(manifest);
+        Assert.Equal(SeatShortcutPolicy.ManifestVersion, manifest!.Version);
+        Assert.Single(manifest.Entries);
+        Assert.Equal(SeatShortcutPolicy.StateRelocated, manifest.Entries[0].State);
+    }
+
+    [Fact]
+    public void ShortcutCrashRecoveryHandlesPendingMoveAndPendingRestore()
+    {
+        using var sandbox = new TempShortcutSandbox();
+        var acl = new FakeShortcutAclHandler();
+        var logger = new CapturingLogger();
+        Directory.CreateDirectory(sandbox.BackupDir);
+
+        // 1) Crash after recording PendingMove, before File.Move happened.
+        var orig1 = Path.Combine(sandbox.Desktop, "Kinseat Hôte.lnk");
+        var bak1 = Path.Combine(sandbox.BackupDir, "1111_Kinseat Hôte.lnk");
+        File.WriteAllText(orig1, "pending-before-move");
+        var manifest1 = new SeatShortcutPolicy.ShortcutManifest(SeatShortcutPolicy.ManifestVersion, [
+            new SeatShortcutPolicy.RelocatedShortcutEntry(orig1, bak1, SeatShortcutPolicy.StatePendingMove, acl.CapturedSddl)
+        ]);
+        File.WriteAllText(sandbox.ManifestPath, JsonSerializer.Serialize(manifest1));
+
+        SeatShortcutPolicy.ApplyCore(sandbox.Paths, true, [Seat], logger, acl);
+        Assert.False(File.Exists(orig1));
+        Assert.Equal("pending-before-move", File.ReadAllText(bak1));
+        var after1 = JsonSerializer.Deserialize<SeatShortcutPolicy.ShortcutManifest>(File.ReadAllText(sandbox.ManifestPath));
+        Assert.Equal(SeatShortcutPolicy.StateRelocated, after1!.Entries[0].State);
+
+        // 2) Crash after File.Move happened during PendingMove, before manifest updated.
+        var manifest2 = new SeatShortcutPolicy.ShortcutManifest(SeatShortcutPolicy.ManifestVersion, [
+            new SeatShortcutPolicy.RelocatedShortcutEntry(orig1, bak1, SeatShortcutPolicy.StatePendingMove, acl.CapturedSddl)
+        ]);
+        File.WriteAllText(sandbox.ManifestPath, JsonSerializer.Serialize(manifest2));
+        SeatShortcutPolicy.ApplyCore(sandbox.Paths, true, [Seat], logger, acl);
+        var after2 = JsonSerializer.Deserialize<SeatShortcutPolicy.ShortcutManifest>(File.ReadAllText(sandbox.ManifestPath));
+        Assert.Equal(SeatShortcutPolicy.StateRelocated, after2!.Entries[0].State);
+
+        // 3) Crash after File.Move during PendingRestore (file already back in place, backup gone).
+        File.Move(bak1, orig1);
+        var manifest3 = new SeatShortcutPolicy.ShortcutManifest(SeatShortcutPolicy.ManifestVersion, [
+            new SeatShortcutPolicy.RelocatedShortcutEntry(orig1, bak1, SeatShortcutPolicy.StatePendingRestore, acl.CapturedSddl)
+        ]);
+        File.WriteAllText(sandbox.ManifestPath, JsonSerializer.Serialize(manifest3));
+        SeatShortcutPolicy.ApplyCore(sandbox.Paths, false, [], logger, acl);
+        Assert.True(File.Exists(orig1));
+        Assert.False(File.Exists(sandbox.ManifestPath));
+        Assert.Contains(acl.RestoredAcls, r => r.Path == orig1 && r.Sddl == acl.CapturedSddl);
+    }
+
+    [Fact]
+    public void ShortcutRestoreLogsConflictWithoutOverwritingRecreatedPublicFile()
+    {
+        using var sandbox = new TempShortcutSandbox();
+        var acl = new FakeShortcutAclHandler();
+        var logger = new CapturingLogger();
+
+        var kinseat = Path.Combine(sandbox.Desktop, "Kinseat Hôte.lnk");
+        var hidClient = Path.Combine(sandbox.Programs, "HidHide Configuration Client.lnk");
+        File.WriteAllText(kinseat, "original-kinseat");
+        File.WriteAllText(hidClient, "original-hid");
+
+        SeatShortcutPolicy.ApplyCore(sandbox.Paths, true, [Seat], logger, acl);
+        Assert.False(File.Exists(kinseat));
+        Assert.False(File.Exists(hidClient));
+
+        // Recreate public shortcut while seats were active (e.g. reinstall).
+        File.WriteAllText(kinseat, "recreated-kinseat");
+
+        SeatShortcutPolicy.ApplyCore(sandbox.Paths, false, [], logger, acl);
+
+        // Recreated file must NOT be overwritten; other shortcut MUST still restore.
+        Assert.Equal("recreated-kinseat", File.ReadAllText(kinseat));
+        Assert.Equal("original-hid", File.ReadAllText(hidClient));
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("Conflit"));
+        var remaining = JsonSerializer.Deserialize<SeatShortcutPolicy.ShortcutManifest>(File.ReadAllText(sandbox.ManifestPath));
+        Assert.Single(remaining!.Entries);
+        Assert.Equal(SeatShortcutPolicy.StateRestoreConflict, remaining.Entries[0].State);
+        Assert.Equal("original-kinseat", File.ReadAllText(remaining.Entries[0].BackupPath));
+    }
+
+    [Fact]
+    public void ShortcutPolicyRejectsOutOfScopePathsAndSymlinks()
+    {
+        using var sandbox = new TempShortcutSandbox();
+        var acl = new FakeShortcutAclHandler();
+        var logger = new CapturingLogger();
+        Directory.CreateDirectory(sandbox.BackupDir);
+
+        var outsideTarget = Path.Combine(sandbox.Outside, "Kinseat Hôte.lnk");
+        var outsideBackup = Path.Combine(sandbox.Outside, "escaped.lnk");
+        var traversalOrig = Path.Combine(sandbox.Desktop, "..", "Outside", "Kinseat Hôte.lnk");
+        var traversalBak = Path.Combine(sandbox.BackupDir, "..", "..", "Outside", "escaped.lnk");
+        var gamePath = Path.Combine(sandbox.Desktop, "Jeu.lnk");
+        var validBak = Path.Combine(sandbox.BackupDir, "aaaa_Jeu.lnk");
+
+        File.WriteAllText(outsideTarget, "outside");
+        File.WriteAllText(outsideBackup, "outside-bak");
+        File.WriteAllText(validBak, "bak-game");
+
+        var crafted = new SeatShortcutPolicy.ShortcutManifest(SeatShortcutPolicy.ManifestVersion, [
+            new SeatShortcutPolicy.RelocatedShortcutEntry(traversalOrig, validBak, SeatShortcutPolicy.StateRelocated),
+            new SeatShortcutPolicy.RelocatedShortcutEntry(Path.Combine(sandbox.Desktop, "Kinseat Hôte.lnk"), traversalBak, SeatShortcutPolicy.StateRelocated),
+            new SeatShortcutPolicy.RelocatedShortcutEntry(gamePath, validBak, SeatShortcutPolicy.StateRelocated)
+        ]);
+        File.WriteAllText(sandbox.ManifestPath, JsonSerializer.Serialize(crafted));
+
+        SeatShortcutPolicy.ApplyCore(sandbox.Paths, false, [], logger, acl);
+
+        Assert.False(File.Exists(gamePath));
+        Assert.Equal("outside", File.ReadAllText(outsideTarget));
+        Assert.Equal("outside-bak", File.ReadAllText(outsideBackup));
+        Assert.Equal("bak-game", File.ReadAllText(validBak));
+        Assert.True(logger.Entries.Count(e => e.Level == LogLevel.Warning) >= 3);
+
+        // Symlinked directory and symlinked .lnk file must never be followed or relocated.
+        var symDir = Path.Combine(sandbox.Programs, "SymLinkDir");
+        var symFile = Path.Combine(sandbox.Desktop, "HidHide Configuration Client.lnk");
+        Directory.CreateSymbolicLink(symDir, sandbox.Outside);
+        File.CreateSymbolicLink(symFile, outsideTarget);
+
+        File.Delete(sandbox.ManifestPath);
+        SeatShortcutPolicy.ApplyCore(sandbox.Paths, true, [Seat], logger, acl);
+
+        Assert.True(File.Exists(outsideTarget));
+        Assert.False(File.Exists(sandbox.ManifestPath));
+        Assert.Empty(SeatShortcutPolicy.DiscoverTargetShortcuts(sandbox.Paths.PublicRoots, logger));
     }
 }
