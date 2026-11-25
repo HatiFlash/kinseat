@@ -24,10 +24,112 @@ fn on_path(name: &str) -> Option<PathBuf> {
         .map(|p| p.join(name))
         .find(|p| p.is_file())
 }
+
+#[cfg(not(windows))]
+fn is_appimage_file(p: &std::path::Path) -> bool {
+    p.is_file()
+        && p.extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("appimage"))
+}
+
+/// Extracts a Moonlight `.AppImage` file once into `base` (one directory per name+size+mtime,
+/// older extractions removed) and returns the extracted `AppRun`. Extraction happens in a
+/// temporary directory renamed afterwards, so an interrupted run never leaves a half tree.
+#[cfg(not(windows))]
+fn extract_appimage(file: &std::path::Path, base: &std::path::Path) -> io::Result<PathBuf> {
+    let meta = fs::metadata(file)?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    let name: String = file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let key = format!("{name}-{}-{mtime}", meta.len());
+    let final_dir = base.join(&key);
+    let app_run = final_dir.join("squashfs-root").join("AppRun");
+    if app_run.is_file() {
+        return Ok(app_run);
+    }
+    fs::create_dir_all(base)?;
+    // Drop older extractions and leftovers of interrupted ones.
+    for entry in fs::read_dir(base)?.flatten() {
+        if entry.file_name().to_string_lossy() != key {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+    let _ = fs::remove_dir_all(&final_dir);
+    let tmp = base.join(format!(".tmp-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp)?;
+    let result = (|| {
+        let out = Command::new(fs::canonicalize(file)?)
+            .arg("--appimage-extract")
+            .current_dir(&tmp)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()?;
+        if !out.status.success() || !tmp.join("squashfs-root").join("AppRun").is_file() {
+            return Err(io::Error::other(format!(
+                "extraction AppImage échouée ({}) : {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        fs::rename(&tmp, &final_dir)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&tmp);
+    }
+    result?;
+    Ok(app_run)
+}
+
+/// Uses the extracted copy of an `.AppImage` file (so the bundled OpenSSL can be forced first),
+/// or the file itself, with a log line, if the extraction fails.
+#[cfg(not(windows))]
+fn prefer_extracted(program: PathBuf) -> PathBuf {
+    if !is_appimage_file(&program) {
+        return program;
+    }
+    let Some(base) = crate::settings::config_path()
+        .and_then(|p| p.parent().map(|p| p.join("moonlight-appimage")))
+    else {
+        return program;
+    };
+    match extract_appimage(&program, &base) {
+        Ok(app_run) => app_run,
+        Err(e) => {
+            if let Ok(mut f) = log() {
+                let _ = writeln!(
+                    f,
+                    "AppImage {} non extrait, lancement direct : {e}",
+                    program.display()
+                );
+            }
+            program
+        }
+    }
+}
+
 impl Engine {
     pub fn locate(custom: &str) -> Option<Self> {
         if !custom.trim().is_empty() {
             let p = PathBuf::from(custom.trim());
+            #[cfg(not(windows))]
+            let p = prefer_extracted(p);
             return p.is_file().then_some(Self {
                 program: p,
                 prefix: vec![],
@@ -58,7 +160,7 @@ impl Engine {
             on_path("moonlight")
                 .or_else(|| on_path("Moonlight"))
                 .map(|program| Self {
-                    program,
+                    program: prefer_extracted(program),
                     prefix: vec![],
                 })
                 .or_else(|| {
@@ -951,6 +1053,63 @@ pub fn stream(engine: Engine, place: Place, args: Vec<String>, tx: Sender<Event>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    fn fake_appimage(dir: &std::path::Path, name: &str, ok: bool) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let f = dir.join(name);
+        let body = if ok {
+            "#!/bin/sh\n[ \"$1\" = --appimage-extract ] || exit 2\nmkdir -p squashfs-root/usr/lib && : > squashfs-root/AppRun\n"
+        } else {
+            "#!/bin/sh\necho boom >&2\nexit 1\n"
+        };
+        fs::write(&f, body).unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o755)).unwrap();
+        f
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn appimage_file_is_extracted_once_and_old_ones_removed() {
+        let root = std::env::temp_dir().join(format!("kinseat-extract-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let base = root.join("store");
+        let img = fake_appimage(&root, "Moonlight-1.AppImage", true);
+        let run = extract_appimage(&img, &base).unwrap();
+        assert!(run.ends_with("squashfs-root/AppRun") && run.is_file());
+        assert!(run.parent().unwrap().join("usr/lib").is_dir());
+        assert_eq!(extract_appimage(&img, &base).unwrap(), run);
+        let img2 = fake_appimage(&root, "Moonlight-2.AppImage", true);
+        let run2 = extract_appimage(&img2, &base).unwrap();
+        assert!(!run.exists() && run2.is_file());
+        assert_eq!(fs::read_dir(&base).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn failed_appimage_extraction_leaves_nothing() {
+        let root = std::env::temp_dir().join(format!("kinseat-extractko-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let base = root.join("store");
+        let img = fake_appimage(&root, "Moonlight-bad.AppImage", false);
+        assert!(extract_appimage(&img, &base).is_err());
+        assert_eq!(fs::read_dir(&base).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    #[ignore = "needs the real AppImage of the lab"]
+    fn real_appimage_extracts() {
+        let img = PathBuf::from("/root/projects/kinseat/lab/moonlight-linux/ml.AppImage");
+        let base = std::env::temp_dir().join(format!("kinseat-real-{}", std::process::id()));
+        let run = extract_appimage(&img, &base).unwrap();
+        assert!(run.is_file() && run.parent().unwrap().join("usr/lib").is_dir());
+        let _ = fs::remove_dir_all(&base);
+    }
 
     #[cfg(not(windows))]
     #[test]
