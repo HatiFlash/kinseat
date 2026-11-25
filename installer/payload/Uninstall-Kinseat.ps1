@@ -240,7 +240,15 @@ try {
         if(-not (Test-PathUnder $dir $full)){return $null}
         if(-not [string]::Equals([IO.Path]::GetDirectoryName($full).TrimEnd('\'),$dir,[StringComparison]::OrdinalIgnoreCase)){return $null}
         $leaf=[IO.Path]::GetFileName($full)
-        if($leaf -notmatch '^[0-9A-Fa-f]{16}_' -or $leaf.Substring(17) -ne [IO.Path]::GetFileName($originalPath)){return $null}
+        if($leaf -notmatch '^[0-9A-F]{16}_' -or -not [string]::Equals($leaf.Substring(17),[IO.Path]::GetFileName($originalPath),[StringComparison]::Ordinal)){return $null}
+        # Nom déterministe de SeatShortcutPolicy.BuildBackupPath : SHA-256 UTF-8 du chemin d'origine canonique en majuscules, 16 premiers hex.
+        try{
+            $canonical=[IO.Path]::GetFullPath($originalPath).ToUpperInvariant()
+            $sha=[Security.Cryptography.SHA256]::Create()
+            try{$hashBytes=$sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical))}finally{$sha.Dispose()}
+            $expectedHash=([BitConverter]::ToString($hashBytes) -replace '-','').Substring(0,16)
+        }catch{return $null}
+        if(-not [string]::Equals($leaf.Substring(0,16),$expectedHash,[StringComparison]::Ordinal)){return $null}
         if(Test-ReparseChain $dir $full){return $null}
         return $full
     }
@@ -357,8 +365,7 @@ try {
         }
     }
     Remove-Item 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Kinseat' -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Kinseat Hôte.lnk') -Force -ErrorAction SilentlyContinue
-    Remove-Item (Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'Kinseat Hôte.lnk') -Force -ErrorAction SilentlyContinue
+    # Aucun raccourci public n'est supprimé ici : sans inventaire prouvant l'appartenance, un fichier restauré ou tiers serait perdu.
     # setup.exe runs from this directory: Windows may hold the image open until it exits.
     if (Test-Path $install) {
         $prefix=(Resolve-Path -LiteralPath $install).Path.TrimEnd('\') + '\'
