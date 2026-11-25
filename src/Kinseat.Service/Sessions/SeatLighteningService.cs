@@ -4,6 +4,7 @@ using System.Management;
 using System.Runtime.InteropServices;
 using Microsoft.Win32;
 using MultiSeat.Service.Accounts;
+using MultiSeat.Service.Configuration;
 using MultiSeat.Service.Interop;
 using MultiSeat.Shared.Models;
 
@@ -226,7 +227,7 @@ public sealed class SeatLighteningService(ILogger<SeatLighteningService> logger,
         }
     }
 
-    public void ApplyRegistry(string accountSid, SeatLightening settings)
+    internal static void ValidateUserSid(string accountSid)
     {
         if (!OperatingSystem.IsWindows()) return;
         // A SID is resolved from the account, never accepted from IPC. Refuse all non-user SIDs.
@@ -234,25 +235,147 @@ public sealed class SeatLighteningService(ILogger<SeatLighteningService> logger,
         if (!accountSid.StartsWith("S-1-5-21-", StringComparison.Ordinal) ||
             !string.Equals(sid.Value, accountSid, StringComparison.Ordinal))
             throw new ArgumentException("SID de compte local invalide", nameof(accountSid));
-        using var loaded = Registry.Users.OpenSubKey(accountSid, true);
-        var mounted = loaded is null;
-        string? mount = null;
+    }
+
+    internal static void WithAccountHive(
+        string accountSid,
+        Func<string, RegistryKey?> openLoadedHive,
+        Func<string, (RegistryKey Root, Action Unload)> mountOfflineHive,
+        Action<RegistryKey> action)
+    {
+        ValidateUserSid(accountSid);
+        using var loaded = openLoadedHive(accountSid);
+        if (loaded is not null)
+        {
+            action(loaded);
+            return;
+        }
+        var (root, unload) = mountOfflineHive(accountSid);
         try
         {
-            if (mounted)
+            using (root)
+                action(root);
+        }
+        finally
+        {
+            unload();
+        }
+    }
+
+    private void WithAccountHive(string accountSid, Action<RegistryKey> action)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        WithAccountHive(
+            accountSid,
+            sid => Registry.Users.OpenSubKey(sid, true),
+            sid =>
             {
-                using var profile = Registry.LocalMachine.OpenSubKey($@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\{accountSid}");
+                using var profile = Registry.LocalMachine.OpenSubKey($@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\{sid}");
                 var path = profile?.GetValue("ProfileImagePath") as string
                     ?? throw new IOException("Profil Windows introuvable");
                 var hive = Path.Combine(Environment.ExpandEnvironmentVariables(path), "NTUSER.DAT");
                 if (!File.Exists(hive)) throw new FileNotFoundException("Ruche du compte introuvable", hive);
                 EnableHivePrivileges();
-                mount = "Kinseat-Lightening-" + accountSid;
+                var mount = "Kinseat-Lightening-" + sid;
                 var result = RegLoadKey(HkeyUsers, mount, hive);
                 if (result != 0) throw new Win32Exception(result, "RegLoadKey a échoué");
+                try
+                {
+                    var root = Registry.Users.OpenSubKey(mount, true)
+                        ?? throw new IOException("La ruche du compte ne peut être ouverte");
+                    return (root, () =>
+                    {
+                        var unload = RegUnLoadKey(HkeyUsers, mount);
+                        if (unload != 0) logger.LogWarning("RegUnLoadKey {Mount} a échoué ({Code})", mount, unload);
+                    });
+                }
+                catch
+                {
+                    var unload = RegUnLoadKey(HkeyUsers, mount);
+                    if (unload != 0) logger.LogWarning("RegUnLoadKey {Mount} a échoué ({Code})", mount, unload);
+                    throw;
+                }
+            },
+            action);
+    }
+
+    internal static int ApplySafetyPoliciesToAccounts(
+        IEnumerable<string> accountNames,
+        Func<string, bool> isEligible,
+        Func<string, string?> resolveSid,
+        Action<string, string> applyToHive,
+        ILogger log)
+    {
+        var applied = 0;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var account in accountNames)
+        {
+            if (string.IsNullOrWhiteSpace(account) || !seen.Add(account)) continue;
+            try
+            {
+                if (!isEligible(account))
+                {
+                    log.LogWarning("Stratégies de sécurité ignorées pour {Account} : compte non géré ou administrateur", account);
+                    continue;
+                }
+                var sid = resolveSid(account);
+                if (string.IsNullOrWhiteSpace(sid))
+                {
+                    log.LogWarning("Stratégies de sécurité non appliquées à {Account} : SID introuvable", account);
+                    continue;
+                }
+                applyToHive(account, sid);
+                log.LogInformation("Stratégies de sécurité appliquées à {Account}", account);
+                applied++;
             }
-            using var root = mounted ? Registry.Users.OpenSubKey(mount!, true) : Registry.Users.OpenSubKey(accountSid, true);
-            if (root is null) throw new IOException("La ruche du compte ne peut être ouverte");
+            catch (Exception ex)
+            {
+                log.LogWarning(ex, "Échec de l'application des stratégies de sécurité à {Account}", account);
+            }
+        }
+        return applied;
+    }
+
+    /// <summary>Idempotently applies per-user safety policies to a single managed seat account without throwing.</summary>
+    public void TryApplySafetyPolicies(string accountName, AccountManager accounts)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        ApplySafetyPoliciesToAccounts(
+            [accountName],
+            accounts.IsManagedSeatAccount,
+            name => AccountManager.TryResolveSid(name, logger),
+            (_, sid) => WithAccountHive(sid, root =>
+            {
+                ApplyPowerPolicy(root);
+                ApplySeatSafetyPolicy(root);
+            }),
+            logger);
+    }
+
+    /// <summary>Idempotently applies per-user safety policies to every known managed seat account at service startup.</summary>
+    public void ApplySafetyPoliciesToAllSeats(AccountManager accounts, SeatManager? seats = null, SeatPresetStore? presets = null)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var candidates = accounts.ListManagedAccounts().Where(a => a.IsManaged).Select(a => a.Username)
+            .Concat(seats?.GetAllSeats().Select(s => s.AccountName) ?? [])
+            .Concat(presets?.GetAll().Select(p => p.AccountName) ?? []);
+        ApplySafetyPoliciesToAccounts(
+            candidates,
+            accounts.IsManagedSeatAccount,
+            name => AccountManager.TryResolveSid(name, logger),
+            (_, sid) => WithAccountHive(sid, root =>
+            {
+                ApplyPowerPolicy(root);
+                ApplySeatSafetyPolicy(root);
+            }),
+            logger);
+    }
+
+    public void ApplyRegistry(string accountSid, SeatLightening settings)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        WithAccountHive(accountSid, root =>
+        {
             ApplyDesktopIcons(root, settings.EmptyDesktop);
             ApplyPowerPolicy(root);
             ApplySeatSafetyPolicy(root);
@@ -278,15 +401,7 @@ public sealed class SeatLighteningService(ILogger<SeatLighteningService> logger,
                 _startupBySid[accountSid] = startup;
                 _blockedBySid[accountSid] = settings.BlockStartupApps ? entries.Keys.Order(StringComparer.OrdinalIgnoreCase).ToArray() : [];
             }
-        }
-        finally
-        {
-            if (mount is not null)
-            {
-                var result = RegUnLoadKey(HkeyUsers, mount);
-                if (result != 0) logger.LogWarning("RegUnLoadKey {Mount} a échoué ({Code})", mount, result);
-            }
-        }
+        });
     }
 
     public object Report(Guid seatId, string accountName, SeatLightening settings)

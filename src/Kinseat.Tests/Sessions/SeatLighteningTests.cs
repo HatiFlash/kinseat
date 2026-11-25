@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using Microsoft.Win32;
 using MultiSeat.Service.Ipc;
 using MultiSeat.Service.Sessions;
@@ -183,5 +184,94 @@ public sealed class SeatLighteningTests
             Assert.Equal(new[] { "Run|OneDrive" }, entries.Keys.ToArray());
         }
         finally { Registry.CurrentUser.DeleteSubKeyTree(path, false); }
+    }
+
+    [Fact]
+    public void ApplySafetyPoliciesToAccountsCoversExistingSeatsLogsInfoAndContinuesOnError()
+    {
+        var applied = new List<(string Account, string Sid)>();
+        var logs = new List<(LogLevel Level, string Message)>();
+        var logger = new CaptureLogger(logs);
+
+        // Existing accounts (including duplicate casing, one failing seat, one non-managed account).
+        var count = SeatLighteningService.ApplySafetyPoliciesToAccounts(
+            ["ks-test1", "KS-TEST1", "ks-broken", "linked-admin", "ks-lea"],
+            isEligible: a => !a.Equals("linked-admin", StringComparison.OrdinalIgnoreCase),
+            resolveSid: a => $"S-1-5-21-1000-2000-3000-{(a.Equals("ks-test1", StringComparison.OrdinalIgnoreCase) ? 1001 : a.Equals("ks-lea", StringComparison.OrdinalIgnoreCase) ? 1002 : 1003)}",
+            applyToHive: (account, sid) =>
+            {
+                if (account.Equals("ks-broken", StringComparison.OrdinalIgnoreCase))
+                    throw new IOException("Ruche verrouillée");
+                applied.Add((account, sid));
+            },
+            logger);
+
+        Assert.Equal(2, count);
+        Assert.Equal([("ks-test1", "S-1-5-21-1000-2000-3000-1001"), ("ks-lea", "S-1-5-21-1000-2000-3000-1002")], applied);
+        Assert.Contains(logs, l => l.Level == LogLevel.Information && l.Message == "Stratégies de sécurité appliquées à ks-test1");
+        Assert.Contains(logs, l => l.Level == LogLevel.Information && l.Message == "Stratégies de sécurité appliquées à ks-lea");
+        Assert.Contains(logs, l => l.Level == LogLevel.Warning && l.Message.Contains("ks-broken"));
+        Assert.Contains(logs, l => l.Level == LogLevel.Warning && l.Message.Contains("linked-admin"));
+
+        // Re-running on already processed accounts stays idempotent and never skips them.
+        var secondCount = SeatLighteningService.ApplySafetyPoliciesToAccounts(
+            ["ks-test1"],
+            isEligible: _ => true,
+            resolveSid: _ => "S-1-5-21-1000-2000-3000-1001",
+            applyToHive: (account, sid) => applied.Add((account, sid)),
+            logger);
+        Assert.Equal(1, secondCount);
+        Assert.Equal(3, applied.Count);
+    }
+
+    [Fact]
+    public void WithAccountHiveUsesLoadedHiveForExistingMarkedAccountAndRemovesDisableTaskMgr()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var path = @"Software\KinseatTest-" + Guid.NewGuid().ToString("N");
+        const string pol = @"Software\Microsoft\Windows\CurrentVersion\Policies";
+        try
+        {
+            using (var setup = Registry.CurrentUser.CreateSubKey(path, true)!)
+            {
+                // Simulate an existing account already marked by lightening and having a stale DisableTaskMgr.
+                using (var owned = setup.CreateSubKey(@"Software\Kinseat\Lightening\BlockedStartup\Run", true)!)
+                    owned.SetValue("OneDrive", "OneDrive.exe");
+                using (var oldSys = setup.CreateSubKey(pol + @"\System", true)!)
+                    oldSys.SetValue("DisableTaskMgr", 1, RegistryValueKind.DWord);
+            }
+
+            var offlineMounted = false;
+            SeatLighteningService.WithAccountHive(
+                "S-1-5-21-1000-2000-3000-1001",
+                openLoadedHive: _ => Registry.CurrentUser.OpenSubKey(path, true),
+                mountOfflineHive: _ => { offlineMounted = true; throw new InvalidOperationException("Ne doit pas monter NTUSER.DAT"); },
+                root =>
+                {
+                    SeatLighteningService.ApplyPowerPolicy(root);
+                    SeatLighteningService.ApplySeatSafetyPolicy(root);
+                });
+
+            Assert.False(offlineMounted);
+            using var rootCheck = Registry.CurrentUser.OpenSubKey(path)!;
+            using var explorer = rootCheck.OpenSubKey(pol + @"\Explorer")!;
+            Assert.Equal(1, explorer.GetValue("NoClose"));
+            Assert.Equal(1, explorer.GetValue("HideSCANetwork"));
+            Assert.Equal(1, explorer.GetValue("NoControlPanel"));
+            Assert.Equal(1, explorer.GetValue("DisallowRun"));
+            using var sys = rootCheck.OpenSubKey(pol + @"\System")!;
+            Assert.Equal(1, sys.GetValue("DisableRegistryTools"));
+            Assert.Null(sys.GetValue("DisableTaskMgr"));
+        }
+        finally { Registry.CurrentUser.DeleteSubKeyTree(path, false); }
+    }
+
+    private sealed class CaptureLogger(List<(LogLevel Level, string Message)> entries) : ILogger
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter) =>
+            entries.Add((logLevel, formatter(state, exception)));
     }
 }

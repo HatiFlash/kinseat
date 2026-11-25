@@ -3,7 +3,14 @@
 Chaque place est un compte Windows local standard (non administrateur). Les stratégies ci-dessous sont écrites
 uniquement dans la ruche du compte de place (`SeatLighteningService.ApplySeatSafetyPolicy` et `ApplyPowerPolicy`),
 jamais dans HKLM ni dans la session de la console. Elles sont toujours appliquées, indépendamment des réglages
-d'allégement, et sont idempotentes.
+d'allégement, et sont idempotentes :
+- au démarrage du service pour toutes les places gérées existantes (`SeatLighteningService.ApplySafetyPoliciesToAllSeats`),
+  directement sur la ruche chargée `HKU\<SID>` si la session est active, sinon en montant `NTUSER.DAT` ;
+- avant chaque ouverture ou reconnexion de session de place (`SessionLauncher.LaunchSessionAsync`) ainsi que lors
+  de l'application de l'allègement (`SeatLighteningService.ApplyRegistry`).
+
+Chaque application journalise une entrée `Info` (« Stratégies de sécurité appliquées à <compte> ») et un `Warning`
+non bloquant en cas d'échec afin de ne jamais empêcher le démarrage du service.
 
 ## Tableau
 

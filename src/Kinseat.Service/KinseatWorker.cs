@@ -102,6 +102,11 @@ public sealed class MultiSeatWorker : BackgroundService
         // idle is corrected too. Managed accounts only; linked accounts are left alone.
         _accounts.NormalizeManagedAccountPrivileges();
 
+        // ── Step 0a-1: Apply per-user safety policies to every managed seat account ──
+        // Idempotent, applied at startup to all existing seats (loaded HKU\<SID> or offline NTUSER.DAT)
+        // so accounts created before an upgrade or with an already-active session get hardened too.
+        _services.GetService<SeatLighteningService>()?.ApplySafetyPoliciesToAllSeats(_accounts, _seatManager, _presets);
+
         // ── Step 0a-2: Send the shared Steam shortcuts and the console user's Steam entries through the shim ──
         // Steam isolation only helps if the ordinary ways of starting Steam use it: a click on a plain
         // shortcut starts a Steam that takes over the machine. Does nothing unless isolation and the

@@ -41,6 +41,7 @@ public sealed class SessionLauncher
     private readonly ILogger<SessionLauncher> _logger;
     private readonly MultiSeatOptions _options;
     private readonly AccountManager _accounts;
+    private readonly SeatLighteningService? _lightening;
 
     // Track session-anchor process handles per session to prevent premature cleanup, and so the
     // health check can replace an anchor that has expired (see SessionAnchorTracker).
@@ -85,12 +86,14 @@ public sealed class SessionLauncher
         ILogger<SessionLauncher> logger,
         IOptions<MultiSeatOptions> options,
         AccountManager accounts,
-        RdpWrapper rdpWrapper)
+        RdpWrapper rdpWrapper,
+        SeatLighteningService? lightening = null)
     {
         _logger = logger;
         _options = options.Value;
         _accounts = accounts;
         _rdpWrapper = rdpWrapper;
+        _lightening = lightening;
         _credentials = new RdpCredentialStore(logger);
     }
 
@@ -128,6 +131,10 @@ public sealed class SessionLauncher
                 $"No stored credential for '{accountName}'. " +
                 "Account was likely discovered at startup without a password. " +
                 "Delete and recreate the account, or update the credential.");
+
+        // Apply per-user safety policies before opening or reconnecting any seat session
+        // (loaded HKU\<SID> if already active, otherwise offline NTUSER.DAT). Non-blocking on error.
+        _lightening?.TryApplySafetyPolicies(accountName, _accounts);
 
         // Check if this user already has a session (Active or Disconnected)
         var existingSessionId = FindExistingSession(accountName);
