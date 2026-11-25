@@ -29,6 +29,7 @@ internal static class ShutdownRightPolicy
         string? ConsoleUserSid,
         IReadOnlySet<string> NonLocalProfileSids,
         IReadOnlySet<string> PrivilegedMemberSids);
+    internal sealed record ReconcileResult(bool Succeeded, IReadOnlySet<string> UnprotectedSeats);
 
     internal interface ILsaPolicy : IDisposable
     {
@@ -93,9 +94,9 @@ internal static class ShutdownRightPolicy
         return lastDash > 0 ? sid[..(lastDash + 1)] : null;
     }
 
-    internal static void Apply(AccountManager accounts, ILogger logger)
+    internal static bool Apply(AccountManager accounts, ILogger logger)
     {
-        if (!OperatingSystem.IsWindows()) return;
+        if (!OperatingSystem.IsWindows()) return true;
         lock (Gate)
         try
         {
@@ -105,7 +106,7 @@ internal static class ShutdownRightPolicy
             if (names.Length == 0)
             {
                 Restore(lsa, groups, StatePath);
-                return;
+                return true;
             }
             var seats = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var name in names)
@@ -116,11 +117,12 @@ internal static class ShutdownRightPolicy
             }
             var groupSid = groups.EnsureGroup(AllowedGroupName, AllowedGroupComment);
             var hostAccounts = CollectHostAccounts(groups, ExtractMachineSidPrefix(groupSid), logger);
-            ApplyCore(lsa, groups, StatePath, seats, hostAccounts, logger);
+            return ApplyCore(lsa, groups, StatePath, seats, hostAccounts, logger);
         }
         catch (Exception ex)
         {
             logger.LogWarning(ex, "Droits d'arrêt inchangés ou partiellement appliqués ; vérifier/restaurer {Path}", StatePath);
+            return false;
         }
     }
 
@@ -130,25 +132,41 @@ internal static class ShutdownRightPolicy
         string statePath,
         IReadOnlySet<string> managedSeats,
         HostAccounts hostAccounts,
+        ILogger logger) =>
+        ReconcileCore(lsa, groups, statePath, managedSeats, hostAccounts, logger).Succeeded;
+
+    internal static ReconcileResult ReconcileCore(
+        ILsaPolicy lsa,
+        ILocalGroupPolicy groups,
+        string statePath,
+        IReadOnlySet<string> managedSeats,
+        HostAccounts hostAccounts,
         ILogger logger)
     {
+        var unprotectedSeats = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (managedSeats.Count == 0)
         {
             Restore(lsa, groups, statePath);
-            return true;
+            return new ReconcileResult(true, unprotectedSeats);
         }
 
-        var privilegedSeats = managedSeats.Where(hostAccounts.PrivilegedMemberSids.Contains).ToArray();
+        // Never modify Administrators or Backup Operators; flag any managed seat member as unprotected.
+        var privilegedSeats = managedSeats.Where(hostAccounts.PrivilegedMemberSids.Contains)
+            .Order(StringComparer.OrdinalIgnoreCase).ToArray();
         foreach (var seatSid in privilegedSeats)
         {
+            unprotectedSeats.Add(seatSid);
             logger.LogWarning(
-                "Place {Sid} membre d'Administrators ou Backup Operators : non traitée comme protégée pour le droit d'arrêt",
+                "Place {Sid} non protégée pour le droit d'arrêt : membre d'Administrators ou Backup Operators (groupes non modifiés)",
                 seatSid);
         }
-        var protectedSeats = managedSeats.Except(privilegedSeats, StringComparer.OrdinalIgnoreCase)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        if (protectedSeats.Count == 0)
-            return false;
+        if (unprotectedSeats.Count == managedSeats.Count)
+        {
+            logger.LogWarning(
+                "Réconciliation des droits d'arrêt en échec : aucune place protégée ({Count} place(s) non protégée(s))",
+                unprotectedSeats.Count);
+            return new ReconcileResult(false, unprotectedSeats);
+        }
 
         var groupSid = groups.EnsureGroup(AllowedGroupName, AllowedGroupComment);
         var desiredMembers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -170,15 +188,22 @@ internal static class ShutdownRightPolicy
                 logger.LogWarning(ex,
                     "Impossible d'ajouter {Sid} au groupe {Group} : aucun droit d'arrêt retiré",
                     sid, AllowedGroupName);
-                return false;
+                return new ReconcileResult(false, unprotectedSeats);
             }
         }
-        foreach (var stale in currentMembers.Where(s => !desiredMembers.Contains(s)).Order(StringComparer.OrdinalIgnoreCase))
+        // Never remove a member from Kinseat-ArretAutorise unless it is a managed seat account.
+        foreach (var seatSid in currentMembers.Where(managedSeats.Contains).Order(StringComparer.OrdinalIgnoreCase))
         {
-            try { groups.RemoveMemberSid(AllowedGroupName, stale); }
+            try
+            {
+                groups.RemoveMemberSid(AllowedGroupName, seatSid);
+            }
             catch (Exception ex)
             {
-                logger.LogWarning(ex, "Retrait du membre {Sid} hors du groupe {Group} impossible", stale, AllowedGroupName);
+                unprotectedSeats.Add(seatSid);
+                logger.LogWarning(ex,
+                    "Place {Sid} non protégée pour le droit d'arrêt : échec du retrait du groupe {Group}",
+                    seatSid, AllowedGroupName);
             }
         }
 
@@ -190,31 +215,77 @@ internal static class ShutdownRightPolicy
             {
                 logger.LogWarning("SID du groupe {Group} différent du journal {Path} ; restaurer avant de réappliquer",
                     AllowedGroupName, statePath);
-                return false;
+                return new ReconcileResult(false, unprotectedSeats);
             }
             ApplySnapshot(lsa, statePath, existing);
-            return true;
+            RecordDirectSeatGrants(lsa, managedSeats, unprotectedSeats, logger);
+            if (unprotectedSeats.Count > 0)
+            {
+                logger.LogWarning(
+                    "Réconciliation des droits d'arrêt en échec : {Count} place(s) non protégée(s) ({Sids})",
+                    unprotectedSeats.Count, string.Join(", ", unprotectedSeats.Order(StringComparer.OrdinalIgnoreCase)));
+                return new ReconcileResult(false, unprotectedSeats);
+            }
+            return new ReconcileResult(true, unprotectedSeats);
         }
 
         var originals = Rights.ToDictionary(r => r, r => lsa.Enumerate(r));
-        foreach (var right in Rights)
-        {
-            foreach (var seatSid in protectedSeats.Where(s => originals[right].Contains(s, StringComparer.OrdinalIgnoreCase)))
-            {
-                logger.LogWarning("Droit {Right} directement attribué à la place {Sid} : attribution spécifique conservée", right, seatSid);
-            }
-        }
+        RecordDirectSeatGrants(originals, managedSeats, unprotectedSeats, logger);
 
         var changes = Plan(originals, groupSid);
-        if (changes.All(c => c.Remove.Length == 0 && c.Add.Length == 0)) return true;
+        if (changes.All(c => c.Remove.Length == 0 && c.Add.Length == 0))
+        {
+            if (unprotectedSeats.Count > 0)
+            {
+                logger.LogWarning(
+                    "Réconciliation des droits d'arrêt en échec : {Count} place(s) non protégée(s) ({Sids})",
+                    unprotectedSeats.Count, string.Join(", ", unprotectedSeats.Order(StringComparer.OrdinalIgnoreCase)));
+                return new ReconcileResult(false, unprotectedSeats);
+            }
+            return new ReconcileResult(true, unprotectedSeats);
+        }
 
         EnsureStateDirectory(statePath);
         // Persist original intent before the first LSA mutation; never overwrite an existing original.
         var snapshot = new Snapshot(changes, AllowedGroupName, groupSid, Applied: false);
         Save(statePath, snapshot);
         ApplySnapshot(lsa, statePath, Load(statePath));
+        if (unprotectedSeats.Count > 0)
+        {
+            logger.LogWarning(
+                "Réconciliation des droits d'arrêt en échec : {Count} place(s) non protégée(s) ({Sids})",
+                unprotectedSeats.Count, string.Join(", ", unprotectedSeats.Order(StringComparer.OrdinalIgnoreCase)));
+            return new ReconcileResult(false, unprotectedSeats);
+        }
         logger.LogInformation("Droits d'arrêt durcis via le groupe {Group} ; origine conservée dans {Path}", AllowedGroupName, statePath);
-        return true;
+        return new ReconcileResult(true, unprotectedSeats);
+    }
+
+    private static void RecordDirectSeatGrants(
+        ILsaPolicy lsa,
+        IReadOnlySet<string> managedSeats,
+        HashSet<string> unprotectedSeats,
+        ILogger logger) =>
+        RecordDirectSeatGrants(Rights.ToDictionary(r => r, r => lsa.Enumerate(r)), managedSeats, unprotectedSeats, logger);
+
+    private static void RecordDirectSeatGrants(
+        IReadOnlyDictionary<string, string[]> grantsByRight,
+        IReadOnlySet<string> managedSeats,
+        HashSet<string> unprotectedSeats,
+        ILogger logger)
+    {
+        foreach (var right in Rights)
+        {
+            if (!grantsByRight.TryGetValue(right, out var grants)) continue;
+            foreach (var seatSid in managedSeats.Where(s => grants.Contains(s, StringComparer.OrdinalIgnoreCase))
+                .Order(StringComparer.OrdinalIgnoreCase))
+            {
+                unprotectedSeats.Add(seatSid);
+                logger.LogWarning(
+                    "Place {Sid} non protégée pour le droit d'arrêt : droit {Right} directement attribué (attribution spécifique conservée)",
+                    seatSid, right);
+            }
+        }
     }
 
     internal static void ApplySnapshot(ILsaPolicy lsa, string path, Snapshot snapshot)

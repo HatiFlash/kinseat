@@ -20,11 +20,48 @@ try {
     Emit 'service' 'running' 'Arrêt et restauration des droits avant suppression du service' 10
     $svc=Get-Service MultiSeatService -ErrorAction SilentlyContinue
     if($svc -and $svc.Status -ne 'Stopped'){Stop-Service MultiSeatService -Force; $svc.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(40))}
-    # Import only USER_RIGHTS; preserve every other exported privilege and unrelated SID.
+    function Get-UserRightEntries($lines, $right) {
+        $match = @(for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match ('^' + $right + '\s*=')) { $i } })
+        if ($match.Count -gt 1) { throw "Attribution dupliquée : $right" }
+        if ($match.Count -eq 0) { return @() }
+        return @(($lines[$match[0]] -split '=', 2)[1] -split ',' | ForEach-Object { $_.Trim().TrimStart('*') } | Where-Object { $_ })
+    }
+    function Restore-ShutdownRightsInf($tmpRights, $targetRights) {
+        $restoreInf = Join-Path $tmpRights 'restore.inf'
+        $infLines = @(
+            '[Unicode]'
+            'Unicode=yes'
+            '[Version]'
+            'signature="$CHICAGO$"'
+            'Revision=1'
+            '[Privilege Rights]'
+        )
+        foreach ($right in @('SeShutdownPrivilege', 'SeRemoteShutdownPrivilege')) {
+            $formatted = @($targetRights[$right] | ForEach-Object { if ($_ -match '^S-\d+-') { '*' + $_ } else { $_ } })
+            $infLines += ($right + ' = ' + ($formatted -join ','))
+        }
+        [IO.File]::WriteAllLines($restoreInf, $infLines, [Text.Encoding]::Unicode)
+        & secedit.exe /configure /db (Join-Path $tmpRights 'restore.sdb') /cfg $restoreInf /areas USER_RIGHTS /quiet | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Restauration LSA impossible : $LASTEXITCODE" }
+        $verify = Join-Path $tmpRights 'verify.inf'
+        & secedit.exe /export /areas USER_RIGHTS /cfg $verify | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Vérification LSA impossible : $LASTEXITCODE" }
+        $actualLines = @(Get-Content -LiteralPath $verify -Encoding Unicode)
+        foreach ($right in @('SeShutdownPrivilege', 'SeRemoteShutdownPrivilege')) {
+            $expectedIds = @($targetRights[$right])
+            $actualIds = @(Get-UserRightEntries $actualLines $right)
+            $missing = @($expectedIds | Where-Object { $_ -notin $actualIds })
+            $extra = @($actualIds | Where-Object { $_ -notin $expectedIds })
+            if ($missing.Count -gt 0 -or $extra.Count -gt 0) {
+                throw "Droit LSA non restauré conformément à l'attendu : $right"
+            }
+        }
+    }
+    # Import a minimal USER_RIGHTS INF containing only the two shutdown rights; preserve all other rights.
+    $expected=@('SeShutdownPrivilege','SeRemoteShutdownPrivilege')
     $rightsState=Join-Path $data 'shutdown-rights\state.json'
     if(Test-Path -LiteralPath $rightsState){
         $snapshot=Get-Content -LiteralPath $rightsState -Raw | ConvertFrom-Json
-        $expected=@('SeShutdownPrivilege','SeRemoteShutdownPrivilege')
         if(@($snapshot.Changes).Count -ne 2 -or
             ((@($snapshot.Changes | ForEach-Object Right | Sort-Object) -join ',') -ne
              (@($expected | Sort-Object) -join ','))){
@@ -43,28 +80,14 @@ try {
             & secedit.exe /export /areas USER_RIGHTS /cfg $export | Out-Null
             if($LASTEXITCODE -ne 0){throw "Export LSA impossible : $LASTEXITCODE"}
             $lines=@(Get-Content -LiteralPath $export -Encoding Unicode)
+            $targetRights=@{}
             foreach($change in $snapshot.Changes){
-                $match=@(for($i=0;$i -lt $lines.Count;$i++){if($lines[$i] -match ('^'+$change.Right+'\s*=')){$i}})
-                if($match.Count -gt 1){throw "Attribution dupliquée : $($change.Right)"}
-                $current=if($match.Count){@(($lines[$match[0]] -split '=',2)[1] -split ',' | ForEach-Object {$_.Trim().TrimStart('*')} | Where-Object {$_})}else{@()}
+                $current=@(Get-UserRightEntries $lines $change.Right)
                 $restore=@($current | Where-Object {$_ -notin @($change.Add)})
                 $restore+=@($change.Remove | Where-Object {$_ -notin $restore})
-                $entry=$change.Right+' = '+(($restore | ForEach-Object {'*'+$_}) -join ',')
-                if($match.Count){$lines[$match[0]]=$entry}else{$lines+= $entry}
+                $targetRights[$change.Right]=$restore
             }
-            [IO.File]::WriteAllLines($export,$lines,[Text.Encoding]::Unicode)
-            & secedit.exe /configure /db (Join-Path $tmpRights 'restore.sdb') /cfg $export /areas USER_RIGHTS /quiet | Out-Null
-            if($LASTEXITCODE -ne 0){throw "Restauration LSA impossible : $LASTEXITCODE"}
-            $verify=Join-Path $tmpRights 'verify.inf'
-            & secedit.exe /export /areas USER_RIGHTS /cfg $verify | Out-Null
-            if($LASTEXITCODE -ne 0){throw "Vérification LSA impossible : $LASTEXITCODE"}
-            $actual=@(Get-Content -LiteralPath $verify -Encoding Unicode)
-            foreach($change in $snapshot.Changes){
-                $line=@($actual | Where-Object {$_ -match ('^'+$change.Right+'\s*=')})
-                if($line.Count -ne 1){throw "Droit LSA non vérifiable : $($change.Right)"}
-                $ids=@(($line[0] -split '=',2)[1] -split ',' | ForEach-Object {$_.Trim().TrimStart('*')})
-                if(@($change.Remove | Where-Object {$_ -notin $ids}).Count){throw "Droit LSA non restauré : $($change.Right)"}
-            }
+            Restore-ShutdownRightsInf $tmpRights $targetRights
             $groupName = if ($snapshot.GroupName) { [string]$snapshot.GroupName } else { 'Kinseat-ArretAutorise' }
             if ($groupName -eq 'Kinseat-ArretAutorise') {
                 $grp = Get-LocalGroup -Name $groupName -ErrorAction SilentlyContinue
@@ -72,6 +95,43 @@ try {
             }
             Remove-Item -LiteralPath $rightsState -Force
             Emit 'service' 'ok' 'Droits LSA restaurés et groupe dédié supprimé' 20
+        } finally {Remove-Item -LiteralPath $tmpRights -Recurse -Force -ErrorAction SilentlyContinue}
+    } else {
+        $groupName = 'Kinseat-ArretAutorise'
+        $grp = Get-LocalGroup -Name $groupName -ErrorAction SilentlyContinue
+        $grpSid = if ($grp -and $grp.SID) { $grp.SID.Value } else { $null }
+        $tmpRights=Join-Path $env:TEMP ('kinseat-rights-'+[guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $tmpRights | Out-Null
+        try {
+            $export=Join-Path $tmpRights 'current.inf'
+            & secedit.exe /export /areas USER_RIGHTS /cfg $export | Out-Null
+            if($LASTEXITCODE -ne 0){throw "Export LSA impossible : $LASTEXITCODE"}
+            $lines=@(Get-Content -LiteralPath $export -Encoding Unicode)
+            $currentMap=@{}
+            $inRights=$false
+            foreach($right in $expected){
+                $entries=@(Get-UserRightEntries $lines $right)
+                $currentMap[$right]=$entries
+                if(($grpSid -and ($grpSid -in $entries)) -or
+                    @($entries | Where-Object {$_ -eq $groupName -or $_ -like "*\$groupName"}).Count -gt 0){
+                    $inRights=$true
+                }
+            }
+            if($grp -or $inRights){
+                $targetRights=@{}
+                foreach($right in $expected){
+                    $restored=@($currentMap[$right] | Where-Object {
+                        (-not $grpSid -or $_ -ne $grpSid) -and $_ -ne $groupName -and $_ -notlike "*\$groupName"
+                    })
+                    foreach($requiredSid in @('S-1-5-32-545','S-1-5-32-544')){
+                        if($requiredSid -notin $restored){$restored+=$requiredSid}
+                    }
+                    $targetRights[$right]=$restored
+                }
+                Restore-ShutdownRightsInf $tmpRights $targetRights
+                if($grp){Remove-LocalGroup -Name $groupName -ErrorAction SilentlyContinue}
+                Emit 'service' 'warning' 'Journal LSA absent : droits d''arrêt restaurés de façon conservatrice et groupe dédié supprimé' 20
+            }
         } finally {Remove-Item -LiteralPath $tmpRights -Recurse -Force -ErrorAction SilentlyContinue}
     }
     if($svc){& sc.exe delete MultiSeatService | Out-Null; if($LASTEXITCODE -ne 0){throw "sc delete code $LASTEXITCODE"}}

@@ -41,6 +41,8 @@ public sealed class MultiSeatWorker : BackgroundService
     /// check rather than inside its loop: a pass that retries a failing seat can take minutes,
     /// and the other seats' health checks must not wait for it.
     /// </summary>
+    internal static readonly TimeSpan ShutdownPolicyReconcileInterval = TimeSpan.FromSeconds(60);
+
     private Task _recovery = Task.CompletedTask;
 
     private WebApplication? _apiApp;
@@ -201,10 +203,17 @@ public sealed class MultiSeatWorker : BackgroundService
         // others are still being retried. The health check skips seats that are provisioning.
         _recovery = Task.Run(() => AutoProvisionSeatsAsync(stoppingToken), stoppingToken);
 
+        // ── Step 5b: Periodic shutdown-rights reconciliation (≤ 60 s) ─
+        // Runs on its own ≤ 60 s cadence independent of HealthCheckIntervalMs so newly created
+        // accounts and first-time Microsoft/domain profiles join Kinseat-ArretAutorise promptly.
+        var shutdownReconcileTask = ReconcileShutdownPolicyLoopAsync(stoppingToken);
+
         // ── Step 6: Health-check loop ────────────────────────────────
         using var timer = new PeriodicTimer(
             TimeSpan.FromMilliseconds(_options.HealthCheckIntervalMs));
 
+        try
+        {
         while (!stoppingToken.IsCancellationRequested)
         {
             // A resume, or a seat that lost its session, asks for a reconciliation pass
@@ -226,8 +235,7 @@ public sealed class MultiSeatWorker : BackgroundService
                 _logger.LogError(ex, "Physical pad exclusion reconciliation failed");
             }
 
-            // Reconcile accounts and shortcuts created after service startup, and retry partial LSA writes.
-            ShutdownRightPolicy.Apply(_accounts, _logger);
+            // Reconcile shortcuts for seats created after service startup.
             try { SeatShortcutPolicy.Apply(_accounts, _logger); }
             catch (Exception ex) { _logger.LogWarning(ex, "Masquage des raccourcis hôte impossible"); }
 
@@ -252,6 +260,29 @@ public sealed class MultiSeatWorker : BackgroundService
             }
 
             await timer.WaitForNextTickAsync(stoppingToken);
+        }
+        }
+        finally
+        {
+            try { await shutdownReconcileTask; }
+            catch (OperationCanceledException) { }
+        }
+    }
+
+    private async Task ReconcileShutdownPolicyLoopAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(ShutdownPolicyReconcileInterval);
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                try { ShutdownRightPolicy.Apply(_accounts, _logger); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Réconciliation des droits d'arrêt impossible"); }
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Shutdown.
         }
     }
 

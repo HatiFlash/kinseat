@@ -40,6 +40,7 @@ public sealed class SeatHardeningTests
         internal readonly Dictionary<string, HashSet<string>> Groups = new(StringComparer.OrdinalIgnoreCase);
         internal string GroupSid { get; set; } = DedicatedGroupSid;
         internal string? FailOnAddSid { get; set; }
+        internal string? FailOnRemoveSid { get; set; }
         internal bool Deleted { get; private set; }
 
         public string EnsureGroup(string name, string comment)
@@ -61,6 +62,8 @@ public sealed class SeatHardeningTests
 
         public void RemoveMemberSid(string groupName, string sid)
         {
+            if (string.Equals(FailOnRemoveSid, sid, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"Remove failed for {sid}");
             if (Groups.TryGetValue(groupName, out var members)) members.Remove(sid);
         }
 
@@ -196,15 +199,116 @@ public sealed class SeatHardeningTests
             Assert.Empty(lsa.Calls);
             Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains(Seat));
 
-            // With a second normal seat: privileged seat is still excluded from dedicated group, normal seat is protected.
+            // With a second normal seat: privileged seat stays unprotected (reconciliation fails, no false success),
+            // while both seats are excluded from dedicated group and Backup Operators is untouched.
             var bothSeats = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Seat, Seat2 };
             var host2 = host with { ActiveLocalUsers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Seat, Seat2, ConsoleUser } };
-            Assert.True(ShutdownRightPolicy.ApplyCore(lsa, groups, path, bothSeats, host2, logger));
+            var result = ShutdownRightPolicy.ReconcileCore(lsa, groups, path, bothSeats, host2, logger);
+            Assert.False(result.Succeeded);
+            Assert.Contains(Seat, result.UnprotectedSeats);
+            Assert.DoesNotContain(Seat2, result.UnprotectedSeats);
+            Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains(Seat) && e.Message.Contains("non protégée"));
             var members = groups.GetMemberSids(ShutdownRightPolicy.AllowedGroupName);
             Assert.DoesNotContain(Seat, members);
             Assert.DoesNotContain(Seat2, members);
             Assert.Contains(ConsoleUser, members);
             Assert.Contains("S-1-5-32-551", lsa.Enumerate("SeShutdownPrivilege"));
+        }
+        finally { File.Delete(path); File.Delete(path + ".tmp"); }
+    }
+
+    [Fact]
+    public void ReconciliationNeverRemovesNonSeatMembersAndAddsNewLocalAndProfileListAccounts()
+    {
+        var path = TempStatePath();
+        var lsa = new FakeLsa();
+        lsa.Rights["SeShutdownPrivilege"] = new(["S-1-5-32-544", "S-1-5-32-545"], StringComparer.OrdinalIgnoreCase);
+        lsa.Rights["SeRemoteShutdownPrivilege"] = new(["S-1-5-32-544"], StringComparer.OrdinalIgnoreCase);
+        var groups = new FakeLocalGroups();
+        var manualNonSeat = "S-1-5-21-1-2-3-1999";
+        var previousDomainMember = "S-1-5-21-9-8-7-1200";
+        groups.EnsureGroup(ShutdownRightPolicy.AllowedGroupName, "test");
+        groups.AddMemberSid(ShutdownRightPolicy.AllowedGroupName, manualNonSeat);
+        groups.AddMemberSid(ShutdownRightPolicy.AllowedGroupName, previousDomainMember);
+        groups.AddMemberSid(ShutdownRightPolicy.AllowedGroupName, Seat);
+        var logger = new CapturingLogger();
+        var host = new ShutdownRightPolicy.HostAccounts(
+            ActiveLocalUsers: new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Seat, ConsoleUser, FamilyLocal },
+            ConsoleUserSid: ConsoleUser,
+            NonLocalProfileSids: new HashSet<string>(StringComparer.OrdinalIgnoreCase) { MicrosoftEntra, DomainUser },
+            PrivilegedMemberSids: new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+        try
+        {
+            Assert.True(ShutdownRightPolicy.ApplyCore(lsa, groups, path, Seats, host, logger));
+            var members = groups.GetMemberSids(ShutdownRightPolicy.AllowedGroupName);
+            Assert.Contains(manualNonSeat, members);
+            Assert.Contains(previousDomainMember, members);
+            Assert.Contains(ConsoleUser, members);
+            Assert.Contains(FamilyLocal, members);
+            Assert.Contains(MicrosoftEntra, members);
+            Assert.Contains(DomainUser, members);
+            Assert.DoesNotContain(Seat, members);
+            Assert.True(MultiSeat.Service.MultiSeatWorker.ShutdownPolicyReconcileInterval > TimeSpan.Zero);
+            Assert.True(MultiSeat.Service.MultiSeatWorker.ShutdownPolicyReconcileInterval <= TimeSpan.FromSeconds(60));
+        }
+        finally { File.Delete(path); File.Delete(path + ".tmp"); }
+    }
+
+    [Fact]
+    public void DirectSeatLsaGrantMarksSeatUnprotectedAndFailsReconciliation()
+    {
+        var path = TempStatePath();
+        var lsa = new FakeLsa();
+        lsa.Rights["SeShutdownPrivilege"] = new(["S-1-5-32-544", "S-1-5-32-545", Seat], StringComparer.OrdinalIgnoreCase);
+        lsa.Rights["SeRemoteShutdownPrivilege"] = new(["S-1-5-32-544"], StringComparer.OrdinalIgnoreCase);
+        var groups = new FakeLocalGroups();
+        var logger = new CapturingLogger();
+        var host = new ShutdownRightPolicy.HostAccounts(
+            ActiveLocalUsers: new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Seat, ConsoleUser },
+            ConsoleUserSid: ConsoleUser,
+            NonLocalProfileSids: new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            PrivilegedMemberSids: new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+        try
+        {
+            var first = ShutdownRightPolicy.ReconcileCore(lsa, groups, path, Seats, host, logger);
+            Assert.False(first.Succeeded);
+            Assert.Contains(Seat, first.UnprotectedSeats);
+            Assert.Contains(Seat, lsa.Enumerate("SeShutdownPrivilege"));
+            Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains(Seat) && e.Message.Contains("non protégée"));
+
+            // Subsequent reconciliation with existing state.json still reports failure while direct grant remains.
+            logger.Entries.Clear();
+            var second = ShutdownRightPolicy.ReconcileCore(lsa, groups, path, Seats, host, logger);
+            Assert.False(second.Succeeded);
+            Assert.Contains(Seat, second.UnprotectedSeats);
+            Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains(Seat) && e.Message.Contains("non protégée"));
+        }
+        finally { File.Delete(path); File.Delete(path + ".tmp"); }
+    }
+
+    [Fact]
+    public void FailedSeatRemovalFromDedicatedGroupMarksSeatUnprotectedAndFailsReconciliation()
+    {
+        var path = TempStatePath();
+        var lsa = new FakeLsa();
+        lsa.Rights["SeShutdownPrivilege"] = new(["S-1-5-32-544", "S-1-5-32-545"], StringComparer.OrdinalIgnoreCase);
+        lsa.Rights["SeRemoteShutdownPrivilege"] = new(["S-1-5-32-544"], StringComparer.OrdinalIgnoreCase);
+        var groups = new FakeLocalGroups { FailOnRemoveSid = Seat };
+        groups.EnsureGroup(ShutdownRightPolicy.AllowedGroupName, "test");
+        groups.AddMemberSid(ShutdownRightPolicy.AllowedGroupName, Seat);
+        var logger = new CapturingLogger();
+        var host = new ShutdownRightPolicy.HostAccounts(
+            ActiveLocalUsers: new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Seat, ConsoleUser },
+            ConsoleUserSid: ConsoleUser,
+            NonLocalProfileSids: new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            PrivilegedMemberSids: new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+        try
+        {
+            var result = ShutdownRightPolicy.ReconcileCore(lsa, groups, path, Seats, host, logger);
+            Assert.False(result.Succeeded);
+            Assert.Contains(Seat, result.UnprotectedSeats);
+            Assert.Contains(Seat, groups.GetMemberSids(ShutdownRightPolicy.AllowedGroupName));
+            Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains(Seat) && e.Message.Contains("non protégée"));
         }
         finally { File.Delete(path); File.Delete(path + ".tmp"); }
     }

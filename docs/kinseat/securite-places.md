@@ -59,20 +59,21 @@ protège `SeShutdownPrivilege` et `SeRemoteShutdownPrivilege` via un groupe loca
    Si l'ajout d'un seul SID au groupe échoue, le service journalise un `Warning` et ne retire aucun droit LSA.
 2. Avant toute mutation LSA, l'état d'intention (droits, SID ajoutés, groupes larges retirés, nom et SID du groupe dédié) est persisté dans `C:\ProgramData\Kinseat\shutdown-rights\state.json` (répertoire restreint à `SYSTEM` et `Administrators`). L'état d'origine n'est jamais écrasé ; un indicateur `Applied` permet la reprise idempotente au démarrage suivant après un crash ou un échec partiel.
 3. Le service accorde d'abord le droit au groupe `Kinseat-ArretAutorise` (ainsi qu'à `Administrators` `S-1-5-32-544` s'il était absent), puis retire UNIQUEMENT les groupes larges présents (`BUILTIN\Users` `S-1-5-32-545`, `Everyone` `S-1-1-0`, `Authenticated Users` `S-1-5-11`, `INTERACTIVE` `S-1-5-4`, `REMOTE INTERACTIVE` `S-1-5-14`). `Administrators`, `Backup Operators` (`S-1-5-32-551`), `SYSTEM`, les comptes de service et tout autre SID spécifique ne sont jamais retirés.
-4. Si un compte de place géré est membre de `Administrators` ou `Backup Operators`, un `Warning` est journalisé et cette place n'est pas traitée comme protégée (sans être ajoutée à `Kinseat-ArretAutorise`).
-5. La réconciliation périodique synchronise les membres du groupe `Kinseat-ArretAutorise` lorsqu'un nouveau compte famille, console ou profil Microsoft/Entra/domaine apparaît, sans modifier le journal d'origine.
+4. Si un compte de place géré reste autorisé (membre de `Administrators` ou `Backup Operators`, attribution LSA directe, ou échec de retrait de `Kinseat-ArretAutorise`), cette place est marquée « non protégée » avec un `Warning` explicite et la réconciliation échoue (aucun faux succès). `Administrators` et `Backup Operators` ne sont jamais modifiés.
+5. La réconciliation périodique (intervalle ≤ 60 s) ajoute à `Kinseat-ArretAutorise` les nouveaux comptes locaux actifs non-place et les SID non locaux présents dans `ProfileList`, sans modifier le journal d'origine. Elle ne retire JAMAIS un membre de `Kinseat-ArretAutorise`, sauf s'il s'agit d'un compte de place gérée.
 
 ### Réversibilité et désinstallation
 
 - Lorsque plus aucune place gérée n'existe, `ShutdownRightPolicy.Restore` rétablit les groupes larges d'origine dans LSA, retire le groupe dédié des droits LSA, supprime le groupe local `Kinseat-ArretAutorise`, puis supprime `state.json`.
-- Lors de la désinstallation (`Uninstall-Kinseat.ps1`), après arrêt du service et avant sa suppression, le script relit `state.json`, restaure les droits `USER_RIGHTS` via `secedit.exe`, vérifie la restauration par un second export, supprime le groupe local `Kinseat-ArretAutorise` puis supprime `state.json`. Les ACE `Deny Read` posées sur les raccourcis publics sont également retirées depuis l'inventaire `shortcuts.json`.
+- Lors de la désinstallation (`Uninstall-Kinseat.ps1`), après arrêt du service et avant sa suppression, le script relit `state.json`, applique un fichier INF minimal contenant uniquement `[Unicode]`, `[Version]` et `[Privilege Rights]` pour `SeShutdownPrivilege` et `SeRemoteShutdownPrivilege` via `secedit.exe /configure /areas USER_RIGHTS`, vérifie ensuite ces deux droits par un second export, supprime le groupe local `Kinseat-ArretAutorise` puis supprime `state.json`.
+- Si `shutdown-rights\state.json` est absent lors de la désinstallation, le script vérifie si `Kinseat-ArretAutorise` existe ou figure dans `SeShutdownPrivilege`/`SeRemoteShutdownPrivilege` ; si oui, il restaure de façon conservatrice en ajoutant `*S-1-5-32-545` (`Users`) et `*S-1-5-32-544` (`Administrators`) en plus de l'existant via le même INF minimal vérifié, puis supprime le groupe ; sinon il poursuit. Les ACE `Deny Read` posées sur les raccourcis publics sont également retirées depuis l'inventaire `shortcuts.json`.
 - En cas d'indisponibilité du service ou du désinstallateur, `state.json` conserve la liste exacte des attributions d'origine pour permettre un rétablissement manuel par un administrateur.
 
 ### Limites
 
 - Les jetons de session déjà ouverts conservent leurs anciens privilèges jusqu'à déconnexion/reconnexion.
-- Un compte Microsoft/Entra/domaine n'ayant pas encore de profil dans `ProfileList` et non connecté à la console au moment de la réconciliation ne rejoindra `Kinseat-ArretAutorise` qu'à la réconciliation suivante après création de son profil (un administrateur garde toujours `SeShutdownPrivilege`).
-- Une place placée manuellement dans `Administrators` ou `Backup Operators`, ou disposant d'une attribution LSA directe, n'est pas bloquée (signalé en `Warning`).
+- Un compte Microsoft/domaine qui n'a jamais ouvert de session obtient le droit à la première réconciliation après sa première connexion (≤ 60 s) ; les administrateurs l'ont toujours.
+- Une place placée manuellement dans `Administrators` ou `Backup Operators`, disposant d'une attribution LSA directe ou dont le retrait de `Kinseat-ArretAutorise` échoue, reste en état « non protégée » (signalé en `Warning` et réconciliation marquée en échec).
 - La protection complète (LSA, groupe dédié, `Uninstall-Kinseat.ps1` et comportement visuel des raccourcis) doit être vérifiée en direct sur l'Hôte Windows réel.
 
 ### Raccourcis publics
