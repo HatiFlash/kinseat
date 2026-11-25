@@ -17,7 +17,7 @@ DÉCISION = non bloquable par compte, choix nécessaire.
 | `rundll32 powrprof.dll,SetSuspendState`, PowerShell `Stop-Computer` / `Restart-Computer`, API `ExitWindowsEx` d'un programme | Idem | DÉCISION (même cause). PowerShell est bloqué depuis l'Explorateur (`DisallowRun`), pas depuis un processus lancé par un jeu. |
 | Mode Avion, coupure Wi-Fi / Bluetooth / réseau (zone de notification, réglages rapides) | Coupe le flux de toutes les places | MISSION partielle : `HideSCANetwork=1` retire l'icône réseau ; `NoControlPanel=1` bloque l'application Paramètres. Les réglages rapides de Windows 11 peuvent rester visibles selon la build : à vérifier au labo. Les actions sur les cartes réseau demandent l'élévation (STD). |
 | Éjection de périphériques USB (« Retirer le périphérique en toute sécurité ») | Déconnecte un disque ou une manette d'une autre place | DÉCISION : aucune stratégie utilisateur ne retire l'icône sans bloquer le stockage USB (`RemovableStorageDevices`), ce qui gênerait les joueurs. Non implémenté. |
-| Gestionnaire des tâches | Tuer Apollo, Kinseat ou un jeu d'une autre place (STD pour les processus d'autres comptes) | MISSION (`System\DisableTaskMgr=1`) pour fermer aussi ses propres processus vitaux. |
+| Gestionnaire des tâches | Tuer Apollo, Kinseat ou un jeu d'une autre place (STD pour les processus d'autres comptes) | Autorisé volontairement : ne touche que les programmes du joueur (un compte standard ne peut pas terminer les processus d'un autre compte) et c'est le seul moyen de fermer un jeu figé. `DisableTaskMgr` n'est pas posé et est supprimé s'il l'avait été. |
 | `regedit` | Modifier sa propre ruche (annulerait ces stratégies) | MISSION (`System\DisableRegistryTools=1`) + `regedit.exe` dans `DisallowRun`. HKLM : STD. |
 | `cmd`, PowerShell, `mmc` | Lancer `shutdown`, scripts | cmd : volontairement NON bloqué (Steam et des lanceurs exécutent `cmd /c`). PowerShell, pwsh, ISE, mmc : `DisallowRun` (Explorateur seulement). Alternative : `Software\Policies\Microsoft\Windows\System\DisableCMD` (1 = cmd + .bat, 2 = cmd interactif seulement) après test avec les jeux de la bibliothèque. |
 | Verrouiller / changer d'utilisateur / se déconnecter | Verrouiller sa propre session n'affecte pas l'Hôte ; « Changer d'utilisateur » peut basculer la console | Déconnexion volontairement laissée (`StartMenuLogOff` / `NoLogoff` non posés). Verrouillage / changement d'utilisateur : non traité, risque faible (DÉCISION si l'on veut `DisableLockWorkstation=1`). |
@@ -33,7 +33,6 @@ DÉCISION = non bloquable par compte, choix nécessaire.
 | `Explorer` | `NoControlPanel` | DWORD | 1 | ADMX ControlPanel « Prohibit access to Control Panel and PC settings » |
 | `Explorer` | `DisallowRun` | DWORD | 1 | ADMX Explorer « Don't run specified Windows applications » |
 | `Explorer\DisallowRun` | `1`, `2`, … | chaîne | `shutdown.exe`, `powershell.exe`, `pwsh.exe`, `powershell_ise.exe`, `regedit.exe`, `mmc.exe` | idem (liste) |
-| `System` | `DisableTaskMgr` | DWORD | 1 | ADMX « Remove Task Manager » |
 | `System` | `DisableRegistryTools` | DWORD | 1 | ADMX « Prevent access to registry editing tools » |
 
 Limite : `DisallowRun` ne s'applique qu'aux programmes lancés par l'Explorateur (Démarrer, Exécuter, raccourcis,

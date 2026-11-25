@@ -154,7 +154,9 @@ public sealed class SeatLighteningService(ILogger<SeatLighteningService> logger,
         }
         using (var system = root.CreateSubKey(SystemPolicy, true)!)
         {
-            system.SetValue("DisableTaskMgr", 1, RegistryValueKind.DWord);
+            // Task Manager stays available: a standard account only ends its own processes, and the
+            // player needs it to close a frozen game. Remove the value if an earlier version set it.
+            system.DeleteValue("DisableTaskMgr", false);
             system.SetValue("DisableRegistryTools", 1, RegistryValueKind.DWord);
         }
         // DisallowRun list: values "1","2",… = program names. Add only missing ones, keep any other entry.

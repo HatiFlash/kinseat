@@ -103,10 +103,15 @@ public sealed class SeatLighteningTests
             using var root = Registry.CurrentUser.CreateSubKey(path, true)!;
             using (var pre = root.CreateSubKey(pol + @"\Explorer\DisallowRun", true)!)
                 pre.SetValue("1", "custom.exe", RegistryValueKind.String);
+            // A previous version may have set DisableTaskMgr: it must be removed.
+            using (var oldSys = root.CreateSubKey(pol + @"\System", true)!)
+                oldSys.SetValue("DisableTaskMgr", 1, RegistryValueKind.DWord);
             SeatLighteningService.ApplySeatSafetyPolicy(root);
             SeatLighteningService.ApplySeatSafetyPolicy(root);
+            using (var sys = root.OpenSubKey(pol + @"\System")!)
+                Assert.Null(sys.GetValue("DisableTaskMgr"));
             foreach (var (sub, name) in new[] { ("Explorer", "HideSCANetwork"), ("Explorer", "NoControlPanel"),
-                ("Explorer", "DisallowRun"), ("System", "DisableTaskMgr"), ("System", "DisableRegistryTools") })
+                ("Explorer", "DisallowRun"), ("System", "DisableRegistryTools") })
             {
                 using var key = root.OpenSubKey(pol + @"\" + sub)!;
                 Assert.Equal(1, key.GetValue(name));
