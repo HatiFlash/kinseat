@@ -412,7 +412,7 @@ try {
     Step 'registration' 95 {
         $uninstall='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Kinseat'
         New-Item $uninstall -Force | Out-Null
-        $values=@{DisplayName='Kinseat Hôte';DisplayVersion='0.3.21';Publisher='Kinseat';DisplayIcon=((Join-Path $install 'kinseat.exe')+',0');InstallLocation=$install;UninstallString=('"'+(Join-Path $install 'setup.exe')+'" --uninstall')}
+        $values=@{DisplayName='Kinseat Hôte';DisplayVersion='0.3.22';Publisher='Kinseat';DisplayIcon=((Join-Path $install 'kinseat.exe')+',0');InstallLocation=$install;UninstallString=('"'+(Join-Path $install 'setup.exe')+'" --uninstall')}
         foreach($name in $values.Keys){Set-ItemProperty $uninstall -Name $name -Value $values[$name]}
         foreach($name in @('NoModify','NoRepair')){Set-ItemProperty $uninstall -Name $name -Value 1 -Type DWord}
         $size=[int][Math]::Ceiling(((@(Get-ChildItem $install -File -Recurse | Measure-Object Length -Sum).Sum)/1KB))

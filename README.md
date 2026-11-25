@@ -4,7 +4,7 @@
 
 Kinseat transforme un PC Windows puissant en console partagée pour la famille ou la maison : chaque joueur reçoit sa propre **place**, c'est-à-dire une session Windows à lui, avec son écran virtuel, son son, sa manette et ses jeux. Il y joue depuis un autre appareil (PC portable, mini-PC Windows x64/ARM64, Linux ou Mac) grâce au streaming, pendant que la personne assise devant le PC continue de l'utiliser normalement.
 
-> Version actuelle : **0.3.21** (préversion). Kinseat est testé sur un laboratoire de machines virtuelles et sur un vrai PC familial ; les limites connues sont listées dans chaque note de version.
+> Version en préparation : **0.3.22** (préversion — qualification finale en attente avant publication ; les versions publiées précédentes restent consultables sur la page des [versions (Releases)](https://github.com/HatiFlash/kinseat/releases)). Kinseat est testé sur un laboratoire de machines virtuelles et sur un vrai PC familial ; les limites connues sont listées dans chaque note de version (voir [docs/release-notes/0.3.22.md](docs/release-notes/0.3.22.md)).
 
 ![Vue d'ensemble de Kinseat Hôte](docs/images/hote-vue-ensemble-0.3.20.png)
 *Kinseat Hôte : cartes de places avec état et télémétrie, préavis de fin annulable directement dans la carte, ressources du PC unifiées et alertes en direct. (Capture avec données de démonstration.)*
@@ -20,7 +20,7 @@ Kinseat transforme un PC Windows puissant en console partagée pour la famille o
   - **manettes** : chaque manette va uniquement à la session de son joueur (ViGEmBus + HidHide), pas aux autres ni à la console ;
   - **sauvegardes** : un jeu lancé par Kinseat écrit dans un dossier propre au joueur grâce au moteur natif `Kinseat.GameFiles` — les sauvegardes de l'hôte ne sont jamais modifiées ;
   - **bureau** : le joueur ne voit que les jeux qu'on lui a autorisés ;
-  - **sécurité des places** : un compte de place géré par Kinseat ne peut ouvrir ni les Paramètres, ni le Panneau de configuration, ni regedit, ni les réglages réseau, ni les outils système, et ne peut pas arrêter le PC par les menus (le Gestionnaire des tâches reste permis pour fermer un jeu figé) — voir [docs/kinseat/securite-places.md](docs/kinseat/securite-places.md) ;
+  - **sécurité des places** : un compte de place géré par Kinseat ne peut ouvrir ni les Paramètres, ni le Panneau de configuration, ni regedit, ni les réglages réseau, ni les outils système, ni arrêter le PC par les menus (en 0.3.22 : durcissement réversible des droits d'arrêt machine et relocalisation des 4 raccourcis publics Kinseat/HidHide vers une sauvegarde administrateur, restaurés à la désinstallation — qualification finale en attente ; le Gestionnaire des tâches reste permis pour fermer un jeu figé) — voir [docs/kinseat/securite-places.md](docs/kinseat/securite-places.md) ;
   - **Steam** : prise en charge d'une instance Steam isolée par joueur (`Kinseat.SteamLauncher` / `Kinseat.SteamHook`).
 - **Bibliothèque de jeux centralisée** : détection automatique de Steam, Epic, GOG, EA, Ubisoft, ou ajout manuel repliable d'un exécutable, avec autorisation joueur par joueur et copie initiale optionnelle de la sauvegarde hôte.
 - **Ressources maîtrisées** : processeur, carte graphique, mémoire vidéo (VRAM), encodeur (NVENC/AMF) et RAM sont surveillés en continu avec barres de progression et alertes contextuelles ; un profil graphique et un budget VRAM sont proposés dès la création d'une place.
@@ -114,7 +114,7 @@ En cas de problème, les journaux à joindre sont décrits dans [docs/kinseat/jo
 
 ## Limites connues
 
-- Version 0.3.21 : un compte ajouté comme place sans avoir été créé par Kinseat n'est pas protégé par les stratégies de sécurité des places ; l'arrêt par la commande tapée dans une console n'est pas encore bloqué au niveau machine ; les raccourcis du bureau public restent visibles.
+- Version 0.3.22 (en préparation, test final sur l'Hôte Windows en attente) : un compte ajouté comme place sans avoir été créé par Kinseat n'est pas protégé ; une place disposant d'attributions LSA directes ou membre de groupes privilégiés (`Administrators`, `Backup Operators`) reste non protégée (signalée en avertissement) ; un compte Microsoft, Entra ID ou domaine non encore connu sur la machine n'obtient le droit d'arrêt qu'après sa première connexion (≤ 60 s) ; la conservation du droit d'arrêt pour les comptes normaux a été observée en préversion mais attend sa qualification finale.
 - Le partage de la carte graphique ne garantit pas une réservation stricte de mémoire vidéo par joueur : Kinseat surveille et prévient, il ne promet pas que tous les jeux lourds tourneront en même temps.
 - Les jeux à anti-triche noyau ou à DRM strict peuvent refuser de tourner dans une session secondaire.
 - Chaque version liste ses limites et ce qui a été réellement testé dans ses notes de publication.
