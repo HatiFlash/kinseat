@@ -15,7 +15,42 @@ function Emit($step,$status,$message,$pct) {
     $stream=[IO.FileStream]::new($Progress,[IO.FileMode]::Append,[IO.FileAccess]::Write,[IO.FileShare]::Read)
     try { $stream.Write($bytes,0,$bytes.Length); $stream.Flush() } finally { $stream.Dispose() }
 }
-function Save-State { [IO.File]::WriteAllText($stateFile,(ConvertTo-Json -InputObject $state -Depth 8),[Text.Encoding]::UTF8) }
+function Save-State { [IO.File]::WriteAllText($stateFile,(ConvertTo-Json -InputObject $state -Depth 8),(New-Object Text.UTF8Encoding($false))) }
+function Test-IsReparse($p) {
+    $item=Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+    if(-not $item){return $false}
+    return [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
+}
+# Le service Kinseat peut avoir déplacé un raccourci public vers shortcuts-backup (manifeste v2). Le chemin de la
+# sauvegarde est RECALCULÉ (SHA-256 du chemin d'origine, comme SeatShortcutPolicy) : le JSON ne désigne jamais un chemin lu.
+# Retour : 'none' (rien de déplacé / pas de manifeste v2), 'relocated' (sauvegarde présente), 'missing' (déclaré
+# déplacé mais sauvegarde absente), 'invalid' (manifeste ou entrée non fiable).
+function Get-ShortcutRelocation([string]$full) {
+    $dir=Join-Path $data 'shutdown-rights'
+    $manifestPath=Join-Path $dir 'shortcuts.json'
+    $backupDir=Join-Path $dir 'shortcuts-backup'
+    if(-not (Test-Path -LiteralPath $manifestPath)){return 'none'}
+    if((Test-IsReparse $dir) -or (Test-IsReparse $manifestPath)){return 'invalid'}
+    try{
+        $raw=(Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8).Trim()
+        if($raw.StartsWith('[')){return 'none'}
+        $manifest=$raw | ConvertFrom-Json
+        if($manifest.Version -ne 2 -or $null -eq $manifest.Entries){return 'invalid'}
+        foreach($entry in @($manifest.Entries)){
+            if(-not $entry.OriginalPath -or -not [string]::Equals([IO.Path]::GetFullPath([string]$entry.OriginalPath),$full,[StringComparison]::OrdinalIgnoreCase)){continue}
+            if($entry.State -notin @('PendingMove','Relocated','PendingRestore','RestoreConflict')){return 'invalid'}
+            $sha=[Security.Cryptography.SHA256]::Create()
+            try{$hash=$sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($full.ToUpperInvariant()))}finally{$sha.Dispose()}
+            $expected=Join-Path $backupDir (([BitConverter]::ToString($hash) -replace '-','').Substring(0,16)+'_'+[IO.Path]::GetFileName($full))
+            if(-not $entry.BackupPath -or -not [string]::Equals([IO.Path]::GetFullPath([string]$entry.BackupPath),[IO.Path]::GetFullPath($expected),[StringComparison]::OrdinalIgnoreCase)){return 'invalid'}
+            if((Test-IsReparse $backupDir) -or (Test-IsReparse $expected)){return 'invalid'}
+            if(Test-Path -LiteralPath $expected -PathType Leaf){return 'relocated'}
+            if($entry.State -eq 'PendingMove'){return 'none'}
+            return 'missing'
+        }
+        return 'none'
+    }catch{return 'invalid'}
+}
 function Step($id,$pct,[scriptblock]$work) {
     $start=[DateTime]::UtcNow
     Emit $id 'running' "Commande: $id" $pct
@@ -86,9 +121,9 @@ try {
     $principal=New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Administrateur requis' }
     if (-not [Environment]::Is64BitOperatingSystem -or [Environment]::OSVersion.Version.Major -lt 10) { throw 'Windows 10/11 x64 requis' }
-    $p=Get-Content -LiteralPath $Plan -Raw | ConvertFrom-Json
+    $p=Get-Content -LiteralPath $Plan -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($p.options.install_dir -ne $install -or ($p.options.rdpwrap -and -not $p.options.rdp_consent)) { throw 'Plan invalide' }
-    $manifest=Get-Content -LiteralPath (Join-Path $root 'manifest.json') -Raw | ConvertFrom-Json
+    $manifest=Get-Content -LiteralPath (Join-Path $root 'manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     foreach ($item in $manifest.artifacts | Where-Object { $_.required }) { Check-File $item }
     foreach ($entry in $manifest.artifacts | Where-Object { $_.required }) {
         if ($entry.file -match '^service/' -and -not (Test-Path -LiteralPath (Join-Path $root $entry.file) -PathType Leaf)) { throw "Fichier service manquant : $($entry.file)" }
@@ -101,10 +136,10 @@ try {
         'service/SteamIsolation/Kinseat.GameFiles.dll','service/SteamIsolation/Kinseat.GameFiles32.dll')) {
         if (-not @($manifest.artifacts | Where-Object { $_.file -eq $scriptName -and $_.required }).Count) { throw "Script non signé par manifeste: $scriptName" }
     }
-    $runtime=Get-Content -LiteralPath (Join-Path $root 'service/Kinseat.Service.runtimeconfig.json') -Raw | ConvertFrom-Json
+    $runtime=Get-Content -LiteralPath (Join-Path $root 'service/Kinseat.Service.runtimeconfig.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     if (-not $runtime.runtimeOptions.includedFrameworks -or -not (Test-Path (Join-Path $root 'service/hostfxr.dll'))) { throw 'Publish autonome incohérent' }
     if (Test-Path -LiteralPath $stateFile) {
-        $script:priorStateRaw=Get-Content -LiteralPath $stateFile -Raw
+        $script:priorStateRaw=Get-Content -LiteralPath $stateFile -Raw -Encoding UTF8
         $prior=$script:priorStateRaw | ConvertFrom-Json
         # 'rolled-back' = an earlier attempt failed and was fully undone: the machine is in its prior
         # state, so a new attempt is safe. Anything else (interrupted, rollback failed) is not.
@@ -119,7 +154,15 @@ try {
             $state.thirdParty=@($prior.thirdParty)
             # Inventaire de propriété des raccourcis publics : conservé tel quel (absent sur les anciennes versions).
             if ($prior.PSObject.Properties['shortcuts'] -and $prior.shortcuts) {
-                $state.shortcuts=@(@($prior.shortcuts) | ForEach-Object { [ordered]@{ path=[string]$_.path; target=[string]$_.target; sha256=[string]$_.sha256 } })
+                $seenShortcuts=@{}
+                $dedup=New-Object Collections.Generic.List[object]
+                foreach($old in @($prior.shortcuts)){
+                    $key=([string]$old.path).ToUpperInvariant()
+                    if($seenShortcuts.ContainsKey($key)){continue}
+                    $seenShortcuts[$key]=$true
+                    $dedup.Add([ordered]@{ path=[string]$old.path; target=[string]$old.target; sha256=[string]$old.sha256 })
+                }
+                $state.shortcuts=@($dedup.ToArray())
             }
         }
     }
@@ -208,6 +251,60 @@ try {
             }
         }
         Save-State
+    }
+    # Raccourcis publics : AVANT le démarrage du service (arrêté depuis 'service-stop'), donc sans course avec la
+    # relocalisation par le service ; le manifeste v2 est stable pendant toute cette étape.
+    Step 'shortcuts' 60 {
+        $shell=New-Object -ComObject WScript.Shell
+        $hostExe=Join-Path $install 'kinseat.exe'
+        $lnkName='Kinseat H'+[char]0x00F4+'te.lnk'
+        # Dossiers publics (corrects aussi sous SYSTEM) ; replis symétriques si le dossier connu est vide.
+        $programs=[Environment]::GetFolderPath('CommonPrograms')
+        if([string]::IsNullOrWhiteSpace($programs)){$programs=Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'}
+        $desktopDir=[Environment]::GetFolderPath('CommonDesktopDirectory')
+        if([string]::IsNullOrWhiteSpace($desktopDir)){$desktopDir=Join-Path $env:PUBLIC 'Desktop'}
+        $start=Join-Path $programs $lnkName
+        $desk=Join-Path $desktopDir $lnkName
+        $script:createdShortcuts=@()
+        $inventory=New-Object Collections.Generic.List[object]
+        foreach($entry in @($state.shortcuts)){ $inventory.Add($entry) }
+        foreach($lnkPath in @($start,$desk)){
+            $full=[IO.Path]::GetFullPath($lnkPath)
+            $known=@($inventory | Where-Object { [string]::Equals($_.path,$full,[StringComparison]::OrdinalIgnoreCase) }) | Select-Object -First 1
+            $relocation=Get-ShortcutRelocation $full
+            if($relocation -eq 'relocated'){
+                # Déjà déplacé par le service (sauvegarde présente) : ne rien recréer ; l'entrée d'inventaire
+                # de l'ancienne version (si connue) est conservée telle quelle. Idempotent.
+                Emit 'shortcuts' 'warning' "Raccourci déjà relocalisé par le service, non recréé : $full" 60
+                continue
+            }
+            if($relocation -in @('missing','invalid')){
+                if($known){[void]$inventory.Remove($known)}
+                Emit 'shortcuts' 'warning' "Manifeste de raccourcis $relocation : propriété non revendiquée, raccourci non recréé : $full" 60
+                continue
+            }
+            $previousBytes=$null
+            if(Test-Path -LiteralPath $full){
+                $item=Get-Item -LiteralPath $full -Force
+                $currentHash=(Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash
+                $owned=($known -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -and [string]::Equals($currentHash,[string]$known.sha256,[StringComparison]::OrdinalIgnoreCase))
+                if(-not $owned){
+                    # Raccourci existant non prouvé comme créé par Kinseat : ni écrasé ni revendiqué.
+                    if($known){[void]$inventory.Remove($known)}
+                    Emit 'shortcuts' 'warning' "Raccourci existant conservé, propriété non revendiquée : $full" 60
+                    continue
+                }
+                $previousBytes=[IO.File]::ReadAllBytes($full)
+                [void]$inventory.Remove($known)
+            }
+            elseif($known){ [void]$inventory.Remove($known) }
+            $link=$shell.CreateShortcut($full); $link.TargetPath=$hostExe; $link.WorkingDirectory=$install; $link.IconLocation=$hostExe+',0'; $link.Save()
+            $created=[ordered]@{ path=$full; target=[string]$shell.CreateShortcut($full).TargetPath; sha256=(Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash }
+            $inventory.Add($created)
+            # Copie distincte : les octets précédents (rollback d'une mise à jour) ne sont jamais écrits dans l'état.
+            $script:createdShortcuts+=,@{ path=$full; sha256=$created.sha256; previousBytes=$previousBytes }
+        }
+        $state.shortcuts=@($inventory.ToArray()); Save-State
     }
     Step 'service' 65 {
         $exe=Join-Path $install 'Kinseat.Service.exe'
@@ -313,39 +410,6 @@ try {
         }
     }
     Step 'registration' 95 {
-        $shell=New-Object -ComObject WScript.Shell
-        $hostExe=Join-Path $install 'kinseat.exe'
-        $lnkName='Kinseat H'+[char]0x00F4+'te.lnk'
-        # Dossiers publics (corrects aussi sous SYSTEM) ; repli ProgramData pour le menu Démarrer.
-        $programs=[Environment]::GetFolderPath('CommonPrograms')
-        if([string]::IsNullOrWhiteSpace($programs)){$programs=Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'}
-        $start=Join-Path $programs $lnkName
-        $desk=Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) $lnkName
-        $script:createdShortcuts=@()
-        $inventory=New-Object Collections.Generic.List[object]
-        foreach($entry in @($state.shortcuts)){ $inventory.Add($entry) }
-        foreach($lnkPath in @($start,$desk)){
-            $full=[IO.Path]::GetFullPath($lnkPath)
-            $known=@($inventory | Where-Object { [string]::Equals($_.path,$full,[StringComparison]::OrdinalIgnoreCase) }) | Select-Object -First 1
-            if(Test-Path -LiteralPath $full){
-                $item=Get-Item -LiteralPath $full -Force
-                $currentHash=(Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash
-                $owned=($known -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -and [string]::Equals($currentHash,[string]$known.sha256,[StringComparison]::OrdinalIgnoreCase))
-                if(-not $owned){
-                    # Raccourci existant non prouvé comme créé par Kinseat : ni écrasé ni revendiqué.
-                    if($known){[void]$inventory.Remove($known)}
-                    Emit 'registration' 'warning' "Raccourci existant conservé, propriété non revendiquée : $full" 95
-                    continue
-                }
-                [void]$inventory.Remove($known)
-            }
-            elseif($known){ [void]$inventory.Remove($known) }
-            $link=$shell.CreateShortcut($full); $link.TargetPath=$hostExe; $link.WorkingDirectory=$install; $link.IconLocation=$hostExe+',0'; $link.Save()
-            $created=[ordered]@{ path=$full; target=[string]$shell.CreateShortcut($full).TargetPath; sha256=(Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash }
-            $inventory.Add($created)
-            $script:createdShortcuts+=,$created
-        }
-        $state.shortcuts=@($inventory.ToArray()); Save-State
         $uninstall='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Kinseat'
         New-Item $uninstall -Force | Out-Null
         $values=@{DisplayName='Kinseat Hôte';DisplayVersion='0.3.21';Publisher='Kinseat';DisplayIcon=((Join-Path $install 'kinseat.exe')+',0');InstallLocation=$install;UninstallString=('"'+(Join-Path $install 'setup.exe')+'" --uninstall')}
@@ -367,9 +431,14 @@ try {
             switch($id) {
                 'registration' {
                     Remove-Item 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Kinseat' -Recurse -Force -ErrorAction SilentlyContinue
-                    # Seuls les raccourcis créés par cette tentative (et inchangés) sont retirés.
+                }
+                'shortcuts' {
+                    # Seuls les raccourcis créés par cette tentative (et inchangés) sont retirés ; un ancien raccourci écrasé est remis en l'état.
                     foreach($made in @($script:createdShortcuts)){
-                        if($made -and (Test-Path -LiteralPath $made.path) -and (Get-FileHash -LiteralPath $made.path -Algorithm SHA256).Hash -eq $made.sha256){ Remove-Item -LiteralPath $made.path -Force -ErrorAction SilentlyContinue }
+                        if($made -and (Test-Path -LiteralPath $made.path) -and (Get-FileHash -LiteralPath $made.path -Algorithm SHA256).Hash -eq $made.sha256){
+                            if($made.previousBytes){ [IO.File]::WriteAllBytes($made.path,[byte[]]$made.previousBytes) }
+                            else { Remove-Item -LiteralPath $made.path -Force -ErrorAction SilentlyContinue }
+                        }
                     }
                 }
                 'service' { Stop-Service MultiSeatService -Force -ErrorAction SilentlyContinue; if(-not $state.serviceExisted){ & sc.exe delete MultiSeatService | Out-Null } }
