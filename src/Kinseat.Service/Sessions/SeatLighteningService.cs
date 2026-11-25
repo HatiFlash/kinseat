@@ -133,6 +133,45 @@ public sealed class SeatLighteningService(ILogger<SeatLighteningService> logger,
         policy.SetValue("NoClose", 1, RegistryValueKind.DWord);
     }
 
+    private const string SystemPolicy = @"Software\Microsoft\Windows\CurrentVersion\Policies\System";
+
+    /// <summary>Programs the seat account cannot start from Explorer (Policies\Explorer\DisallowRun). This only
+    /// covers launches through Explorer (Start, Run, shortcuts), not CreateProcess from a game or a script.</summary>
+    internal static readonly string[] DisallowedPrograms =
+        ["shutdown.exe", "powershell.exe", "pwsh.exe", "powershell_ise.exe", "regedit.exe", "mmc.exe"];
+
+    // Per-user policies that keep a seat player from disturbing the host PC. Seat hive only, always applied,
+    // idempotent. Sources: Microsoft ADMX (Explorer.admx, ControlPanel.admx, Taskmgr/System.admx) and
+    // learn.microsoft.com Policy CSP / "Group Policy Settings Reference". cmd.exe is deliberately NOT blocked
+    // (Steam and some launchers run cmd /c). StartMenuLogOff/NoLogoff are untouched: the player signs out.
+    internal static void ApplySeatSafetyPolicy(RegistryKey root)
+    {
+        using (var explorer = root.CreateSubKey(Explorer, true)!)
+        {
+            explorer.SetValue("HideSCANetwork", 1, RegistryValueKind.DWord); // remove the network icon
+            explorer.SetValue("NoControlPanel", 1, RegistryValueKind.DWord); // Control Panel and Settings app
+            explorer.SetValue("DisallowRun", 1, RegistryValueKind.DWord);
+        }
+        using (var system = root.CreateSubKey(SystemPolicy, true)!)
+        {
+            // Task Manager stays available: a standard account only ends its own processes, and the
+            // player needs it to close a frozen game. Remove the value if an earlier version set it.
+            system.DeleteValue("DisableTaskMgr", false);
+            system.SetValue("DisableRegistryTools", 1, RegistryValueKind.DWord);
+        }
+        // DisallowRun list: values "1","2",… = program names. Add only missing ones, keep any other entry.
+        using var list = root.CreateSubKey(Explorer + @"\DisallowRun", true)!;
+        var present = list.GetValueNames().Select(n => list.GetValue(n)?.ToString() ?? "")
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var next = 1;
+        foreach (var program in DisallowedPrograms)
+        {
+            if (present.Contains(program)) continue;
+            while (list.GetValue(next.ToString()) is not null) next++;
+            list.SetValue(next.ToString(), program, RegistryValueKind.String);
+        }
+    }
+
     internal static readonly string[] DesktopIcons =
     [
         "{645FF040-5081-101B-9F08-00AA002F954E}", // Corbeille
@@ -216,6 +255,7 @@ public sealed class SeatLighteningService(ILogger<SeatLighteningService> logger,
             if (root is null) throw new IOException("La ruche du compte ne peut être ouverte");
             ApplyDesktopIcons(root, settings.EmptyDesktop);
             ApplyPowerPolicy(root);
+            ApplySeatSafetyPolicy(root);
             var entries = new Dictionary<string, string>(StartupEntries(), StringComparer.OrdinalIgnoreCase);
             foreach (var (key, value) in SeatRunEntries(root)) entries.TryAdd(key, value);
             ApplyApproved(root, entries, settings.BlockStartupApps);

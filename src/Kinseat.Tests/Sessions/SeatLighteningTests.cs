@@ -92,6 +92,46 @@ public sealed class SeatLighteningTests
         finally { Registry.CurrentUser.DeleteSubKeyTree(path, false); }
     }
 
+    [Fact]
+    public void ApplySeatSafetyPolicySetsValuesIdempotentlyInsideRootOnly()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var path = @"Software\KinseatTest-" + Guid.NewGuid().ToString("N");
+        const string pol = @"Software\Microsoft\Windows\CurrentVersion\Policies";
+        try
+        {
+            using var root = Registry.CurrentUser.CreateSubKey(path, true)!;
+            using (var pre = root.CreateSubKey(pol + @"\Explorer\DisallowRun", true)!)
+                pre.SetValue("1", "custom.exe", RegistryValueKind.String);
+            // A previous version may have set DisableTaskMgr: it must be removed.
+            using (var oldSys = root.CreateSubKey(pol + @"\System", true)!)
+                oldSys.SetValue("DisableTaskMgr", 1, RegistryValueKind.DWord);
+            SeatLighteningService.ApplySeatSafetyPolicy(root);
+            SeatLighteningService.ApplySeatSafetyPolicy(root);
+            using (var sys = root.OpenSubKey(pol + @"\System")!)
+                Assert.Null(sys.GetValue("DisableTaskMgr"));
+            foreach (var (sub, name) in new[] { ("Explorer", "HideSCANetwork"), ("Explorer", "NoControlPanel"),
+                ("Explorer", "DisallowRun"), ("System", "DisableRegistryTools") })
+            {
+                using var key = root.OpenSubKey(pol + @"\" + sub)!;
+                Assert.Equal(1, key.GetValue(name));
+                Assert.Equal(RegistryValueKind.DWord, key.GetValueKind(name));
+            }
+            using var list = root.OpenSubKey(pol + @"\Explorer\DisallowRun")!;
+            var values = list.GetValueNames().Select(n => (string)list.GetValue(n)!).ToArray();
+            Assert.Equal("custom.exe", list.GetValue("1"));
+            Assert.Equal(SeatLighteningService.DisallowedPrograms.Length + 1, values.Length);
+            foreach (var program in SeatLighteningService.DisallowedPrograms) Assert.Contains(program, values);
+            Assert.DoesNotContain("cmd.exe", values);
+            using var explorer = root.OpenSubKey(pol + @"\Explorer")!;
+            Assert.Null(explorer.GetValue("NoLogoff"));
+            Assert.Null(explorer.GetValue("StartMenuLogOff"));
+            // Nothing outside the root hive: no cmd policy written under it either.
+            Assert.Null(root.OpenSubKey(@"Software\Policies\Microsoft\Windows\System"));
+        }
+        finally { Registry.CurrentUser.DeleteSubKeyTree(path, false); }
+    }
+
     [Theory]
     [InlineData("seat.lightening.set", "{}")]
     [InlineData("seat.lightening.set", "{\"emptyDesktop\":true,\"blockStartupApps\":true,\"blockVendorUtilities\":true,\"closeWindhawkTray\":0}")]
