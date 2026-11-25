@@ -226,6 +226,11 @@ public sealed class MultiSeatWorker : BackgroundService
                 _logger.LogError(ex, "Physical pad exclusion reconciliation failed");
             }
 
+            // Reconcile accounts and shortcuts created after service startup, and retry partial LSA writes.
+            ShutdownRightPolicy.Apply(_accounts, _logger);
+            try { SeatShortcutPolicy.Apply(_accounts, _logger); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Masquage des raccourcis hôte impossible"); }
+
             try
             {
                 await _healthCheck.CheckAllSeatsAsync(_seatManager, stoppingToken);

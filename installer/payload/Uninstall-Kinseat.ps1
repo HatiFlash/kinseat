@@ -17,9 +17,64 @@ try {
     if(-not (Test-Path $stateFile)){throw 'État d''installation absent : désinstallation conservatrice refusée'}
     $state=Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
     if($state.schema -ne 1 -or $state.status -ne 'complete'){throw 'État incertain : intervention manuelle requise'}
-    Emit 'service' 'running' 'Arrêt du service' 10
+    Emit 'service' 'running' 'Arrêt et restauration des droits avant suppression du service' 10
     $svc=Get-Service MultiSeatService -ErrorAction SilentlyContinue
-    if($svc){if($svc.Status -ne 'Stopped'){Stop-Service MultiSeatService -Force; $svc.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(40))}; & sc.exe delete MultiSeatService | Out-Null; if($LASTEXITCODE -ne 0){throw "sc delete code $LASTEXITCODE"}}
+    if($svc -and $svc.Status -ne 'Stopped'){Stop-Service MultiSeatService -Force; $svc.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(40))}
+    # Import only USER_RIGHTS; preserve every other exported privilege and unrelated SID.
+    $rightsState=Join-Path $data 'shutdown-rights\state.json'
+    if(Test-Path -LiteralPath $rightsState){
+        $snapshot=Get-Content -LiteralPath $rightsState -Raw | ConvertFrom-Json
+        $expected=@('SeShutdownPrivilege','SeRemoteShutdownPrivilege')
+        if(@($snapshot.Changes).Count -ne 2 -or
+            ((@($snapshot.Changes | ForEach-Object Right | Sort-Object) -join ',') -ne
+             (@($expected | Sort-Object) -join ','))){
+            throw 'Sauvegarde LSA invalide : désinstallation refusée'
+        }
+        foreach($change in $snapshot.Changes){
+            if(@($change.Remove | Where-Object {$_ -notin @('S-1-1-0','S-1-5-4','S-1-5-11','S-1-5-14','S-1-5-32-545')}).Count -or
+               @($change.Add | Where-Object {$_ -ne 'S-1-5-32-544' -and $_ -notmatch '^S-1-5-21-(\d+-){3}\d+$'}).Count){
+                throw 'Sauvegarde LSA contenant un SID inattendu : désinstallation refusée'
+            }
+        }
+        $tmpRights=Join-Path $env:TEMP ('kinseat-rights-'+[guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $tmpRights | Out-Null
+        try {
+            $export=Join-Path $tmpRights 'current.inf'
+            & secedit.exe /export /areas USER_RIGHTS /cfg $export | Out-Null
+            if($LASTEXITCODE -ne 0){throw "Export LSA impossible : $LASTEXITCODE"}
+            $lines=@(Get-Content -LiteralPath $export -Encoding Unicode)
+            foreach($change in $snapshot.Changes){
+                $match=@(for($i=0;$i -lt $lines.Count;$i++){if($lines[$i] -match ('^'+$change.Right+'\s*=')){$i}})
+                if($match.Count -gt 1){throw "Attribution dupliquée : $($change.Right)"}
+                $current=if($match.Count){@(($lines[$match[0]] -split '=',2)[1] -split ',' | ForEach-Object {$_.Trim().TrimStart('*')} | Where-Object {$_})}else{@()}
+                $restore=@($current | Where-Object {$_ -notin @($change.Add)})
+                $restore+=@($change.Remove | Where-Object {$_ -notin $restore})
+                $entry=$change.Right+' = '+(($restore | ForEach-Object {'*'+$_}) -join ',')
+                if($match.Count){$lines[$match[0]]=$entry}else{$lines+= $entry}
+            }
+            [IO.File]::WriteAllLines($export,$lines,[Text.Encoding]::Unicode)
+            & secedit.exe /configure /db (Join-Path $tmpRights 'restore.sdb') /cfg $export /areas USER_RIGHTS /quiet | Out-Null
+            if($LASTEXITCODE -ne 0){throw "Restauration LSA impossible : $LASTEXITCODE"}
+            $verify=Join-Path $tmpRights 'verify.inf'
+            & secedit.exe /export /areas USER_RIGHTS /cfg $verify | Out-Null
+            if($LASTEXITCODE -ne 0){throw "Vérification LSA impossible : $LASTEXITCODE"}
+            $actual=@(Get-Content -LiteralPath $verify -Encoding Unicode)
+            foreach($change in $snapshot.Changes){
+                $line=@($actual | Where-Object {$_ -match ('^'+$change.Right+'\s*=')})
+                if($line.Count -ne 1){throw "Droit LSA non vérifiable : $($change.Right)"}
+                $ids=@(($line[0] -split '=',2)[1] -split ',' | ForEach-Object {$_.Trim().TrimStart('*')})
+                if(@($change.Remove | Where-Object {$_ -notin $ids}).Count){throw "Droit LSA non restauré : $($change.Right)"}
+            }
+            $groupName = if ($snapshot.GroupName) { [string]$snapshot.GroupName } else { 'Kinseat-ArretAutorise' }
+            if ($groupName -eq 'Kinseat-ArretAutorise') {
+                $grp = Get-LocalGroup -Name $groupName -ErrorAction SilentlyContinue
+                if ($grp) { Remove-LocalGroup -Name $groupName -ErrorAction SilentlyContinue }
+            }
+            Remove-Item -LiteralPath $rightsState -Force
+            Emit 'service' 'ok' 'Droits LSA restaurés et groupe dédié supprimé' 20
+        } finally {Remove-Item -LiteralPath $tmpRights -Recurse -Force -ErrorAction SilentlyContinue}
+    }
+    if($svc){& sc.exe delete MultiSeatService | Out-Null; if($LASTEXITCODE -ne 0){throw "sc delete code $LASTEXITCODE"}}
     Emit 'service' 'ok' 'Service supprimé' 25
     Get-NetFirewallRule -DisplayName 'Kinseat-Join' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
     if($state.firewallOwned){Get-NetFirewallRule -DisplayName 'Kinseat - bloquer RDP réseau' -ErrorAction SilentlyContinue | Remove-NetFirewallRule}
@@ -82,6 +137,25 @@ try {
         }
         elseif($id -eq 'rdpwrap'){}
         elseif($id -eq 'vdd'){Emit 'vdd' 'warning' 'Pilote SudoVDA : désinstallation automatique non sûre ; retirer manuellement' 60}
+    }
+    $shortcuts=Join-Path $data 'shutdown-rights\shortcuts.json'
+    if(Test-Path -LiteralPath $shortcuts){
+        foreach($entry in @(Get-Content -LiteralPath $shortcuts -Raw | ConvertFrom-Json)){
+            if($entry.Sid -notmatch '^S-1-5-21-(\d+-){3}\d+$' -or
+                [IO.Path]::GetFileName($entry.Path) -notin @('Kinseat Hôte.lnk','HidHide Configurator.lnk')){
+                throw 'Inventaire de raccourcis invalide : désinstallation refusée'
+            }
+            if(Test-Path -LiteralPath $entry.Path){
+                $acl=Get-Acl -LiteralPath $entry.Path
+                $rule=[Security.AccessControl.FileSystemAccessRule]::new(
+                    [Security.Principal.SecurityIdentifier]::new($entry.Sid),
+                    [Security.AccessControl.FileSystemRights]::Read,
+                    [Security.AccessControl.AccessControlType]::Deny)
+                $acl.RemoveAccessRuleSpecific($rule)
+                Set-Acl -LiteralPath $entry.Path -AclObject $acl
+            }
+        }
+        Remove-Item -LiteralPath $shortcuts -Force
     }
     Remove-Item 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Kinseat' -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Kinseat Hôte.lnk') -Force -ErrorAction SilentlyContinue

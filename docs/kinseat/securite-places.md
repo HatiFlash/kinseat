@@ -20,7 +20,7 @@ DÉCISION = non bloquable par compte, choix nécessaire.
 | Action dangereuse | Risque pour l'Hôte | Statut |
 |---|---|---|
 | Menus Démarrer / Alt+F4 sur le bureau / Ctrl+Alt+Suppr : Arrêter, Redémarrer, Veille, Veille prolongée | Coupe le PC pour tous | MISSION (`Explorer\NoClose=1`, existant). Se déconnecter reste possible. |
-| `shutdown /s` / `/r` / `/h` en ligne de commande | Idem | LSA : retrait des attributions partagées de `SeShutdownPrivilege` après sauvegarde et préservation des comptes locaux non places ; sessions existantes à reconnecter. |
+| `shutdown /s` / `/r` / `/h` en ligne de commande | Idem | LSA : groupe local dédié `Kinseat-ArretAutorise` peuplé des comptes non-places autorisés (locaux actifs, console, profils Microsoft/Entra/domaine), puis retrait des groupes larges de `SeShutdownPrivilege` ; sessions existantes à reconnecter. |
 | `rundll32 powrprof.dll,SetSuspendState`, PowerShell `Stop-Computer` / `Restart-Computer`, API `ExitWindowsEx` d'un programme | Idem | Même protection LSA pour l'arrêt/redémarrage (et `SeRemoteShutdownPrivilege` pour l'arrêt distant) ; la veille et l'hibernation doivent être vérifiées sur l'Hôte Windows. |
 | Mode Avion, coupure Wi-Fi / Bluetooth / réseau (zone de notification, réglages rapides) | Coupe le flux de toutes les places | MISSION partielle : `HideSCANetwork=1` retire l'icône réseau ; `NoControlPanel=1` bloque l'application Paramètres. Les réglages rapides de Windows 11 peuvent rester visibles selon la build : à vérifier au labo. Les actions sur les cartes réseau demandent l'élévation (STD). |
 | Éjection de périphériques USB (« Retirer le périphérique en toute sécurité ») | Déconnecte un disque ou une manette d'une autre place | DÉCISION : aucune stratégie utilisateur ne retire l'icône sans bloquer le stockage USB (`RemovableStorageDevices`), ce qui gênerait les joueurs. Non implémenté. |
@@ -47,34 +47,34 @@ double-clic). Un processus lancé par un jeu, un script ou un autre programme n'
 
 ## Droit d'arrêt machine et raccourcis publics
 
-Au démarrage, `ShutdownRightPolicy` énumère les attributions LSA de `SeShutdownPrivilege` et
-`SeRemoteShutdownPrivilege`, puis les comptes locaux de la SAM. Il refuse de modifier les droits
-si la machine est jointe à un domaine, si la console est non locale, si une identité de place n'est
-pas vérifiée, ou si un groupe bénéficiaire inconnu pourrait contenir une place. Si la vérification
-réussit, il accorde d'abord `SeShutdownPrivilege` explicitement aux comptes locaux non places qui
-ne le possèdent pas déjà (console et famille compris), préserve le droit des Administrateurs, puis
-retire les attributions aux groupes partagés (Users, Everyone, INTERACTIVE, Authenticated Users,
-REMOTE INTERACTIVE). Il ne donne pas de nouveau droit d'arrêt distant aux comptes locaux ; seuls
-les groupes partagés sont retirés du droit distant. Les échecs sont journalisés sans bloquer le
-service. Les jetons de session déjà ouverts gardent leurs anciens privilèges jusqu'à reconnexion.
+### Mécanisme et groupe local dédié (`Kinseat-ArretAutorise`)
 
-Avant la première modification, la liste des retraits et ajouts est sauvée dans
-`C:\ProgramData\Kinseat\shutdown-rights\state.json` (répertoire limité à SYSTEM et Administrateurs).
-Si plus aucune place gérée n'existe au démarrage suivant, le service rétablit les droits retirés et
-supprime les attributions ajoutées. Pour désinstaller, supprimer d'abord toutes les places gérées,
-redémarrer le service et vérifier la restauration AVANT de retirer le service et cette sauvegarde :
-le programme de désinstallation n'est pas modifiable dans ce périmètre et ne restaure PAS les droits
-à lui seul. Conserver ce fichier pour un rétablissement manuel par administrateur si le service
-n'est plus disponible. Une sauvegarde existante n'est pas recalculée automatiquement : un nouvel
-utilisateur local non place créé ultérieurement ne reçoit pas automatiquement le droit explicite ;
-une attribution ajoutée manuellement à un groupe après le premier démarrage n'est pas supprimée.
-Ne pas prétendre que la protection est garantie avant vérification sur l'Hôte Windows réel ; les
-échecs LSA ou WMI laissent le droit d'arrêt inchangé ou partiellement modifié (consulter le Warning).
+Au démarrage et lors de la réconciliation périodique du service (`KinseatWorker`), `ShutdownRightPolicy`
+protège `SeShutdownPrivilege` et `SeRemoteShutdownPrivilege` via un groupe local dédié nommé
+`Kinseat-ArretAutorise` :
+1. Le service crée ou maintient le groupe local `Kinseat-ArretAutorise` et y ajoute par SID :
+   - tout compte local actif non-place (en excluant les comptes intégrés `Guest` `-501`, `DefaultAccount` `-503` et `WDAGUtilityAccount` `-504`) ;
+   - le compte actuellement connecté sur la console ;
+   - les comptes Microsoft, Entra ID (`S-1-12-1-*`) et de domaine (`S-1-5-21-*` hors préfixe machine locale) disposant d'un profil dans `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList`.
+   Si l'ajout d'un seul SID au groupe échoue, le service journalise un `Warning` et ne retire aucun droit LSA.
+2. Avant toute mutation LSA, l'état d'intention (droits, SID ajoutés, groupes larges retirés, nom et SID du groupe dédié) est persisté dans `C:\ProgramData\Kinseat\shutdown-rights\state.json` (répertoire restreint à `SYSTEM` et `Administrators`). L'état d'origine n'est jamais écrasé ; un indicateur `Applied` permet la reprise idempotente au démarrage suivant après un crash ou un échec partiel.
+3. Le service accorde d'abord le droit au groupe `Kinseat-ArretAutorise` (ainsi qu'à `Administrators` `S-1-5-32-544` s'il était absent), puis retire UNIQUEMENT les groupes larges présents (`BUILTIN\Users` `S-1-5-32-545`, `Everyone` `S-1-1-0`, `Authenticated Users` `S-1-5-11`, `INTERACTIVE` `S-1-5-4`, `REMOTE INTERACTIVE` `S-1-5-14`). `Administrators`, `Backup Operators` (`S-1-5-32-551`), `SYSTEM`, les comptes de service et tout autre SID spécifique ne sont jamais retirés.
+4. Si un compte de place géré est membre de `Administrators` ou `Backup Operators`, un `Warning` est journalisé et cette place n'est pas traitée comme protégée (sans être ajoutée à `Kinseat-ArretAutorise`).
+5. La réconciliation périodique synchronise les membres du groupe `Kinseat-ArretAutorise` lorsqu'un nouveau compte famille, console ou profil Microsoft/Entra/domaine apparaît, sans modifier le journal d'origine.
 
-`SeatShortcutPolicy` place une ACL Deny Read uniquement sur les fichiers existants
-`Kinseat Hôte.lnk` et `HidHide Configurator.lnk` du bureau public, pour les SID des comptes gérés
-vérifiés, au démarrage. Les raccourcis de jeux ne sont pas touchés et les administrateurs peuvent
-continuer à lire les liens. Cette ACL n'est pas actuellement retirée automatiquement après la
-suppression d'une place ; l'installateur devrait à terme créer ces deux raccourcis sur le bureau
-administrateur uniquement et supprimer les anciens raccourcis publics (hors périmètre des fichiers
-modifiables ici). Un raccourci recréé après le démarrage ne sera protégé qu'au prochain démarrage.
+### Réversibilité et désinstallation
+
+- Lorsque plus aucune place gérée n'existe, `ShutdownRightPolicy.Restore` rétablit les groupes larges d'origine dans LSA, retire le groupe dédié des droits LSA, supprime le groupe local `Kinseat-ArretAutorise`, puis supprime `state.json`.
+- Lors de la désinstallation (`Uninstall-Kinseat.ps1`), après arrêt du service et avant sa suppression, le script relit `state.json`, restaure les droits `USER_RIGHTS` via `secedit.exe`, vérifie la restauration par un second export, supprime le groupe local `Kinseat-ArretAutorise` puis supprime `state.json`. Les ACE `Deny Read` posées sur les raccourcis publics sont également retirées depuis l'inventaire `shortcuts.json`.
+- En cas d'indisponibilité du service ou du désinstallateur, `state.json` conserve la liste exacte des attributions d'origine pour permettre un rétablissement manuel par un administrateur.
+
+### Limites
+
+- Les jetons de session déjà ouverts conservent leurs anciens privilèges jusqu'à déconnexion/reconnexion.
+- Un compte Microsoft/Entra/domaine n'ayant pas encore de profil dans `ProfileList` et non connecté à la console au moment de la réconciliation ne rejoindra `Kinseat-ArretAutorise` qu'à la réconciliation suivante après création de son profil (un administrateur garde toujours `SeShutdownPrivilege`).
+- Une place placée manuellement dans `Administrators` ou `Backup Operators`, ou disposant d'une attribution LSA directe, n'est pas bloquée (signalé en `Warning`).
+- La protection complète (LSA, groupe dédié, `Uninstall-Kinseat.ps1` et comportement visuel des raccourcis) doit être vérifiée en direct sur l'Hôte Windows réel.
+
+### Raccourcis publics
+
+`SeatShortcutPolicy` place une ACL `Deny Read` uniquement sur `Kinseat Hôte.lnk` et `HidHide Configurator.lnk` présents sur le bureau public (`CommonDesktopDirectory`) et le menu Démarrer public (`CommonPrograms`), pour les SID des comptes de place vérifiés, et journalise chaque ACE dans `C:\ProgramData\Kinseat\shutdown-rights\shortcuts.json`. Les raccourcis de jeux ne sont pas touchés, les ACE obsolètes sont nettoyées lorsqu'une place est supprimée, et `Uninstall-Kinseat.ps1` retire les ACE enregistrées. Limite Windows : une ACL `Deny Read` sur un `.lnk` du bureau public empêche la lecture/l'exécution par la place mais peut laisser l'icône visible dans l'Explorateur selon la version de Windows.
