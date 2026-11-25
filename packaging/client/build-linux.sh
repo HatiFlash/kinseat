@@ -7,7 +7,7 @@ mkdir -p "$OUT"
 cd "$ROOT/app"
 cargo build --release -p kinseat-client
 BIN="$CARGO_TARGET_DIR/release/kinseat-client"
-VERSION=0.3.21
+VERSION=0.3.22
 MAX_GLIBC="${KINSEAT_MAX_GLIBC:-2.35}"
 GLIBC_NEEDED="$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -n1)"
 if [ -z "$GLIBC_NEEDED" ]; then
