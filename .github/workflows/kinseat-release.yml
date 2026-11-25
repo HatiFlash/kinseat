@@ -235,7 +235,8 @@ jobs:
 
   client-linux-x64:
     name: Kinseat Client (Linux x64 .deb & .tar.gz)
-    runs-on: ubuntu-latest
+    # glibc 2.35 : le binaire reste lancable sur Debian 12 / Ubuntu 22.04+
+    runs-on: ubuntu-22.04
     timeout-minutes: 25
 
     steps:
