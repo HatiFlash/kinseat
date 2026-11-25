@@ -111,6 +111,31 @@ impl Engine {
         )
     }
 
+    /// Root of an extracted AppImage (`AppRun` next to `usr/lib`) this engine runs from, if any.
+    fn appimage_root(&self) -> Option<PathBuf> {
+        if cfg!(windows) || self.is_flatpak() {
+            return None;
+        }
+        let real = fs::canonicalize(&self.program).unwrap_or_else(|_| self.program.clone());
+        real.ancestors()
+            .skip(1)
+            .take(4)
+            .find(|d| d.join("AppRun").is_file() && d.join("usr").join("lib").is_dir())
+            .map(PathBuf::from)
+    }
+
+    /// `LD_LIBRARY_PATH` for an extracted AppImage: its bundled `usr/lib` must come first, else
+    /// Moonlight mixes its own OpenSSL with the system libssl/libcrypto and the HTTPS pairing
+    /// step fails (SslHandshakeFailedError, then "Server certificate mismatch").
+    fn library_path(&self, existing: Option<&str>) -> Option<String> {
+        let lib = self.appimage_root()?.join("usr").join("lib");
+        let lib = lib.to_string_lossy().into_owned();
+        Some(match existing.filter(|v| !v.is_empty()) {
+            Some(old) => format!("{lib}:{old}"),
+            None => lib,
+        })
+    }
+
     pub fn command(&self, args: &[String]) -> Command {
         let mut cmd = Command::new(&self.program);
         let isolation = data_dir().map(|dir| self.profile_isolation(&dir));
@@ -133,6 +158,9 @@ impl Engine {
         }
         for (key, value) in &env {
             cmd.env(key, value);
+        }
+        if let Some(path) = self.library_path(std::env::var("LD_LIBRARY_PATH").ok().as_deref()) {
+            cmd.env("LD_LIBRARY_PATH", path);
         }
         // The bundled Windows build is portable (`portable.dat`): it keeps its settings, including
         // the pairing certificates, in its *working directory*. Pin that to a per-user writable
@@ -923,6 +951,41 @@ pub fn stream(engine: Engine, place: Place, args: Vec<String>, tx: Sender<Event>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn extracted_appimage_gets_its_own_libs_first() {
+        let root = std::env::temp_dir().join(format!("kinseat-appimg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("usr/lib")).unwrap();
+        fs::create_dir_all(root.join("usr/bin")).unwrap();
+        fs::write(root.join("AppRun"), "").unwrap();
+        fs::write(root.join("usr/bin/moonlight"), "").unwrap();
+        let real = fs::canonicalize(&root).unwrap();
+        let lib = real.join("usr/lib").to_string_lossy().into_owned();
+        for program in [root.join("AppRun"), root.join("usr/bin/moonlight")] {
+            let e = Engine {
+                program,
+                prefix: vec![],
+            };
+            assert_eq!(e.library_path(None), Some(lib.clone()));
+            assert_eq!(
+                e.library_path(Some("/opt/x")),
+                Some(format!("{lib}:/opt/x"))
+            );
+        }
+        let plain = Engine {
+            program: "/usr/bin/moonlight".into(),
+            prefix: vec![],
+        };
+        assert_eq!(plain.library_path(Some("/opt/x")), None);
+        let flatpak = Engine {
+            program: root.join("AppRun"),
+            prefix: vec!["run".into(), "com.moonlight_stream.Moonlight".into()],
+        };
+        assert_eq!(flatpak.library_path(None), None);
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[cfg(not(windows))]
     #[test]
