@@ -152,6 +152,7 @@ impl ShortcutHook {
             let timer = unsafe { SetTimer(std::ptr::null_mut(), 1, 2000, None) };
             let _ = ready_tx.send(Some(thread_id));
             let mut hook = hook;
+            let mut lost = false;
             while unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) } > 0 {
                 if msg.message == WM_TIMER && msg.wParam == 2 {
                     unsafe { KillTimer(std::ptr::null_mut(), 2) };
@@ -177,7 +178,15 @@ impl ShortcutHook {
                             if !replacement.is_null() {
                                 unsafe { UnhookWindowsHookEx(hook) };
                                 hook = replacement;
-                                crate::engine::diagnostic("crochet installé");
+                                if lost {
+                                    lost = false;
+                                    crate::engine::diagnostic("crochet réinstallé");
+                                }
+                            } else if !lost {
+                                lost = true;
+                                crate::engine::diagnostic(
+                                    "crochet perdu : réinstallation impossible",
+                                );
                             }
                         } else if owner != s.pid && fg as isize != s.panel {
                             s.keys = stream_menu::ShortcutKeys::default();

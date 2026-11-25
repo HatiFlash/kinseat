@@ -143,6 +143,10 @@ impl Client {
                     self.playing = true;
                     self.notice = None;
                 }
+                Event::Retrying(message) => {
+                    self.moonlight_pid = None;
+                    self.notice = Some(message);
+                }
                 Event::Terminated(message) => {
                     self.stop_panel();
                     self.launching = false;

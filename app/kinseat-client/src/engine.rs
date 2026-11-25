@@ -7,7 +7,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
-        Arc,
+        Arc, Mutex,
     },
     thread,
     time::Duration,
@@ -510,7 +510,11 @@ fn report_termination(place: &Place, code: i128, tx: &Sender<Event>) {
     )));
 }
 
-fn capture_output<R: io::Read + Send + 'static>(source: R, tx: Sender<i128>) -> io::Result<()> {
+fn capture_output<R: io::Read + Send + 'static>(
+    source: R,
+    tx: Sender<i128>,
+    observed: Arc<Observed>,
+) -> io::Result<()> {
     let mut journal = log()?;
     thread::spawn(move || {
         let mut reader = BufReader::new(source);
@@ -521,7 +525,9 @@ fn capture_output<R: io::Read + Send + 'static>(source: R, tx: Sender<i128>) -> 
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
                     let _ = journal.write_all(&line);
-                    if let Some(code) = termination_code(&String::from_utf8_lossy(&line)) {
+                    let text = String::from_utf8_lossy(&line);
+                    observed.feed(&text);
+                    if let Some(code) = termination_code(&text) {
                         let _ = tx.send(code);
                     }
                 }
@@ -535,6 +541,7 @@ fn capture_output<R: io::Read + Send + 'static>(source: R, tx: Sender<i128>) -> 
 pub enum Event {
     Pair(Result<(), String>),
     Started(u32),
+    Retrying(String),
     Stopped(String),
     Terminated(String),
 }
@@ -651,97 +658,207 @@ fn pair_blocking(
     }
 }
 
+/// Observations on one Moonlight attempt, shared with the output readers.
+#[derive(Default)]
+struct Observed {
+    saw_video: AtomicBool,
+    tail: Mutex<String>,
+}
+
+impl Observed {
+    fn feed(&self, line: &str) {
+        if line.contains("Received first video packet") {
+            self.saw_video.store(true, Ordering::Relaxed);
+        }
+        if let Ok(mut tail) = self.tail.lock() {
+            tail.push_str(line);
+            if tail.len() > 4000 {
+                let mut cut = tail.len() - 4000;
+                while !tail.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                tail.drain(..cut);
+            }
+        }
+    }
+}
+
+const RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Retry the very first connection once when Moonlight failed before any video and the
+/// host did not refuse us (known ENet/ping-timeout race after boot, moonlight-qt#1625).
+fn should_retry(
+    attempt: u32,
+    saw_video: bool,
+    user_quit: bool,
+    exit_ok: bool,
+    log_tail: &str,
+) -> bool {
+    if attempt >= 2 || saw_video || user_quit || exit_ok {
+        return false;
+    }
+    let tail = log_tail.to_lowercase();
+    ![
+        "not paired",
+        "pairing",
+        "unauthorized",
+        "access denied",
+        "forbidden",
+        "refus",
+    ]
+    .iter()
+    .any(|m| tail.contains(m))
+}
+
+enum Attempt {
+    Done,
+    Retry,
+}
+
+fn run_attempt(
+    engine: &Engine,
+    place: &Place,
+    args: &[String],
+    tx: &Sender<Event>,
+    stop_rx: &Receiver<()>,
+    attempt: u32,
+) -> Attempt {
+    // A pipe lets us react before Moonlight presents its error page. Pairing still uses
+    // execute() and its direct journal redirection.
+    let mut child = match engine
+        .command(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = tx.send(Event::Stopped(format!("Lancement impossible : {e}")));
+            return Attempt::Done;
+        }
+    };
+    let observed = Arc::new(Observed::default());
+    let (term_tx, term_rx) = mpsc::channel();
+    let capture = child
+        .stdout
+        .take()
+        .and_then(|out| capture_output(out, term_tx.clone(), observed.clone()).ok())
+        .is_some()
+        && child
+            .stderr
+            .take()
+            .and_then(|err| capture_output(err, term_tx, observed.clone()).ok())
+            .is_some();
+    if !capture {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = tx.send(Event::Stopped("Journal Moonlight indisponible".into()));
+        return Attempt::Done;
+    }
+    let _ = tx.send(Event::Started(child.id()));
+    let retry = |exit_ok: bool| {
+        // Let the readers flush the last lines before judging the journal.
+        thread::sleep(Duration::from_millis(200));
+        let tail = observed.tail.lock().map(|t| t.clone()).unwrap_or_default();
+        should_retry(
+            attempt,
+            observed.saw_video.load(Ordering::Relaxed),
+            false,
+            exit_ok,
+            &tail,
+        )
+    };
+    loop {
+        // A deliberate exit takes precedence over any termination line emitted during quit.
+        if stop_rx.try_recv().is_ok() {
+            // L'UI envoie Ctrl+Alt+Maj+Q à Moonlight. Laisser 5 s pour sa fermeture,
+            // puis arrêter uniquement le processus lancé par ce Client.
+            let started = std::time::Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let _ = tx.send(Event::Stopped(format!("Moonlight terminé ({status})")));
+                        return Attempt::Done;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Event::Stopped(format!(
+                            "Suivi du processus impossible : {e}"
+                        )));
+                        return Attempt::Done;
+                    }
+                    Ok(None) => {}
+                }
+                if crate::stream_menu::quit_deadline_reached(started.elapsed()) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = tx.send(Event::Stopped("Flux arrêté".into()));
+            return Attempt::Done;
+        }
+        if let Ok(code) = term_rx.try_recv() {
+            let _ = child.kill();
+            let _ = child.wait();
+            if code != 0 && retry(false) {
+                return Attempt::Retry;
+            }
+            report_termination(place, code, tx);
+            return Attempt::Done;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // The reader may still be copying the last buffered line after process exit.
+                if let Ok(code) = term_rx.recv_timeout(Duration::from_millis(200)) {
+                    if code != 0 && retry(false) {
+                        return Attempt::Retry;
+                    }
+                    report_termination(place, code, tx);
+                } else if retry(status.success()) {
+                    return Attempt::Retry;
+                } else {
+                    let _ = tx.send(Event::Stopped(format!("Moonlight terminé ({status})")));
+                }
+                return Attempt::Done;
+            }
+            Err(e) => {
+                let _ = tx.send(Event::Stopped(format!(
+                    "Suivi du processus impossible : {e}"
+                )));
+                return Attempt::Done;
+            }
+            Ok(None) => {}
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 pub fn stream(engine: Engine, place: Place, args: Vec<String>, tx: Sender<Event>) -> Sender<()> {
     let (stop_tx, stop_rx): (Sender<()>, Receiver<()>) = mpsc::channel();
     thread::spawn(move || {
-        // A pipe lets us react before Moonlight presents its error page. Pairing still uses
-        // execute() and its direct journal redirection.
-        let mut child = match engine
-            .command(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(e) => {
-                let _ = tx.send(Event::Stopped(format!("Lancement impossible : {e}")));
-                return;
-            }
-        };
-        let (term_tx, term_rx) = mpsc::channel();
-        let capture = child
-            .stdout
-            .take()
-            .and_then(|out| capture_output(out, term_tx.clone()).ok())
-            .is_some()
-            && child
-                .stderr
-                .take()
-                .and_then(|err| capture_output(err, term_tx).ok())
-                .is_some();
-        if !capture {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = tx.send(Event::Stopped("Journal Moonlight indisponible".into()));
-            return;
-        }
-        let _ = tx.send(Event::Started(child.id()));
+        let mut attempt = 1;
         loop {
-            // A deliberate exit takes precedence over any termination line emitted during quit.
-            if stop_rx.try_recv().is_ok() {
-                // L'UI envoie Ctrl+Alt+Maj+Q à Moonlight. Laisser 5 s pour sa fermeture,
-                // puis arrêter uniquement le processus lancé par ce Client.
-                let started = std::time::Instant::now();
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(status)) => {
-                            let _ =
-                                tx.send(Event::Stopped(format!("Moonlight terminé ({status})")));
+            match run_attempt(&engine, &place, &args, &tx, &stop_rx, attempt) {
+                Attempt::Done => return,
+                Attempt::Retry => {
+                    let msg = "Première connexion échouée, nouvel essai…";
+                    let _ = tx.send(Event::Retrying(msg.into()));
+                    attempt += 1;
+                    if let Ok(mut journal) = log() {
+                        let _ = writeln!(journal, "\n=== tentative {attempt} ({msg}) ===");
+                    }
+                    // Wait, but honour a quit requested meanwhile.
+                    let waited = std::time::Instant::now();
+                    while waited.elapsed() < RETRY_DELAY {
+                        if stop_rx.try_recv().is_ok() {
+                            let _ = tx.send(Event::Stopped("Flux arrêté".into()));
                             return;
                         }
-                        Err(e) => {
-                            let _ = tx.send(Event::Stopped(format!(
-                                "Suivi du processus impossible : {e}"
-                            )));
-                            return;
-                        }
-                        Ok(None) => {}
+                        thread::sleep(Duration::from_millis(50));
                     }
-                    if crate::stream_menu::quit_deadline_reached(started.elapsed()) {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(100));
                 }
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = tx.send(Event::Stopped("Flux arrêté".into()));
-                break;
             }
-            if let Ok(code) = term_rx.try_recv() {
-                let _ = child.kill();
-                let _ = child.wait();
-                report_termination(&place, code, &tx);
-                break;
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    // The reader may still be copying the last buffered line after process exit.
-                    if let Ok(code) = term_rx.recv_timeout(Duration::from_millis(200)) {
-                        report_termination(&place, code, &tx);
-                    } else {
-                        let _ = tx.send(Event::Stopped(format!("Moonlight terminé ({status})")));
-                    }
-                    break;
-                }
-                Err(e) => {
-                    let _ = tx.send(Event::Stopped(format!(
-                        "Suivi du processus impossible : {e}"
-                    )));
-                    break;
-                }
-                Ok(None) => {}
-            }
-            thread::sleep(Duration::from_millis(20));
         }
     });
     stop_tx
@@ -749,6 +866,17 @@ pub fn stream(engine: Engine, place: Place, args: Vec<String>, tx: Sender<Event>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_only_on_early_failure() {
+        assert!(should_retry(1, false, false, false, "error 10055"));
+        assert!(!should_retry(2, false, false, false, "error 10055"));
+        assert!(!should_retry(1, true, false, false, "error 10055"));
+        assert!(!should_retry(1, false, true, false, "error 10055"));
+        assert!(!should_retry(1, false, false, true, ""));
+        assert!(!should_retry(1, false, false, false, "Host: Not paired"));
+        assert!(!should_retry(1, false, false, false, "401 Unauthorized"));
+    }
 
     #[test]
     fn detects_termination_line() {
