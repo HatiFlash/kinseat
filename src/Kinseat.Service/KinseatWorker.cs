@@ -106,6 +106,10 @@ public sealed class MultiSeatWorker : BackgroundService
         // Idempotent, applied at startup to all existing seats (loaded HKU\<SID> or offline NTUSER.DAT)
         // so accounts created before an upgrade or with an already-active session get hardened too.
         _services.GetService<SeatLighteningService>()?.ApplySafetyPoliciesToAllSeats(_accounts, _seatManager, _presets);
+        try { ShutdownRightPolicy.Apply(_accounts, _logger); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Configuration des droits d'arrêt impossible"); }
+        try { SeatShortcutPolicy.Apply(_accounts, _logger); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Masquage des raccourcis hôte impossible"); }
 
         // ── Step 0a-2: Send the shared Steam shortcuts and the console user's Steam entries through the shim ──
         // Steam isolation only helps if the ordinary ways of starting Steam use it: a click on a plain

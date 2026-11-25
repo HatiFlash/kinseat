@@ -20,8 +20,8 @@ DÉCISION = non bloquable par compte, choix nécessaire.
 | Action dangereuse | Risque pour l'Hôte | Statut |
 |---|---|---|
 | Menus Démarrer / Alt+F4 sur le bureau / Ctrl+Alt+Suppr : Arrêter, Redémarrer, Veille, Veille prolongée | Coupe le PC pour tous | MISSION (`Explorer\NoClose=1`, existant). Se déconnecter reste possible. |
-| `shutdown /s` / `/r` / `/h` en ligne de commande | Idem | DÉCISION : un compte standard a `SeShutdownPrivilege` (groupe Utilisateurs). `NoClose` ne l'empêche pas. `DisallowRun` bloque `shutdown.exe` seulement lancé depuis l'Explorateur. |
-| `rundll32 powrprof.dll,SetSuspendState`, PowerShell `Stop-Computer` / `Restart-Computer`, API `ExitWindowsEx` d'un programme | Idem | DÉCISION (même cause). PowerShell est bloqué depuis l'Explorateur (`DisallowRun`), pas depuis un processus lancé par un jeu. |
+| `shutdown /s` / `/r` / `/h` en ligne de commande | Idem | LSA : retrait des attributions partagées de `SeShutdownPrivilege` après sauvegarde et préservation des comptes locaux non places ; sessions existantes à reconnecter. |
+| `rundll32 powrprof.dll,SetSuspendState`, PowerShell `Stop-Computer` / `Restart-Computer`, API `ExitWindowsEx` d'un programme | Idem | Même protection LSA pour l'arrêt/redémarrage (et `SeRemoteShutdownPrivilege` pour l'arrêt distant) ; la veille et l'hibernation doivent être vérifiées sur l'Hôte Windows. |
 | Mode Avion, coupure Wi-Fi / Bluetooth / réseau (zone de notification, réglages rapides) | Coupe le flux de toutes les places | MISSION partielle : `HideSCANetwork=1` retire l'icône réseau ; `NoControlPanel=1` bloque l'application Paramètres. Les réglages rapides de Windows 11 peuvent rester visibles selon la build : à vérifier au labo. Les actions sur les cartes réseau demandent l'élévation (STD). |
 | Éjection de périphériques USB (« Retirer le périphérique en toute sécurité ») | Déconnecte un disque ou une manette d'une autre place | DÉCISION : aucune stratégie utilisateur ne retire l'icône sans bloquer le stockage USB (`RemovableStorageDevices`), ce qui gênerait les joueurs. Non implémenté. |
 | Gestionnaire des tâches | Tuer Apollo, Kinseat ou un jeu d'une autre place (STD pour les processus d'autres comptes) | Autorisé volontairement : ne touche que les programmes du joueur (un compte standard ne peut pas terminer les processus d'un autre compte) et c'est le seul moyen de fermer un jeu figé. `DisableTaskMgr` n'est pas posé et est supprimé s'il l'avait été. |
@@ -45,12 +45,36 @@ DÉCISION = non bloquable par compte, choix nécessaire.
 Limite : `DisallowRun` ne s'applique qu'aux programmes lancés par l'Explorateur (Démarrer, Exécuter, raccourcis,
 double-clic). Un processus lancé par un jeu, un script ou un autre programme n'est pas concerné.
 
-## Décision nécessaire : le droit d'arrêt
+## Droit d'arrêt machine et raccourcis publics
 
-`SeShutdownPrivilege` (« Arrêter le système ») est accordé par défaut au groupe Utilisateurs. Aucune stratégie
-utilisateur ne le retire à un seul compte. Le retirer pour le groupe Utilisateurs est une stratégie locale de la
-machine entière (`secpol.msc` → Attribuer des droits d'utilisateur → Arrêter le système), ce qui touche aussi
-Hatim et la console de l'Hôte. Solution proposée : ne laisser ce droit qu'aux Administrateurs et au compte de la
-console, ou refuser le droit au groupe local dédié aux places de Kinseat (`SeDenyShutdownPrivilege` n'existe pas :
-il faut donc retirer Utilisateurs et accorder à un groupe « Console »). Non implémenté ici ; à valider avant,
-car un retrait mal fait peut empêcher les mises à jour planifiées et l'arrêt par le service.
+Au démarrage, `ShutdownRightPolicy` énumère les attributions LSA de `SeShutdownPrivilege` et
+`SeRemoteShutdownPrivilege`, puis les comptes locaux de la SAM. Il refuse de modifier les droits
+si la machine est jointe à un domaine, si la console est non locale, si une identité de place n'est
+pas vérifiée, ou si un groupe bénéficiaire inconnu pourrait contenir une place. Si la vérification
+réussit, il accorde d'abord `SeShutdownPrivilege` explicitement aux comptes locaux non places qui
+ne le possèdent pas déjà (console et famille compris), préserve le droit des Administrateurs, puis
+retire les attributions aux groupes partagés (Users, Everyone, INTERACTIVE, Authenticated Users,
+REMOTE INTERACTIVE). Il ne donne pas de nouveau droit d'arrêt distant aux comptes locaux ; seuls
+les groupes partagés sont retirés du droit distant. Les échecs sont journalisés sans bloquer le
+service. Les jetons de session déjà ouverts gardent leurs anciens privilèges jusqu'à reconnexion.
+
+Avant la première modification, la liste des retraits et ajouts est sauvée dans
+`C:\ProgramData\Kinseat\shutdown-rights\state.json` (répertoire limité à SYSTEM et Administrateurs).
+Si plus aucune place gérée n'existe au démarrage suivant, le service rétablit les droits retirés et
+supprime les attributions ajoutées. Pour désinstaller, supprimer d'abord toutes les places gérées,
+redémarrer le service et vérifier la restauration AVANT de retirer le service et cette sauvegarde :
+le programme de désinstallation n'est pas modifiable dans ce périmètre et ne restaure PAS les droits
+à lui seul. Conserver ce fichier pour un rétablissement manuel par administrateur si le service
+n'est plus disponible. Une sauvegarde existante n'est pas recalculée automatiquement : un nouvel
+utilisateur local non place créé ultérieurement ne reçoit pas automatiquement le droit explicite ;
+une attribution ajoutée manuellement à un groupe après le premier démarrage n'est pas supprimée.
+Ne pas prétendre que la protection est garantie avant vérification sur l'Hôte Windows réel ; les
+échecs LSA ou WMI laissent le droit d'arrêt inchangé ou partiellement modifié (consulter le Warning).
+
+`SeatShortcutPolicy` place une ACL Deny Read uniquement sur les fichiers existants
+`Kinseat Hôte.lnk` et `HidHide Configurator.lnk` du bureau public, pour les SID des comptes gérés
+vérifiés, au démarrage. Les raccourcis de jeux ne sont pas touchés et les administrateurs peuvent
+continuer à lire les liens. Cette ACL n'est pas actuellement retirée automatiquement après la
+suppression d'une place ; l'installateur devrait à terme créer ces deux raccourcis sur le bureau
+administrateur uniquement et supprimer les anciens raccourcis publics (hors périmètre des fichiers
+modifiables ici). Un raccourci recréé après le démarrage ne sera protégé qu'au prochain démarrage.
