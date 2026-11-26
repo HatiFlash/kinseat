@@ -1093,4 +1093,43 @@ public sealed class SeatHardeningTests
         Assert.False(File.Exists(sandbox.ManifestPath));
         Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning);
     }
+
+    [Fact]
+    public void ShortcutPolicyLogsIgnoredReparsePointsAtMostOnceAndDowngradesKnownCompatJunction()
+    {
+        using var sandbox = new TempShortcutSandbox();
+        var acl = new FakeShortcutAclHandler();
+        var logger = new CapturingLogger();
+
+        // Known Windows compatibility junction pattern: Start Menu\Programmes -> Start Menu\Programs.
+        var compatJunction = Path.Combine(sandbox.StartMenu, "Programmes");
+        Directory.CreateSymbolicLink(compatJunction, sandbox.Programs);
+
+        // Unexpected reparse point targeting outside the public root.
+        var unexpectedLink = Path.Combine(sandbox.Programs, "UnexpectedLink");
+        Directory.CreateSymbolicLink(unexpectedLink, sandbox.Outside);
+        var outsideShortcut = Path.Combine(sandbox.Outside, "HidHide Configurator.lnk");
+        File.WriteAllText(outsideShortcut, "outside-untouched");
+
+        // Two reconciliation passes: neither reparse point is followed, and each path is logged at most once.
+        SeatShortcutPolicy.ApplyCore(sandbox.Paths, true, [Seat], logger, acl);
+        SeatShortcutPolicy.ApplyCore(sandbox.Paths, true, [Seat], logger, acl);
+
+        Assert.Equal("outside-untouched", File.ReadAllText(outsideShortcut));
+        Assert.False(File.Exists(sandbox.ManifestPath));
+
+        Assert.Single(logger.Entries, e => e.Level == LogLevel.Debug && e.Message.Contains("Programmes"));
+        Assert.DoesNotContain(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("Programmes"));
+        Assert.Single(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("UnexpectedLink"));
+
+        // Hidden+System attributes also classify a junction as a known Windows compatibility junction.
+        Assert.True(SeatShortcutPolicy.IsKnownWindowsCompatibilityJunction(
+            sandbox.StartMenu,
+            unexpectedLink,
+            FileAttributes.Directory | FileAttributes.Hidden | FileAttributes.System | FileAttributes.ReparsePoint));
+        Assert.False(SeatShortcutPolicy.IsKnownWindowsCompatibilityJunction(
+            sandbox.StartMenu,
+            unexpectedLink,
+            FileAttributes.Directory | FileAttributes.ReparsePoint));
+    }
 }

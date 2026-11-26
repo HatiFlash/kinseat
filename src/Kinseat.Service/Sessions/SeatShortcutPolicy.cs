@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Principal;
@@ -59,6 +60,7 @@ internal static class SeatShortcutPolicy
         "Kinseat", "shutdown-rights", "shortcuts-backup");
 
     private static readonly object Gate = new();
+    private static readonly ConcurrentDictionary<string, byte> LoggedIgnoredReparsePaths = new(StringComparer.FromComparison(PathComparison));
 
     internal static readonly Environment.SpecialFolder[] DefaultPublicRootFolders =
     [
@@ -113,12 +115,12 @@ internal static class SeatShortcutPolicy
 
         if (IsReparsePoint(paths.ManifestPath))
         {
-            logger.LogWarning("Manifeste des raccourcis ignoré (lien symbolique/reparse point) : {Path}", paths.ManifestPath);
+            LogIgnoredReparsePoint(logger, paths.ManifestPath, LogLevel.Warning, "Manifeste des raccourcis ignoré (lien symbolique/reparse point) : {Path}", paths.ManifestPath);
             return;
         }
         if (IsReparsePoint(paths.BackupDirectory))
         {
-            logger.LogWarning("Répertoire de sauvegarde des raccourcis ignoré (lien symbolique/reparse point) : {Path}", paths.BackupDirectory);
+            LogIgnoredReparsePoint(logger, paths.BackupDirectory, LogLevel.Warning, "Répertoire de sauvegarde des raccourcis ignoré (lien symbolique/reparse point) : {Path}", paths.BackupDirectory);
             return;
         }
 
@@ -142,7 +144,7 @@ internal static class SeatShortcutPolicy
             if (skippedOriginals.Contains(normalizedOriginal)) continue;
             if (HasReparsePointInSubpath(paths.PublicRoots, normalizedOriginal))
             {
-                logger.LogWarning("Raccourci ignoré (reparse point détecté) : {Path}", normalizedOriginal);
+                LogIgnoredReparsePoint(logger, normalizedOriginal, LogLevel.Warning, "Raccourci ignoré (reparse point détecté) : {Path}", normalizedOriginal);
                 continue;
             }
 
@@ -505,7 +507,7 @@ internal static class SeatShortcutPolicy
             if (!Directory.Exists(root)) continue;
             if (IsReparsePoint(root) || HasReparsePointAncestorInRoots(normalizedRoots, root))
             {
-                logger.LogWarning("Racine publique ignorée (reparse point) : {Root}", root);
+                LogIgnoredReparsePoint(logger, root, LogLevel.Warning, "Racine publique ignorée (reparse point) : {Root}", root);
                 continue;
             }
             if (!visitedDirs.Add(root)) continue;
@@ -534,7 +536,7 @@ internal static class SeatShortcutPolicy
                     if (!IsAllowedShortcutName(Path.GetFileName(file))) continue;
                     if (IsReparsePoint(file))
                     {
-                        logger.LogWarning("Raccourci ignoré (reparse point) : {File}", file);
+                        LogIgnoredReparsePoint(logger, file, LogLevel.Warning, "Raccourci ignoré (reparse point) : {File}", file);
                         continue;
                     }
                     results.Add(Path.GetFullPath(file));
@@ -545,7 +547,10 @@ internal static class SeatShortcutPolicy
                     var normalizedSubdir = NormalizeDirectoryPath(subdir);
                     if (IsReparsePoint(normalizedSubdir))
                     {
-                        logger.LogWarning("Sous-répertoire public ignoré (reparse point) : {Dir}", subdir);
+                        if (IsKnownWindowsCompatibilityJunction(root, normalizedSubdir))
+                            LogIgnoredReparsePoint(logger, normalizedSubdir, LogLevel.Debug, "Sous-répertoire public ignoré (jonction de compatibilité Windows) : {Dir}", subdir);
+                        else
+                            LogIgnoredReparsePoint(logger, normalizedSubdir, LogLevel.Warning, "Sous-répertoire public ignoré (reparse point) : {Dir}", subdir);
                         continue;
                     }
                     if (!visitedDirs.Add(normalizedSubdir)) continue;
@@ -784,6 +789,61 @@ internal static class SeatShortcutPolicy
             return true;
         }
         return false;
+    }
+
+    private static void LogIgnoredReparsePoint(
+        ILogger logger,
+        string path,
+        LogLevel level,
+        string messageTemplate,
+        string displayPath)
+    {
+        if (!TryMarkReparsePathLogged(path))
+            return;
+
+        logger.Log(level, messageTemplate, displayPath);
+    }
+
+    private static bool TryMarkReparsePathLogged(string path)
+    {
+        string key;
+        try { key = NormalizeDirectoryPath(path); }
+        catch { key = path; }
+        return LoggedIgnoredReparsePaths.TryAdd(key, 0);
+    }
+
+    internal static bool IsKnownWindowsCompatibilityJunction(
+        string publicRoot,
+        string normalizedSubdir,
+        FileAttributes? attributesOverride = null)
+    {
+        try
+        {
+            var attrs = attributesOverride ?? File.GetAttributes(normalizedSubdir);
+            if ((attrs & (FileAttributes.Hidden | FileAttributes.System)) == (FileAttributes.Hidden | FileAttributes.System))
+                return true;
+        }
+        catch
+        {
+            // Fall through to link target inspection.
+        }
+
+        try
+        {
+            var normalizedRoot = NormalizeDirectoryPath(publicRoot);
+            var target = new DirectoryInfo(normalizedSubdir).ResolveLinkTarget(returnFinalTarget: false);
+            if (target is null)
+                return false;
+
+            var normalizedTarget = NormalizeDirectoryPath(target.FullName);
+            return !string.Equals(normalizedTarget, normalizedSubdir, PathComparison) &&
+                Directory.Exists(normalizedTarget) &&
+                IsStrictlyUnderRoot(normalizedRoot, normalizedTarget);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static bool IsReparsePoint(string path)
