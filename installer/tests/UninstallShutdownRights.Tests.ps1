@@ -3,10 +3,14 @@
 # Code de sortie : 0 si tout passe, 1 sinon. Compatible Windows PowerShell 5.1 et pwsh.
 $ErrorActionPreference = 'Stop'
 $scriptPath = Join-Path $PSScriptRoot '../payload/Uninstall-Kinseat.ps1'
-$source = [IO.File]::ReadAllText((Resolve-Path $scriptPath))
-$function = [regex]::Match($source, '(?ms)^function Get-ShutdownRightTarget\(.*?^\}').Value
-if (-not $function) { Write-Host 'ECHEC : fonction Get-ShutdownRightTarget introuvable'; exit 1 }
-. ([scriptblock]::Create($function))
+$tokens = $null; $parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $scriptPath).Path, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors -and $parseErrors.Count -gt 0) { Write-Host "ECHEC : erreur de syntaxe dans Uninstall-Kinseat.ps1 : $($parseErrors[0].Message)"; exit 1 }
+foreach ($fname in @('Get-ShutdownRightTarget', 'ConvertTo-RightSidSet')) {
+    $def = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fname }, $true) | Select-Object -First 1
+    if (-not $def) { Write-Host "ECHEC : fonction $fname introuvable"; exit 1 }
+    . ([scriptblock]::Create($def.Extent.Text))
+}
 
 $script:failures = 0
 function Assert-Set($name, $actual, $expected) {
@@ -43,8 +47,8 @@ $t = @(Get-ShutdownRightTarget 'SeShutdownPrivilege' @($gsid, "WIN-TEST\$group",
 Assert-Set 'sans journal : conserve les autres entrées, retire SID/MACHINE\nom' $t @($admins, $users, $backup, 'S-1-5-32-999')
 $r = @(Get-ShutdownRightTarget 'SeRemoteShutdownPrivilege' @($group, $admins) $null $group $gsid)
 Assert-Set 'sans journal : arrêt distant sans Users' $r @($admins)
-$r = @(Get-ShutdownRightTarget 'SeRemoteShutdownPrivilege' @($gsid) $null $group $null)
-Assert-Set 'sans journal : arrêt distant vide reste vide (SID connu)' $r @()
+$r = @(Get-ShutdownRightTarget 'SeRemoteShutdownPrivilege' @($gsid, $group, "WIN-TEST\$group", $admins) $null $group $null)
+Assert-Set 'sans journal, SID groupe nul : retire nom et MACHINE\nom, conserve le SID' $r @($gsid, $admins)
 $r = @(Get-ShutdownRightTarget 'SeRemoteShutdownPrivilege' @($gsid) $null $group $gsid)
 Assert-Set 'sans journal : arrêt distant vide reste vide' $r @()
 
@@ -55,6 +59,20 @@ Assert-Set 'idempotence sans journal' $second $first
 $firstJ = @(Get-ShutdownRightTarget 'SeShutdownPrivilege' @($admins, $backup, $group) $shutdownChange $group $gsid)
 $secondJ = @(Get-ShutdownRightTarget 'SeShutdownPrivilege' $firstJ $shutdownChange $group $gsid)
 Assert-Set 'idempotence avec journal' $secondJ $firstJ
+
+# 6) Normalisation en SID pour la vérification par export (résolveur simulé).
+$resolver = { param($n) if ($n -eq 'Administrateurs') { 'S-1-5-32-544' } elseif ($n -eq 'Utilisateurs') { 'S-1-5-32-545' } else { throw 'non résolu' } }
+$exp = @(ConvertTo-RightSidSet @($admins, "*$users") $resolver)
+$act = @(ConvertTo-RightSidSet @('Administrateurs', 'Utilisateurs') $resolver)
+Assert-Set 'SID attendu = nom localisé exporté' $act $exp
+Assert-Set 'entrée *S-… normalisée' (ConvertTo-RightSidSet @('*s-1-5-32-544') $resolver) @($admins)
+Assert-Set 'nom non résoluble conservé en majuscules' (ConvertTo-RightSidSet @('Inconnu', $admins) $resolver) @('INCONNU', $admins)
+$a = (@(ConvertTo-RightSidSet @($admins, $users) $resolver) -join ',')
+$b = (@(ConvertTo-RightSidSet @($admins) $resolver) -join ',')
+if ($a -ne $b) { Write-Host 'OK    ensembles différents = inégaux' } else { Write-Host 'ECHEC ensembles différents jugés égaux'; $script:failures++ }
+$a = (@(ConvertTo-RightSidSet @($users, $admins) $resolver) -join ',')
+$b = (@(ConvertTo-RightSidSet @('administrateurs', "*$users") $resolver) -join ',')
+if ($a -eq $b) { Write-Host 'OK    ordre/casse sans effet' } else { Write-Host 'ECHEC ordre/casse'; $script:failures++ }
 
 if ($script:failures -gt 0) { Write-Host "$($script:failures) échec(s)"; exit 1 }
 Write-Host 'Tous les tests passent'

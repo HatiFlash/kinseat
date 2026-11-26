@@ -35,6 +35,32 @@ function Get-ShutdownRightTarget($Right, $Current, $Change, $GroupName, $GroupSi
     }
     return $restore
 }
+# Fonction pure (testable sans Windows) : normalise des entrées de droit en SID pour comparaison.
+# secedit peut exporter un compte sous son nom localisé ; $Resolver (nom -> SID texte) est injectable.
+function ConvertTo-RightSidSet($Entries, [scriptblock]$Resolver = $null) {
+    if (-not $Resolver) {
+        $Resolver = {
+            param($name)
+            $account = New-Object System.Security.Principal.NTAccount($name)
+            $account.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        }
+    }
+    $set = @()
+    foreach ($entry in @($Entries)) {
+        if (-not $entry) { continue }
+        $text = ([string]$entry).Trim().TrimStart('*')
+        if (-not $text) { continue }
+        if ($text -match '^S-\d+-') { $norm = $text.ToUpperInvariant() }
+        else {
+            $norm = $null
+            try { $norm = [string](& $Resolver $text) } catch { $norm = $null }
+            if (-not $norm) { $norm = $text.ToUpperInvariant() }
+            else { $norm = $norm.ToUpperInvariant() }
+        }
+        if ($norm -notin $set) { $set += $norm }
+    }
+    return @($set | Sort-Object)
+}
 try {
     $principal=New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     if(-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Administrateur requis'}
@@ -72,8 +98,8 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Vérification LSA impossible : $LASTEXITCODE" }
         $actualLines = @(Get-Content -LiteralPath $verify -Encoding Unicode)
         foreach ($right in @('SeShutdownPrivilege', 'SeRemoteShutdownPrivilege')) {
-            $expectedIds = @($targetRights[$right])
-            $actualIds = @(Get-UserRightEntries $actualLines $right)
+            $expectedIds = @(ConvertTo-RightSidSet @($targetRights[$right]))
+            $actualIds = @(ConvertTo-RightSidSet @(Get-UserRightEntries $actualLines $right))
             $missing = @($expectedIds | Where-Object { $_ -notin $actualIds })
             $extra = @($actualIds | Where-Object { $_ -notin $expectedIds })
             if ($missing.Count -gt 0 -or $extra.Count -gt 0) {
