@@ -230,6 +230,8 @@ internal static class ShutdownRightPolicy
         }
 
         var originals = Rights.ToDictionary(r => r, r => lsa.Enumerate(r));
+        if (originals.Values.Any(grants => grants.Contains(groupSid, StringComparer.OrdinalIgnoreCase)))
+            throw new InvalidOperationException("Groupe déjà attributaire d'un droit LSA sans sauvegarde d'origine ; restauration manuelle requise");
         RecordDirectSeatGrants(originals, managedSeats, unprotectedSeats, logger);
 
         var changes = Plan(originals, groupSid);
@@ -309,8 +311,10 @@ internal static class ShutdownRightPolicy
         {
             var actual = lsa.Enumerate(change.Right).ToHashSet(StringComparer.OrdinalIgnoreCase);
             foreach (var sid in RestoreTargets(actual, change.Remove)) lsa.Add(change.Right, sid);
-            foreach (var sid in change.Add.Where(s => !change.Remove.Contains(s, StringComparer.OrdinalIgnoreCase) &&
-                actual.Contains(s))) lsa.Remove(change.Right, sid);
+            var remove = change.Add.Where(s => !change.Remove.Contains(s, StringComparer.OrdinalIgnoreCase));
+            if (snapshot.GroupSid is not null) remove = remove.Append(snapshot.GroupSid);
+            foreach (var sid in remove.Distinct(StringComparer.OrdinalIgnoreCase).Where(actual.Contains))
+                lsa.Remove(change.Right, sid);
         }
         groups?.DeleteGroup(snapshot.GroupName ?? AllowedGroupName);
         File.Delete(path);

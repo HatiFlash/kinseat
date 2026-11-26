@@ -73,6 +73,19 @@ try {
                 throw 'Sauvegarde LSA contenant un SID inattendu : désinstallation refusée'
             }
         }
+        if($snapshot.GroupName -and $snapshot.GroupName -ne 'Kinseat-ArretAutorise'){
+            throw 'Nom du groupe LSA inattendu : désinstallation refusée'
+        }
+        if($snapshot.GroupSid -and $snapshot.GroupSid -notmatch '^S-1-5-21-(\d+-){3}\d+$'){
+            throw 'SID du groupe LSA invalide : désinstallation refusée'
+        }
+        $groupName='Kinseat-ArretAutorise'
+        $grp=Get-LocalGroup -Name $groupName -ErrorAction SilentlyContinue
+        $grpSid=if($grp -and $grp.SID){$grp.SID.Value}else{$null}
+        if($grpSid -and $snapshot.GroupSid -and $grpSid -ne $snapshot.GroupSid){
+            throw 'SID du groupe LSA différent de la sauvegarde : désinstallation refusée'
+        }
+        $dedicatedSid=if($snapshot.GroupSid){[string]$snapshot.GroupSid}else{$grpSid}
         $tmpRights=Join-Path $env:TEMP ('kinseat-rights-'+[guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $tmpRights | Out-Null
         try {
@@ -83,16 +96,17 @@ try {
             $targetRights=@{}
             foreach($change in $snapshot.Changes){
                 $current=@(Get-UserRightEntries $lines $change.Right)
-                $restore=@($current | Where-Object {$_ -notin @($change.Add)})
+                # secedit peut exporter ce groupe sous son nom, tandis que le journal contient son SID.
+                $restore=@($current | Where-Object {
+                    $_ -notin @($change.Add) -and
+                    (-not $dedicatedSid -or $_ -ne $dedicatedSid) -and
+                    $_ -ne $groupName -and $_ -notlike "*\$groupName"
+                })
                 $restore+=@($change.Remove | Where-Object {$_ -notin $restore})
                 $targetRights[$change.Right]=$restore
             }
             Restore-ShutdownRightsInf $tmpRights $targetRights
-            $groupName = if ($snapshot.GroupName) { [string]$snapshot.GroupName } else { 'Kinseat-ArretAutorise' }
-            if ($groupName -eq 'Kinseat-ArretAutorise') {
-                $grp = Get-LocalGroup -Name $groupName -ErrorAction SilentlyContinue
-                if ($grp) { Remove-LocalGroup -Name $groupName -ErrorAction SilentlyContinue }
-            }
+            if($grp){Remove-LocalGroup -Name $groupName -ErrorAction Stop}
             Remove-Item -LiteralPath $rightsState -Force
             Emit 'service' 'ok' 'Droits LSA restaurés et groupe dédié supprimé' 20
         } finally {Remove-Item -LiteralPath $tmpRights -Recurse -Force -ErrorAction SilentlyContinue}
@@ -123,13 +137,11 @@ try {
                     $restored=@($currentMap[$right] | Where-Object {
                         (-not $grpSid -or $_ -ne $grpSid) -and $_ -ne $groupName -and $_ -notlike "*\$groupName"
                     })
-                    foreach($requiredSid in @('S-1-5-32-545','S-1-5-32-544')){
-                        if($requiredSid -notin $restored){$restored+=$requiredSid}
-                    }
+                    # Sans journal d'origine, ne jamais inventer une attribution à Users (ni à Administrators).
                     $targetRights[$right]=$restored
                 }
                 Restore-ShutdownRightsInf $tmpRights $targetRights
-                if($grp){Remove-LocalGroup -Name $groupName -ErrorAction SilentlyContinue}
+                if($grp){Remove-LocalGroup -Name $groupName -ErrorAction Stop}
                 Emit 'service' 'warning' 'Journal LSA absent : droits d''arrêt restaurés de façon conservatrice et groupe dédié supprimé' 20
             }
         } finally {Remove-Item -LiteralPath $tmpRights -Recurse -Force -ErrorAction SilentlyContinue}

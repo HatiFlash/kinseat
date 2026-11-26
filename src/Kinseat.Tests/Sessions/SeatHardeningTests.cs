@@ -364,6 +364,78 @@ public sealed class SeatHardeningTests
     }
 
     [Fact]
+    public void UpgradeKeepsInitialBaselineAndRestoresGroupEvenWhenExportedOnOtherRight()
+    {
+        var path = TempStatePath();
+        var lsa = new FakeLsa();
+        lsa.Rights["SeShutdownPrivilege"] = new([ShutdownRightPolicy.AdminsSid, ShutdownRightPolicy.BackupOperatorsSid, "S-1-5-32-545"], StringComparer.OrdinalIgnoreCase);
+        lsa.Rights["SeRemoteShutdownPrivilege"] = new([ShutdownRightPolicy.AdminsSid], StringComparer.OrdinalIgnoreCase);
+        var groups = new FakeLocalGroups();
+        var host = new ShutdownRightPolicy.HostAccounts(new HashSet<string> { Seat, ConsoleUser }, ConsoleUser,
+            new HashSet<string>(), new HashSet<string>());
+        try
+        {
+            Assert.True(ShutdownRightPolicy.ApplyCore(lsa, groups, path, Seats, host, NullLogger.Instance));
+            var baseline = File.ReadAllText(path);
+            // Upgrade/reconciliation with a group grant that was not in the original plan.
+            lsa.Rights["SeRemoteShutdownPrivilege"].Add(DedicatedGroupSid);
+            Assert.True(ShutdownRightPolicy.ApplyCore(lsa, groups, path, Seats, host, NullLogger.Instance));
+            Assert.Equal(baseline, File.ReadAllText(path));
+            ShutdownRightPolicy.Restore(lsa, groups, path);
+            Assert.Equal([ShutdownRightPolicy.AdminsSid, ShutdownRightPolicy.BackupOperatorsSid, "S-1-5-32-545"],
+                lsa.Enumerate("SeShutdownPrivilege"));
+            Assert.Equal([ShutdownRightPolicy.AdminsSid], lsa.Enumerate("SeRemoteShutdownPrivilege"));
+            Assert.True(groups.Deleted);
+            Assert.True(lsa.Calls.IndexOf($"remove:SeRemoteShutdownPrivilege:{DedicatedGroupSid}") >= 0);
+            var calls = lsa.Calls.Count;
+            ShutdownRightPolicy.Restore(lsa, groups, path);
+            Assert.Equal(calls, lsa.Calls.Count);
+        }
+        finally { File.Delete(path); File.Delete(path + ".tmp"); }
+    }
+
+    [Fact]
+    public void RestoreFailureLeavesGroupAndJournalForRetry()
+    {
+        var path = TempStatePath();
+        var lsa = new FakeLsa();
+        lsa.Rights["SeShutdownPrivilege"] = new([ShutdownRightPolicy.AdminsSid, "S-1-5-32-545"], StringComparer.OrdinalIgnoreCase);
+        lsa.Rights["SeRemoteShutdownPrivilege"] = new([ShutdownRightPolicy.AdminsSid], StringComparer.OrdinalIgnoreCase);
+        var groups = new FakeLocalGroups();
+        var host = new ShutdownRightPolicy.HostAccounts(new HashSet<string> { Seat, ConsoleUser }, ConsoleUser,
+            new HashSet<string>(), new HashSet<string>());
+        try
+        {
+            Assert.True(ShutdownRightPolicy.ApplyCore(lsa, groups, path, Seats, host, NullLogger.Instance));
+            lsa.FailOnCall = lsa.Calls.Count + 1;
+            Assert.Throws<IOException>(() => ShutdownRightPolicy.Restore(lsa, groups, path));
+            Assert.True(File.Exists(path));
+            Assert.False(groups.Deleted);
+            lsa.FailOnCall = 0;
+            ShutdownRightPolicy.Restore(lsa, groups, path);
+            Assert.False(File.Exists(path));
+            Assert.True(groups.Deleted);
+        }
+        finally { File.Delete(path); File.Delete(path + ".tmp"); }
+    }
+
+    [Fact]
+    public void MissingJournalNeverRecapturesAlreadyModifiedLsaBaseline()
+    {
+        var path = TempStatePath();
+        var lsa = new FakeLsa();
+        lsa.Rights["SeShutdownPrivilege"] = new([ShutdownRightPolicy.AdminsSid, DedicatedGroupSid], StringComparer.OrdinalIgnoreCase);
+        lsa.Rights["SeRemoteShutdownPrivilege"] = new([ShutdownRightPolicy.AdminsSid], StringComparer.OrdinalIgnoreCase);
+        var groups = new FakeLocalGroups();
+        var host = new ShutdownRightPolicy.HostAccounts(new HashSet<string> { Seat, ConsoleUser }, ConsoleUser,
+            new HashSet<string>(), new HashSet<string>());
+        Assert.Throws<InvalidOperationException>(() =>
+            ShutdownRightPolicy.ApplyCore(lsa, groups, path, Seats, host, NullLogger.Instance));
+        Assert.False(File.Exists(path));
+        Assert.Empty(lsa.Calls);
+    }
+
+    [Fact]
     public void InvalidSnapshotNeverMutatesLsa()
     {
         var lsa = new FakeLsa();
