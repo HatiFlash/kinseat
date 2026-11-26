@@ -165,7 +165,9 @@ try {
     $shortcutBackupDir=Join-Path $data 'shutdown-rights\shortcuts-backup'
     $commonDesktop=[Environment]::GetFolderPath('CommonDesktopDirectory'); if([string]::IsNullOrWhiteSpace($commonDesktop)){$commonDesktop=Join-Path $env:PUBLIC 'Desktop'}
     $commonPrograms=[Environment]::GetFolderPath('CommonPrograms'); if([string]::IsNullOrWhiteSpace($commonPrograms)){$commonPrograms=Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'}
-    $shortcutRoots=@(@($commonDesktop,$commonPrograms) | Where-Object { $_ } | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') })
+    # CommonStartMenu (racine) : l'original réel de HidHide Configuration Client y est placé, en plus de CommonPrograms (imbriqué) et du bureau public.
+    $commonStartMenu=[Environment]::GetFolderPath('CommonStartMenu'); if([string]::IsNullOrWhiteSpace($commonStartMenu)){$commonStartMenu=Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu'}
+    $shortcutRoots=@(@($commonDesktop,$commonStartMenu,$commonPrograms) | Where-Object { $_ } | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') } | Select-Object -Unique)
     # Noms autorisés : identiques à SeatShortcutPolicy (y compris la variante mojibake historique).
     $allowedShortcutNames=@('Kinseat Hôte.lnk',('Kinseat H'+[char]0x00C3+[char]0x00B4+'te.lnk'),'HidHide Configurator.lnk','HidHide Configuration Client.lnk')
     function Test-PathUnder($root,$full) {
@@ -193,9 +195,15 @@ try {
         if([string]::IsNullOrWhiteSpace($path) -or -not [IO.Path]::IsPathRooted($path)){return $null}
         try{$full=[IO.Path]::GetFullPath($path)}catch{return $null}
         if([IO.Path]::GetFileName($full) -notin $allowedShortcutNames){return $null}
+        # Racines imbriquées (StartMenu contient Programs) : toutes les racines englobantes doivent être exemptes de lien, comme le service.
+        $matched=$false
         foreach($root in $shortcutRoots){
-            if((Test-PathUnder $root $full) -and -not (Test-ReparseChain $root $full)){return $full}
+            if(Test-PathUnder $root $full){
+                $matched=$true
+                if(Test-ReparseChain $root $full){return $null}
+            }
         }
+        if($matched){return $full}
         return $null
     }
     function Resolve-ShortcutBackup($path,$originalPath) {
