@@ -426,6 +426,7 @@ public sealed class SeatHardeningTests
     {
         internal string Root { get; } = Path.Combine(Path.GetTempPath(), $"kinseat-shortcuts-{Guid.NewGuid():N}");
         internal string Desktop { get; }
+        internal string StartMenu { get; }
         internal string Programs { get; }
         internal string Outside { get; }
         internal string Store { get; }
@@ -436,7 +437,8 @@ public sealed class SeatHardeningTests
         internal TempShortcutSandbox()
         {
             Desktop = Path.Combine(Root, "PublicDesktop");
-            Programs = Path.Combine(Root, "CommonPrograms");
+            StartMenu = Path.Combine(Root, "CommonStartMenu");
+            Programs = Path.Combine(StartMenu, "Programs");
             Outside = Path.Combine(Root, "Outside");
             Store = Path.Combine(Root, "shutdown-rights");
             ManifestPath = Path.Combine(Store, "shortcuts.json");
@@ -444,7 +446,7 @@ public sealed class SeatHardeningTests
             Directory.CreateDirectory(Desktop);
             Directory.CreateDirectory(Programs);
             Directory.CreateDirectory(Outside);
-            Paths = new SeatShortcutPolicy.PolicyPaths([Desktop, Programs], ManifestPath, BackupDir);
+            Paths = new SeatShortcutPolicy.PolicyPaths([Desktop, StartMenu, Programs], ManifestPath, BackupDir);
         }
 
         public void Dispose()
@@ -888,6 +890,135 @@ public sealed class SeatHardeningTests
         Assert.Equal("orig-untouched", File.ReadAllText(orig));
         Assert.Equal("other-hash-backup", File.ReadAllText(otherHashBak));
         Assert.Equal(craftedJson, File.ReadAllText(sandbox.ManifestPath));
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public void ShortcutPolicyDefaultRootsIncludeCommonStartMenuProgramsAndDesktop()
+    {
+        Assert.Contains(Environment.SpecialFolder.CommonDesktopDirectory, SeatShortcutPolicy.DefaultPublicRootFolders);
+        Assert.Contains(Environment.SpecialFolder.CommonStartMenu, SeatShortcutPolicy.DefaultPublicRootFolders);
+        Assert.Contains(Environment.SpecialFolder.CommonPrograms, SeatShortcutPolicy.DefaultPublicRootFolders);
+    }
+
+    [Fact]
+    public void ShortcutRelocationCoversStartMenuRootAndNestedProgramsWithoutDuplicateTraversal()
+    {
+        using var sandbox = new TempShortcutSandbox();
+        var acl = new FakeShortcutAclHandler();
+        var logger = new CapturingLogger();
+
+        var rootHidClient = Path.Combine(sandbox.StartMenu, "HidHide Configuration Client.lnk");
+        var rootKinseat = Path.Combine(sandbox.StartMenu, "Kinseat Hôte.lnk");
+        var rootOther = Path.Combine(sandbox.StartMenu, "AutreOutil.lnk");
+        var rootNearMatch = Path.Combine(sandbox.StartMenu, "HidHide.lnk");
+
+        var nestedDir = Path.Combine(sandbox.Programs, "Nefarius", "HidHide");
+        Directory.CreateDirectory(nestedDir);
+        var nestedHidClient = Path.Combine(nestedDir, "HidHide Configuration Client.lnk");
+        var nestedHidConfig = Path.Combine(nestedDir, "HidHide Configurator.lnk");
+        var nestedGame = Path.Combine(sandbox.Programs, "Jeu.lnk");
+
+        File.WriteAllText(rootHidClient, "startmenu-root-hid-client");
+        File.WriteAllText(rootKinseat, "startmenu-root-kinseat");
+        File.WriteAllText(rootOther, "startmenu-other-tool");
+        File.WriteAllText(rootNearMatch, "startmenu-near-match");
+        File.WriteAllText(nestedHidClient, "programs-nested-hid-client");
+        File.WriteAllText(nestedHidConfig, "programs-nested-hid-config");
+        File.WriteAllText(nestedGame, "programs-game");
+
+        // Duplicate + reversed roots (Programs nested under StartMenu): single traversal and no duplicates.
+        var symNested = Path.Combine(sandbox.Programs, "SymNested");
+        Directory.CreateSymbolicLink(symNested, sandbox.Outside);
+        var discoveryLogger = new CapturingLogger();
+        var discovered = SeatShortcutPolicy.DiscoverTargetShortcuts(
+            [sandbox.Programs, sandbox.StartMenu, sandbox.Programs, sandbox.Desktop],
+            discoveryLogger);
+        Directory.Delete(symNested);
+
+        Assert.Equal(4, discovered.Length);
+        Assert.Contains(rootHidClient, discovered);
+        Assert.Contains(rootKinseat, discovered);
+        Assert.Contains(nestedHidClient, discovered);
+        Assert.Contains(nestedHidConfig, discovered);
+        Assert.DoesNotContain(rootOther, discovered);
+        Assert.DoesNotContain(rootNearMatch, discovered);
+        Assert.DoesNotContain(nestedGame, discovered);
+        Assert.Single(discoveryLogger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("SymNested"));
+
+        // Relocate with active managed seat.
+        SeatShortcutPolicy.ApplyCore(sandbox.Paths, true, [Seat], logger, acl);
+
+        Assert.False(File.Exists(rootHidClient));
+        Assert.False(File.Exists(rootKinseat));
+        Assert.False(File.Exists(nestedHidClient));
+        Assert.False(File.Exists(nestedHidConfig));
+        Assert.Equal("startmenu-other-tool", File.ReadAllText(rootOther));
+        Assert.Equal("startmenu-near-match", File.ReadAllText(rootNearMatch));
+        Assert.Equal("programs-game", File.ReadAllText(nestedGame));
+
+        var manifest = JsonSerializer.Deserialize<SeatShortcutPolicy.ShortcutManifest>(File.ReadAllText(sandbox.ManifestPath));
+        Assert.NotNull(manifest);
+        Assert.Equal(SeatShortcutPolicy.ManifestVersion, manifest!.Version);
+        Assert.Equal(4, manifest.Entries.Count);
+        Assert.Equal(4, manifest.Entries.Select(e => e.BackupPath).Distinct(StringComparer.OrdinalIgnoreCase).Count());
+        Assert.All(manifest.Entries, e =>
+        {
+            Assert.Equal(SeatShortcutPolicy.StateRelocated, e.State);
+            Assert.True(File.Exists(e.BackupPath));
+            Assert.Equal(acl.CapturedSddl, e.OriginalSddl);
+        });
+
+        // Simulated service restart while managed seat is still active: idempotent.
+        SeatShortcutPolicy.ApplyCore(sandbox.Paths, true, [Seat], logger, acl);
+        var manifestAfterRestart = JsonSerializer.Deserialize<SeatShortcutPolicy.ShortcutManifest>(File.ReadAllText(sandbox.ManifestPath));
+        Assert.Equal(4, manifestAfterRestart!.Entries.Count);
+        Assert.False(File.Exists(rootHidClient));
+        Assert.False(File.Exists(nestedHidClient));
+
+        // Automatic restoration when no managed seat remains: exact files restored without confusion.
+        SeatShortcutPolicy.ApplyCore(sandbox.Paths, false, [], logger, acl);
+        Assert.Equal("startmenu-root-hid-client", File.ReadAllText(rootHidClient));
+        Assert.Equal("startmenu-root-kinseat", File.ReadAllText(rootKinseat));
+        Assert.Equal("programs-nested-hid-client", File.ReadAllText(nestedHidClient));
+        Assert.Equal("programs-nested-hid-config", File.ReadAllText(nestedHidConfig));
+        Assert.Equal("startmenu-other-tool", File.ReadAllText(rootOther));
+        Assert.Equal("startmenu-near-match", File.ReadAllText(rootNearMatch));
+        Assert.Equal("programs-game", File.ReadAllText(nestedGame));
+        Assert.False(File.Exists(sandbox.ManifestPath));
+        Assert.Empty(Directory.GetFiles(sandbox.BackupDir));
+        Assert.Equal(4, acl.RestoredAcls.Count);
+    }
+
+    [Fact]
+    public void ShortcutPolicyRejectsSymlinkedStartMenuRootEvenWhenProgramsIsAlsoListed()
+    {
+        using var sandbox = new TempShortcutSandbox();
+        var acl = new FakeShortcutAclHandler();
+        var logger = new CapturingLogger();
+
+        var realStartMenu = Path.Combine(sandbox.Outside, "RealStartMenu");
+        var realPrograms = Path.Combine(realStartMenu, "Programs");
+        Directory.CreateDirectory(realPrograms);
+        var realRootShortcut = Path.Combine(realStartMenu, "HidHide Configuration Client.lnk");
+        var realNestedShortcut = Path.Combine(realPrograms, "HidHide Configurator.lnk");
+        File.WriteAllText(realRootShortcut, "outside-root");
+        File.WriteAllText(realNestedShortcut, "outside-nested");
+
+        var linkedStartMenu = Path.Combine(sandbox.Root, "LinkedStartMenu");
+        Directory.CreateSymbolicLink(linkedStartMenu, realStartMenu);
+        var linkedPrograms = Path.Combine(linkedStartMenu, "Programs");
+        var paths = new SeatShortcutPolicy.PolicyPaths(
+            [linkedPrograms, linkedStartMenu],
+            sandbox.ManifestPath,
+            sandbox.BackupDir);
+
+        Assert.Empty(SeatShortcutPolicy.DiscoverTargetShortcuts(paths.PublicRoots, logger));
+        SeatShortcutPolicy.ApplyCore(paths, true, [Seat], logger, acl);
+
+        Assert.Equal("outside-root", File.ReadAllText(realRootShortcut));
+        Assert.Equal("outside-nested", File.ReadAllText(realNestedShortcut));
+        Assert.False(File.Exists(sandbox.ManifestPath));
         Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning);
     }
 }

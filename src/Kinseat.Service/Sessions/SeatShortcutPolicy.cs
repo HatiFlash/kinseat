@@ -60,12 +60,18 @@ internal static class SeatShortcutPolicy
 
     private static readonly object Gate = new();
 
+    internal static readonly Environment.SpecialFolder[] DefaultPublicRootFolders =
+    [
+        Environment.SpecialFolder.CommonDesktopDirectory,
+        Environment.SpecialFolder.CommonStartMenu,
+        Environment.SpecialFolder.CommonPrograms
+    ];
+
+    internal static string[] GetDefaultPublicRoots() => NormalizeDistinctRoots(
+        DefaultPublicRootFolders.Select(Environment.GetFolderPath));
+
     private static PolicyPaths DefaultPaths => new(
-        new[]
-        {
-            Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory),
-            Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms)
-        }.Where(p => !string.IsNullOrWhiteSpace(p)).ToArray(),
+        GetDefaultPublicRoots(),
         InventoryPath,
         BackupDirectoryPath);
 
@@ -491,18 +497,21 @@ internal static class SeatShortcutPolicy
 
     internal static string[] DiscoverTargetShortcuts(IEnumerable<string> publicRoots, ILogger logger)
     {
+        var normalizedRoots = NormalizeDistinctRoots(publicRoots);
+        var visitedDirs = new HashSet<string>(StringComparer.FromComparison(PathComparison));
         var results = new List<string>();
-        foreach (var root in publicRoots)
+        foreach (var root in normalizedRoots)
         {
-            if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root)) continue;
-            if (IsReparsePoint(root))
+            if (!Directory.Exists(root)) continue;
+            if (IsReparsePoint(root) || HasReparsePointAncestorInRoots(normalizedRoots, root))
             {
                 logger.LogWarning("Racine publique ignorée (reparse point) : {Root}", root);
                 continue;
             }
+            if (!visitedDirs.Add(root)) continue;
 
             var pending = new Stack<string>();
-            pending.Push(Path.GetFullPath(root));
+            pending.Push(root);
             while (pending.Count > 0)
             {
                 var current = pending.Pop();
@@ -533,12 +542,14 @@ internal static class SeatShortcutPolicy
 
                 foreach (var subdir in subdirs)
                 {
-                    if (IsReparsePoint(subdir))
+                    var normalizedSubdir = NormalizeDirectoryPath(subdir);
+                    if (IsReparsePoint(normalizedSubdir))
                     {
                         logger.LogWarning("Sous-répertoire public ignoré (reparse point) : {Dir}", subdir);
                         continue;
                     }
-                    pending.Push(Path.GetFullPath(subdir));
+                    if (!visitedDirs.Add(normalizedSubdir)) continue;
+                    pending.Push(normalizedSubdir);
                 }
             }
         }
@@ -676,12 +687,44 @@ internal static class SeatShortcutPolicy
         }
     }
 
+    private static string NormalizeDirectoryPath(string path)
+    {
+        var full = Path.GetFullPath(path);
+        var trimmed = full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return string.IsNullOrEmpty(trimmed) ? full : trimmed;
+    }
+
+    private static string[] NormalizeDistinctRoots(IEnumerable<string> roots) => roots
+        .Where(r => !string.IsNullOrWhiteSpace(r))
+        .Select(NormalizeDirectoryPath)
+        .Where(r => !string.IsNullOrWhiteSpace(r))
+        .Distinct(StringComparer.FromComparison(PathComparison))
+        .OrderBy(r => r.Length)
+        .ToArray();
+
+    private static bool HasReparsePointAncestorInRoots(IEnumerable<string> normalizedRoots, string normalizedTarget)
+    {
+        foreach (var ancestor in normalizedRoots)
+        {
+            if (!IsStrictlyUnderRoot(ancestor, normalizedTarget)) continue;
+            if (IsReparsePoint(ancestor)) return true;
+            var relative = Path.GetRelativePath(ancestor, normalizedTarget);
+            var current = ancestor;
+            foreach (var segment in relative.Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries))
+            {
+                current = Path.Combine(current, segment);
+                if (IsReparsePoint(current)) return true;
+            }
+        }
+        return false;
+    }
+
     private static bool IsStrictlyUnderAnyRoot(IEnumerable<string> roots, string fullPath)
     {
         foreach (var root in roots)
         {
             if (string.IsNullOrWhiteSpace(root)) continue;
-            var fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var fullRoot = NormalizeDirectoryPath(root);
             if (IsStrictlyUnderRoot(fullRoot, fullPath)) return true;
         }
         return false;
@@ -689,17 +732,21 @@ internal static class SeatShortcutPolicy
 
     private static bool IsStrictlyUnderRoot(string normalizedRoot, string fullPath)
     {
-        var prefix = normalizedRoot + Path.DirectorySeparatorChar;
+        var prefix = normalizedRoot.EndsWith(Path.DirectorySeparatorChar)
+            ? normalizedRoot
+            : normalizedRoot + Path.DirectorySeparatorChar;
         return fullPath.StartsWith(prefix, PathComparison) && fullPath.Length > prefix.Length;
     }
 
     private static bool HasReparsePointInSubpath(IEnumerable<string> roots, string fullTarget)
     {
+        var matchedAny = false;
         foreach (var root in roots)
         {
             if (string.IsNullOrWhiteSpace(root)) continue;
-            var fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var fullRoot = NormalizeDirectoryPath(root);
             if (!IsStrictlyUnderRoot(fullRoot, fullTarget)) continue;
+            matchedAny = true;
             if (IsReparsePoint(fullRoot)) return true;
             var relative = Path.GetRelativePath(fullRoot, fullTarget);
             var current = fullRoot;
@@ -708,18 +755,15 @@ internal static class SeatShortcutPolicy
                 current = Path.Combine(current, segment);
                 if (IsReparsePoint(current)) return true;
             }
-            return false;
         }
-        return true;
+        return !matchedAny;
     }
 
     private static bool EnsureDirectoryWithoutReparse(IEnumerable<string> roots, string directoryPath)
     {
-        var fullDir = Path.GetFullPath(directoryPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        foreach (var root in roots)
+        var fullDir = NormalizeDirectoryPath(directoryPath);
+        foreach (var fullRoot in NormalizeDistinctRoots(roots))
         {
-            if (string.IsNullOrWhiteSpace(root)) continue;
-            var fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
             if (string.Equals(fullDir, fullRoot, PathComparison))
             {
                 if (IsReparsePoint(fullRoot)) return false;
