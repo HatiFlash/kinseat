@@ -59,8 +59,10 @@ internal static class SeatShortcutPolicy
         Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
         "Kinseat", "shutdown-rights", "shortcuts-backup");
 
+    internal const int MaxLoggedReparsePaths = 256;
+
     private static readonly object Gate = new();
-    private static readonly ConcurrentDictionary<string, byte> LoggedIgnoredReparsePaths = new(StringComparer.FromComparison(PathComparison));
+    private static readonly ReparsePointLogState DefaultReparseLogState = new(MaxLoggedReparsePaths);
 
     internal static readonly Environment.SpecialFolder[] DefaultPublicRootFolders =
     [
@@ -497,8 +499,13 @@ internal static class SeatShortcutPolicy
             DeleteManifestIfExists(paths.ManifestPath);
     }
 
-    internal static string[] DiscoverTargetShortcuts(IEnumerable<string> publicRoots, ILogger logger)
+    internal static string[] DiscoverTargetShortcuts(
+        IEnumerable<string> publicRoots,
+        ILogger logger,
+        Func<string, string, bool>? compatibilityJunctionClassifier = null,
+        ReparsePointLogState? reparseLogState = null)
     {
+        var logState = reparseLogState ?? DefaultReparseLogState;
         var normalizedRoots = NormalizeDistinctRoots(publicRoots);
         var visitedDirs = new HashSet<string>(StringComparer.FromComparison(PathComparison));
         var results = new List<string>();
@@ -507,7 +514,7 @@ internal static class SeatShortcutPolicy
             if (!Directory.Exists(root)) continue;
             if (IsReparsePoint(root) || HasReparsePointAncestorInRoots(normalizedRoots, root))
             {
-                LogIgnoredReparsePoint(logger, root, LogLevel.Warning, "Racine publique ignorée (reparse point) : {Root}", root);
+                LogIgnoredReparsePoint(logger, root, LogLevel.Warning, "Racine publique ignorée (reparse point) : {Root}", root, logState);
                 continue;
             }
             if (!visitedDirs.Add(root)) continue;
@@ -536,7 +543,7 @@ internal static class SeatShortcutPolicy
                     if (!IsAllowedShortcutName(Path.GetFileName(file))) continue;
                     if (IsReparsePoint(file))
                     {
-                        LogIgnoredReparsePoint(logger, file, LogLevel.Warning, "Raccourci ignoré (reparse point) : {File}", file);
+                        LogIgnoredReparsePoint(logger, file, LogLevel.Warning, "Raccourci ignoré (reparse point) : {File}", file, logState);
                         continue;
                     }
                     results.Add(Path.GetFullPath(file));
@@ -547,10 +554,7 @@ internal static class SeatShortcutPolicy
                     var normalizedSubdir = NormalizeDirectoryPath(subdir);
                     if (IsReparsePoint(normalizedSubdir))
                     {
-                        if (IsKnownWindowsCompatibilityJunction(root, normalizedSubdir))
-                            LogIgnoredReparsePoint(logger, normalizedSubdir, LogLevel.Debug, "Sous-répertoire public ignoré (jonction de compatibilité Windows) : {Dir}", subdir);
-                        else
-                            LogIgnoredReparsePoint(logger, normalizedSubdir, LogLevel.Warning, "Sous-répertoire public ignoré (reparse point) : {Dir}", subdir);
+                        LogIgnoredReparseSubdirectory(logger, root, normalizedSubdir, subdir, compatibilityJunctionClassifier, logState);
                         continue;
                     }
                     if (!visitedDirs.Add(normalizedSubdir)) continue;
@@ -791,25 +795,95 @@ internal static class SeatShortcutPolicy
         return false;
     }
 
+    internal sealed class ReparsePointLogState
+    {
+        private readonly int _maxEntries;
+        private readonly object _addGate = new();
+        private readonly ConcurrentDictionary<string, byte> _loggedPaths = new(StringComparer.FromComparison(PathComparison));
+        private int _count;
+        private int _limitWarned;
+
+        internal ReparsePointLogState(int maxEntries = MaxLoggedReparsePaths)
+        {
+            _maxEntries = Math.Max(0, maxEntries);
+        }
+
+        internal int Count => Volatile.Read(ref _count);
+
+        internal bool TryMarkLogged(string path, ILogger logger)
+        {
+            string key;
+            try { key = NormalizeDirectoryPath(path); }
+            catch { key = path; }
+
+            if (_loggedPaths.ContainsKey(key))
+                return false;
+
+            if (Volatile.Read(ref _count) >= _maxEntries)
+            {
+                LogLimitReachedOnce(logger);
+                return false;
+            }
+
+            lock (_addGate)
+            {
+                if (_loggedPaths.ContainsKey(key))
+                    return false;
+
+                if (_count >= _maxEntries)
+                {
+                    LogLimitReachedOnce(logger);
+                    return false;
+                }
+
+                if (!_loggedPaths.TryAdd(key, 0))
+                    return false;
+
+                Interlocked.Increment(ref _count);
+                return true;
+            }
+        }
+
+        private void LogLimitReachedOnce(ILogger logger)
+        {
+            if (Interlocked.Exchange(ref _limitWarned, 1) == 0)
+                logger.LogWarning("Limite de journalisation des reparse points atteinte ({MaxEntries}) ; les chemins supplémentaires seront ignorés sans journalisation.", _maxEntries);
+        }
+    }
+
     private static void LogIgnoredReparsePoint(
         ILogger logger,
         string path,
         LogLevel level,
         string messageTemplate,
-        string displayPath)
+        string displayPath,
+        ReparsePointLogState? logState = null)
     {
-        if (!TryMarkReparsePathLogged(path))
+        if (!(logState ?? DefaultReparseLogState).TryMarkLogged(path, logger))
             return;
 
         logger.Log(level, messageTemplate, displayPath);
     }
 
-    private static bool TryMarkReparsePathLogged(string path)
+    private static void LogIgnoredReparseSubdirectory(
+        ILogger logger,
+        string publicRoot,
+        string normalizedSubdir,
+        string displaySubdir,
+        Func<string, string, bool>? compatibilityClassifier,
+        ReparsePointLogState logState)
     {
-        string key;
-        try { key = NormalizeDirectoryPath(path); }
-        catch { key = path; }
-        return LoggedIgnoredReparsePaths.TryAdd(key, 0);
+        if (!logState.TryMarkLogged(normalizedSubdir, logger))
+            return;
+
+        var isKnownCompatJunction = compatibilityClassifier is not null
+            ? compatibilityClassifier(publicRoot, normalizedSubdir)
+            : IsKnownWindowsCompatibilityJunction(publicRoot, normalizedSubdir);
+
+        if (isKnownCompatJunction)
+            logger.LogDebug("Sous-répertoire public ignoré (jonction de compatibilité Windows) : {Dir}", displaySubdir);
+        else
+            logger.LogWarning("Sous-répertoire public ignoré (reparse point) : {Dir}", displaySubdir);
     }
 
     internal static bool IsKnownWindowsCompatibilityJunction(
@@ -837,8 +911,8 @@ internal static class SeatShortcutPolicy
 
             var normalizedTarget = NormalizeDirectoryPath(target.FullName);
             return !string.Equals(normalizedTarget, normalizedSubdir, PathComparison) &&
-                Directory.Exists(normalizedTarget) &&
-                IsStrictlyUnderRoot(normalizedRoot, normalizedTarget);
+                IsStrictlyUnderRoot(normalizedRoot, normalizedTarget) &&
+                Directory.Exists(normalizedTarget);
         }
         catch
         {

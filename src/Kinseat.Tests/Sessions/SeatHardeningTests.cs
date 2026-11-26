@@ -1132,4 +1132,62 @@ public sealed class SeatHardeningTests
             unexpectedLink,
             FileAttributes.Directory | FileAttributes.ReparsePoint));
     }
+
+    [Fact]
+    public void ShortcutPolicyClassifiesIgnoredReparseSubdirectoryAtMostOnceAcrossPasses()
+    {
+        using var sandbox = new TempShortcutSandbox();
+        var logger = new CapturingLogger();
+        var logState = new SeatShortcutPolicy.ReparsePointLogState();
+
+        var compatJunction = Path.Combine(sandbox.StartMenu, "Programmes");
+        Directory.CreateSymbolicLink(compatJunction, sandbox.Programs);
+
+        var unexpectedLink = Path.Combine(sandbox.Programs, "UnexpectedLink");
+        Directory.CreateSymbolicLink(unexpectedLink, sandbox.Outside);
+        File.WriteAllText(Path.Combine(sandbox.Outside, "HidHide Configurator.lnk"), "outside-untouched");
+
+        var classificationCalls = new Dictionary<string, int>(StringComparer.Ordinal);
+        bool Classifier(string root, string subdir)
+        {
+            classificationCalls[subdir] = classificationCalls.GetValueOrDefault(subdir) + 1;
+            return SeatShortcutPolicy.IsKnownWindowsCompatibilityJunction(root, subdir);
+        }
+
+        for (var i = 0; i < 3; i++)
+            Assert.Empty(SeatShortcutPolicy.DiscoverTargetShortcuts(sandbox.Paths.PublicRoots, logger, Classifier, logState));
+
+        Assert.Equal(2, classificationCalls.Count);
+        Assert.All(classificationCalls.Values, count => Assert.Equal(1, count));
+        Assert.Single(logger.Entries, e => e.Level == LogLevel.Debug && e.Message.Contains("Programmes"));
+        Assert.Single(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("UnexpectedLink"));
+    }
+
+    [Fact]
+    public void ShortcutPolicyBoundsReparsePointLoggingAndWarnsOnceWhenLimitReached()
+    {
+        using var sandbox = new TempShortcutSandbox();
+        var logger = new CapturingLogger();
+        var logState = new SeatShortcutPolicy.ReparsePointLogState(maxEntries: 2);
+
+        File.WriteAllText(Path.Combine(sandbox.Outside, "HidHide Configurator.lnk"), "outside-untouched");
+        for (var i = 0; i < 4; i++)
+            Directory.CreateSymbolicLink(Path.Combine(sandbox.Programs, $"Link{i}"), sandbox.Outside);
+
+        var classificationCalls = 0;
+        bool Classifier(string root, string subdir)
+        {
+            classificationCalls++;
+            return SeatShortcutPolicy.IsKnownWindowsCompatibilityJunction(root, subdir);
+        }
+
+        Assert.Empty(SeatShortcutPolicy.DiscoverTargetShortcuts(sandbox.Paths.PublicRoots, logger, Classifier, logState));
+        Assert.Empty(SeatShortcutPolicy.DiscoverTargetShortcuts(sandbox.Paths.PublicRoots, logger, Classifier, logState));
+
+        Assert.Equal(256, SeatShortcutPolicy.MaxLoggedReparsePaths);
+        Assert.Equal(2, logState.Count);
+        Assert.Equal(2, classificationCalls);
+        Assert.Equal(2, logger.Entries.Count(e => e.Level == LogLevel.Warning && e.Message.Contains("Sous-répertoire public ignoré")));
+        Assert.Single(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("Limite de journalisation des reparse points atteinte"));
+    }
 }
