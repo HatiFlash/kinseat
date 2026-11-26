@@ -11,6 +11,30 @@ function Emit($step,$status,$message,$pct) {
     try { $stream.Write($bytes,0,$bytes.Length); $stream.Flush() } finally { $stream.Dispose() }
     [IO.File]::AppendAllText($Log,"$([DateTime]::UtcNow.ToString('o')) | $step | $status | $message`r`n")
 }
+# Fonction pure (testable sans Windows) : calcule les entrées cibles d'un droit d'arrêt.
+# $Current : entrées exportées par secedit (sans '*'), $Change : changement journalisé (Add/Remove) ou $null si le journal est absent.
+function Get-ShutdownRightTarget($Right, $Current, $Change, $GroupName, $GroupSid) {
+    if ($Change) {
+        # secedit peut exporter ce groupe sous son nom, tandis que le journal contient son SID.
+        $restore = @(@($Current) | Where-Object {
+            $_ -notin @($Change.Add) -and
+            (-not $GroupSid -or $_ -ne $GroupSid) -and
+            $_ -ne $GroupName -and $_ -notlike "*\$GroupName"
+        })
+        $restore += @(@($Change.Remove) | Where-Object { $_ -and $_ -notin $restore })
+        return $restore
+    }
+    $restore = @(@($Current) | Where-Object {
+        $_ -and (-not $GroupSid -or $_ -ne $GroupSid) -and $_ -ne $GroupName -and $_ -notlike "*\$GroupName"
+    })
+    # Sans journal : défaut client Windows additif pour l'arrêt local ; jamais Users pour l'arrêt à distance.
+    if ($Right -eq 'SeShutdownPrivilege') {
+        foreach ($sid in @('S-1-5-32-544', 'S-1-5-32-545', 'S-1-5-32-551')) {
+            if ($sid -notin $restore) { $restore += $sid }
+        }
+    }
+    return $restore
+}
 try {
     $principal=New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     if(-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Administrateur requis'}
@@ -97,13 +121,7 @@ try {
             foreach($change in $snapshot.Changes){
                 $current=@(Get-UserRightEntries $lines $change.Right)
                 # secedit peut exporter ce groupe sous son nom, tandis que le journal contient son SID.
-                $restore=@($current | Where-Object {
-                    $_ -notin @($change.Add) -and
-                    (-not $dedicatedSid -or $_ -ne $dedicatedSid) -and
-                    $_ -ne $groupName -and $_ -notlike "*\$groupName"
-                })
-                $restore+=@($change.Remove | Where-Object {$_ -notin $restore})
-                $targetRights[$change.Right]=$restore
+                $targetRights[$change.Right]=@(Get-ShutdownRightTarget $change.Right $current $change $groupName $dedicatedSid)
             }
             Restore-ShutdownRightsInf $tmpRights $targetRights
             if($grp){Remove-LocalGroup -Name $groupName -ErrorAction Stop}
@@ -134,15 +152,14 @@ try {
             if($grp -or $inRights){
                 $targetRights=@{}
                 foreach($right in $expected){
-                    $restored=@($currentMap[$right] | Where-Object {
-                        (-not $grpSid -or $_ -ne $grpSid) -and $_ -ne $groupName -and $_ -notlike "*\$groupName"
-                    })
-                    # Sans journal d'origine, ne jamais inventer une attribution à Users (ni à Administrators).
-                    $targetRights[$right]=$restored
+                    # Sans journal : défaut client Windows additif (Administrators, Users, Backup Operators) pour l'arrêt local ;
+                    # l'arrêt à distance n'obtient jamais Users.
+                    $targetRights[$right]=@(Get-ShutdownRightTarget $right @($currentMap[$right]) $null $groupName $grpSid)
                 }
+                # Même chemin de vérification (export) que la branche avec journal, avant suppression du groupe.
                 Restore-ShutdownRightsInf $tmpRights $targetRights
                 if($grp){Remove-LocalGroup -Name $groupName -ErrorAction Stop}
-                Emit 'service' 'warning' 'Journal LSA absent : droits d''arrêt restaurés de façon conservatrice et groupe dédié supprimé' 20
+                Emit 'service' 'warning' 'Journal LSA absent : groupe dédié retiré et défaut client Windows rétabli pour l''arrêt local (Administrators, Users, Backup Operators) ; vérifier SeShutdownPrivilege si la configuration d''origine était personnalisée' 20
             }
         } finally {Remove-Item -LiteralPath $tmpRights -Recurse -Force -ErrorAction SilentlyContinue}
     }
